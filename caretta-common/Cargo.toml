@@ -1,5 +1,5 @@
 [package]
-name = "myapp-common"
+name = "caretta-common"
 version = "0.1.0"
 edition.workspace = true
 

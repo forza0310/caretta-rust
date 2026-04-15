@@ -1,0 +1,18 @@
+[package]
+name = "caretta-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+caretta-common = { path = "../caretta-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+network-types = "0.1.0"
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "caretta"
+path = "src/main.rs"

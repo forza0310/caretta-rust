@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cargo build -p caretta-ebpf --target bpfel-unknown-none$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo \\+nightly -Z build-std=core build -p caretta-ebpf --target bpfel-unknown-none$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
