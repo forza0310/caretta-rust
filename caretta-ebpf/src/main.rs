@@ -10,9 +10,20 @@ const CONNECTION_ROLE_UNKNOWN: u32 = 0;
 const CONNECTION_ROLE_CLIENT: u32 = 1;
 const CONNECTION_ROLE_SERVER: u32 = 2;
 
-const TCP_SYN_SENT: u16 = 2;
-const TCP_SYN_RECV: u16 = 3;
-const TCP_CLOSE: u16 = 7;
+const TCP_SYN_SENT: i32 = 2;
+const TCP_SYN_RECV: i32 = 3;
+const TCP_CLOSE: i32 = 7;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TraceOffsets {
+    pub skaddr_off: u32,
+    pub newstate_off: u32,
+    pub sport_off: u32,
+    pub dport_off: u32,
+    pub saddr_off: u32,
+    pub daddr_off: u32,
+}
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -54,6 +65,10 @@ static CONNECTIONS: HashMap<ConnectionIdentifier, ConnectionThroughputStats> =
 static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
+#[map]
+static TRACEPOINT_OFFSETS: HashMap<u32, TraceOffsets> =
+    HashMap::<u32, TraceOffsets>::with_max_entries(1, 0);
+
 #[kprobe]
 pub fn handle_tcp_sendmsg(ctx: ProbeContext) -> u32 {
     match try_handle_tcp_sendmsg(&ctx) {
@@ -83,6 +98,11 @@ fn ctx_u32(ctx: &TracePointContext, offset: usize) -> Result<u32, i32> {
 #[inline(always)]
 fn ctx_u64(ctx: &TracePointContext, offset: usize) -> Result<u64, i32> {
     unsafe { ctx.read_at::<u64>(offset) }
+}
+
+#[inline(always)]
+fn ctx_i32(ctx: &TracePointContext, offset: usize) -> Result<i32, i32> {
+    unsafe { ctx.read_at::<i32>(offset) }
 }
 
 #[inline(always)]
@@ -123,14 +143,19 @@ fn mark_connection_closed(skaddr: u64, tuple: ConnectionTuple, role: u32) {
 }
 
 fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
-    // linux tracepoint/sock/inet_sock_set_state layout
-    // common header is 8 bytes, then fields start from offset 8
-    let skaddr = ctx_u64(ctx, 8)?;
-    let sport_raw = ctx_u16(ctx, 12)?;
-    let dport_raw = ctx_u16(ctx, 14)?;
-    let newstate = ctx_u16(ctx, 18)?;
-    let src_ip = ctx_u32(ctx, 20)?;
-    let dst_ip = ctx_u32(ctx, 24)?;
+    // Offsets are discovered in userspace from tracefs format and written to TRACEPOINT_OFFSETS map.
+    let offsets_key = 0u32;
+    let offsets = match unsafe { TRACEPOINT_OFFSETS.get(&offsets_key) } {
+        Some(v) => *v,
+        None => return Ok(()),
+    };
+
+    let skaddr = ctx_u64(ctx, offsets.skaddr_off as usize)?;
+    let newstate = ctx_i32(ctx, offsets.newstate_off as usize)?;
+    let sport_raw = ctx_u16(ctx, offsets.sport_off as usize)?;
+    let dport_raw = ctx_u16(ctx, offsets.dport_off as usize)?;
+    let src_ip = ctx_u32(ctx, offsets.saddr_off as usize)?;
+    let dst_ip = ctx_u32(ctx, offsets.daddr_off as usize)?;
 
     let tuple = ConnectionTuple {
         src_ip,

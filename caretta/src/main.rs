@@ -166,9 +166,57 @@ struct ConnectionThroughputStats {
     is_active: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct TraceOffsets {
+    skaddr_off: u32,
+    newstate_off: u32,
+    sport_off: u32,
+    dport_off: u32,
+    saddr_off: u32,
+    daddr_off: u32,
+}
+
 unsafe impl aya::Pod for ConnectionTuple {}
 unsafe impl aya::Pod for ConnectionIdentifier {}
 unsafe impl aya::Pod for ConnectionThroughputStats {}
+unsafe impl aya::Pod for TraceOffsets {}
+
+fn parse_tracepoint_offsets(path: &str) -> anyhow::Result<TraceOffsets> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read tracepoint format: {path}"))?;
+
+    fn find_offset(content: &str, field_name: &str) -> anyhow::Result<u32> {
+        for line in content.lines() {
+            if !line.contains("field:") || !line.contains(field_name) || !line.contains("offset:") {
+                continue;
+            }
+            if let Some(pos) = line.find("offset:") {
+                let rest = &line[(pos + "offset:".len())..];
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| c.is_ascii_whitespace())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if !digits.is_empty() {
+                    return digits
+                        .parse::<u32>()
+                        .with_context(|| format!("invalid offset for field {field_name}"));
+                }
+            }
+        }
+        anyhow::bail!("field offset not found in tracepoint format: {field_name}")
+    }
+
+    Ok(TraceOffsets {
+        skaddr_off: find_offset(&content, "skaddr")?,
+        newstate_off: find_offset(&content, "newstate")?,
+        sport_off: find_offset(&content, "sport")?,
+        dport_off: find_offset(&content, "dport")?,
+        saddr_off: find_offset(&content, "saddr")?,
+        daddr_off: find_offset(&content, "daddr")?,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct Workload {
@@ -641,11 +689,20 @@ async fn main() -> anyhow::Result<()> {
     kprobe.load()?;
     kprobe.attach("tcp_sendmsg", 0)?;
 
+    let offsets = parse_tracepoint_offsets("/sys/kernel/tracing/events/sock/inet_sock_set_state/format")?;
+    let offsets_key = 0u32;
+    let mut offsets_map: BpfHashMap<_, u32, TraceOffsets> = BpfHashMap::try_from(
+        ebpf.map_mut("TRACEPOINT_OFFSETS")
+            .context("TRACEPOINT_OFFSETS map not found")?,
+    )?;
+    offsets_map.insert(offsets_key, offsets, 0)?;
+
     let tracepoint: &mut TracePoint = ebpf
         .program_mut("handle_sock_set_state")
         .context("tracepoint program handle_sock_set_state not found")?
         .try_into()?;
     tracepoint.load()?;
+
     tracepoint.attach("sock", "inet_sock_set_state")?;
 
     let connections_map = ebpf
