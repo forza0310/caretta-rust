@@ -154,8 +154,8 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     let newstate = ctx_i32(ctx, offsets.newstate_off as usize)?;
     let sport_raw = ctx_u16(ctx, offsets.sport_off as usize)?;
     let dport_raw = ctx_u16(ctx, offsets.dport_off as usize)?;
-    let src_ip = ctx_u32(ctx, offsets.saddr_off as usize)?;
-    let dst_ip = ctx_u32(ctx, offsets.daddr_off as usize)?;
+    let src_ip = u32::from_be(ctx_u32(ctx, offsets.saddr_off as usize)?);
+    let dst_ip = u32::from_be(ctx_u32(ctx, offsets.daddr_off as usize)?);
 
     let tuple = ConnectionTuple {
         src_ip,

@@ -299,7 +299,7 @@ struct StaticResolver;
 impl IpResolver for StaticResolver {
     fn resolve_ip(&self, ip: u32) -> Workload {
         Workload {
-            name: Ipv4Addr::from(u32::from_le(ip)).to_string(),
+            name: Ipv4Addr::from(ip).to_string(),
             namespace: "external".to_string(),
             kind: "external".to_string(),
             owner: String::new(),
@@ -443,7 +443,7 @@ impl IpResolver for K8sResolver {
         }
 
         Workload {
-            name: Ipv4Addr::from(u32::from_le(ip)).to_string(),
+            name: Ipv4Addr::from(ip).to_string(),
             namespace: "external".to_string(),
             kind: "external".to_string(),
             owner: String::new(),
@@ -452,7 +452,7 @@ impl IpResolver for K8sResolver {
 }
 
 fn parse_ipv4_to_u32(ip: &str) -> Option<u32> {
-    ip.parse::<Ipv4Addr>().ok().map(|v| u32::from(v).to_le())
+    ip.parse::<Ipv4Addr>().ok().map(u32::from)
 }
 
 impl fmt::Display for NetworkLink {
@@ -537,7 +537,7 @@ fn reduce_connection_to_tcp(
 }
 
 fn is_loopback(ip: u32) -> bool {
-    Ipv4Addr::from(u32::from_le(ip)).is_loopback()
+    Ipv4Addr::from(ip).is_loopback()
 }
 
 fn handle_link_metric(link: &NetworkLink, throughput: u64) {
