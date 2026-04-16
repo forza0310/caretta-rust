@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use aya_ebpf::bindings::{BPF_TCP_CLOSE, BPF_TCP_SYN_RECV, BPF_TCP_SYN_SENT};
 use aya_ebpf::helpers::bpf_get_current_pid_tgid;
 use aya_ebpf::macros::{kprobe, map, tracepoint};
 use aya_ebpf::maps::HashMap;
@@ -9,10 +10,6 @@ use aya_ebpf::programs::{ProbeContext, TracePointContext};
 const CONNECTION_ROLE_UNKNOWN: u32 = 0;
 const CONNECTION_ROLE_CLIENT: u32 = 1;
 const CONNECTION_ROLE_SERVER: u32 = 2;
-
-const TCP_SYN_SENT: i32 = 2;
-const TCP_SYN_RECV: i32 = 3;
-const TCP_CLOSE: i32 = 7;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -165,13 +162,13 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     };
 
     let role = match newstate {
-        TCP_SYN_SENT => CONNECTION_ROLE_CLIENT,
-        TCP_SYN_RECV => CONNECTION_ROLE_SERVER,
-        TCP_CLOSE => CONNECTION_ROLE_UNKNOWN,
+        state if state == BPF_TCP_SYN_SENT as i32 => CONNECTION_ROLE_CLIENT,
+        state if state == BPF_TCP_SYN_RECV as i32 => CONNECTION_ROLE_SERVER,
+        state if state == BPF_TCP_CLOSE as i32 => CONNECTION_ROLE_UNKNOWN,
         _ => CONNECTION_ROLE_UNKNOWN,
     };
 
-    if newstate == TCP_CLOSE {
+    if newstate == BPF_TCP_CLOSE as i32 {
         mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_CLIENT);
         mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_SERVER);
         return Ok(());
