@@ -1,56 +1,89 @@
-代码里用的是 kube 客户端默认发现逻辑，所以凭据来源是下面两类之一：
+# Caretta Rust
 
-- 集群外运行
-会按优先级读取：
-环境变量 KUBECONFIG 指向的文件
-当前用户家目录下 .kube/config
+本项目是基于 Rust + aya + tokio 的 eBPF 网络探针实现，对齐 caretta-go 的核心能力，并保持 cargo run 可直接启动。
+
+## 当前能力总览
+
+- eBPF 采集
+	- kprobe tcp_sendmsg: 统计 bytes_sent
+	- kprobe tcp_cleanup_rbuf: 统计 bytes_received
+	- tracepoint sock/inet_sock_set_state: 追踪连接状态变化
+- 吞吐语义
+	- 用户态链路吞吐采用 bytes_sent + bytes_received
+- Kubernetes 解析
+	- Pod/Service/Node 解析
+	- owner 层级追溯: Pod -> ReplicaSet -> Deployment 等
+	- watch 事件模型: 资源变更触发刷新，并有周期性全量刷新兜底
+- 可观测性
+	- Prometheus 指标端点
+	- Resolver 调试端点
+
+## 运行方式
+
+1. 在项目根目录运行:
+	 sudo -E cargo run
+2. 如果你在 .cargo/config.toml 中配置了 runner = sudo -E，也可直接运行:
+	 cargo run
+
+默认监听:
+
+- 指标端点: http://127.0.0.1:7117/metrics
+- 调试端点: 按环境变量控制，默认关闭
+
+## 端点说明
+
+### 1) /metrics
+
+- 用途: 导出 Prometheus 指标
+- 典型检查:
+	- curl -s http://127.0.0.1:7117/metrics | head
+
+### 2) /debug/resolver
+
+- 用途: 返回当前 IP -> Workload 的解析快照(JSON)
+- 场景: 排查连接为何被标记为 external，或确认 owner 上卷是否生效
+- 默认: 关闭
+
+启用示例:
+
+	DEBUG_RESOLVER_ENABLED=true cargo run
+	curl -s http://127.0.0.1:7117/debug/resolver | head -n 40
+
+## 环境变量
+
+### Kubernetes 凭据
+
+- KUBECONFIG
+	- 集群外运行时可指定 kubeconfig 路径
+	- 未设置时，kube 客户端会尝试默认位置 ~/.kube/config
 - 集群内运行
-会读取 Pod 的 ServiceAccount Token（挂载在 /var/run/secrets/kubernetes.io/serviceaccount）和集群 CA。
+	- 自动使用 ServiceAccount Token 与集群 CA
 
-在非集群环境会自动回退为 external 解析；在集群内有 kube 凭据时会启用 K8sResolver。
+### Resolver 行为
 
-## K8sResolver: owner层级追溯 + watch事件模型
+- TRAVERSE_UP_HIERARCHY
+	- 可选值: true 或 false
+	- 默认: true
+	- 作用: 是否沿 owner 链继续上卷到更稳定工作负载
 
-为了更接近 caretta-go 的语义，当前 Rust 版包含两层能力：
+### 调试端点
 
-- owner 层级追溯：
-会先解析 Pod 的直接 owner（如 ReplicaSet），并继续沿 owner 链向上追溯（如 Deployment/StatefulSet/DaemonSet/Job/CronJob），
-最终把链路归并到更稳定的工作负载实体上。
+- DEBUG_RESOLVER_ENABLED
+	- 可选值: true 或 false
+	- 默认: false
+	- 作用: 开启或关闭 resolver 调试端点
+- DEBUG_RESOLVER_ENDPOINT
+	- 默认: /debug/resolver
+	- 作用: 自定义调试端点路径
 
-- watch 事件模型：
-会对 Pod/Service/Node/ReplicaSet/Deployment/StatefulSet/DaemonSet/Job/CronJob 建立 watch。
-当收到 Added/Modified/Deleted 事件时触发 resolver 快照刷新，同时保留周期性全量刷新作为兜底。
+## 运行行为说明
 
-可通过下面变量控制层级追溯：
+- 在有可用 kube 凭据时，启用 K8sResolver。
+- 在无 kube 凭据或不可访问集群时，解析会回退为 external。
+- 即使 K8sResolver 启用，external 仍可能出现(真实外部流量或回环流量)。
 
-- TRAVERSE_UP_HIERARCHY=true|false（默认 true）
+## 快速排障
 
-## bytes_received 说明
-
-eBPF 侧已补齐 bytes_received：
-
-- 发送方向：kprobe tcp_sendmsg 计入 bytes_sent
-- 接收方向：kprobe tcp_cleanup_rbuf 计入 bytes_received
-
-用户态链路吞吐默认使用 bytes_sent + bytes_received 的合计值，语义更接近 caretta-go 的连接吞吐视角。
-
-## 调试端点 /debug/resolver
-
-提供只读调试端点，返回当前 IP -> Workload 的解析快照（JSON），用于排查为什么某条连接是 external。
-
-默认关闭，可通过下列方式启用：
-
-- 环境变量：DEBUG_RESOLVER_ENABLED=true
-- 可选自定义路径：DEBUG_RESOLVER_ENDPOINT=/debug/resolver（默认这个值）
-
-示例：
-
-```bash
-DEBUG_RESOLVER_ENABLED=true cargo run
-curl http://127.0.0.1:7117/debug/resolver
-```
-
-禁用方式：
-
-- 不设置 DEBUG_RESOLVER_ENABLED
-- 或显式设置 DEBUG_RESOLVER_ENABLED=false
+1. 看程序日志，确认是否打印 kubernetes resolver enabled。
+2. 访问 /metrics，确认有 caretta_links_observed 等指标。
+3. 开启 DEBUG_RESOLVER_ENABLED 后访问调试端点，核对目标 IP 的解析结果。
