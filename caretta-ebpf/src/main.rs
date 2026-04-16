@@ -1,18 +1,44 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
-use aya_log_ebpf::info;
-
-use core::mem;
-use aya_ebpf::macros::map;
+use aya_ebpf::helpers::bpf_get_current_pid_tgid;
+use aya_ebpf::macros::{kprobe, map, tracepoint};
 use aya_ebpf::maps::HashMap;
-use network_types::{
-    eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr},
-    tcp::TcpHdr,
-    udp::UdpHdr,
-};
+use aya_ebpf::programs::{ProbeContext, TracePointContext};
+
+const CONNECTION_ROLE_UNKNOWN: u32 = 0;
+const CONNECTION_ROLE_CLIENT: u32 = 1;
+const CONNECTION_ROLE_SERVER: u32 = 2;
+
+const TCP_SYN_SENT: u16 = 2;
+const TCP_SYN_RECV: u16 = 3;
+const TCP_CLOSE: u16 = 7;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ConnectionTuple {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ConnectionIdentifier {
+    pub id: u32,
+    pub pid: u32,
+    pub tuple: ConnectionTuple,
+    pub role: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ConnectionThroughputStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub is_active: u64,
+}
 
 #[cfg(not(test))]
 #[panic_handler] //#[panic_handler] is required to keep the compiler happy, although it is never used since we cannot panic.
@@ -20,102 +46,168 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-#[map] // (1)
-static BLOCK_SRC_ADDR_LIST: HashMap<u32, u32> =
-    HashMap::<u32, u32>::with_max_entries(1024, 0);
+#[map]
+static CONNECTIONS: HashMap<ConnectionIdentifier, ConnectionThroughputStats> =
+    HashMap::<ConnectionIdentifier, ConnectionThroughputStats>::with_max_entries(131072, 0);
 
 #[map]
-static IGNORE_DEST_PORT_LIST: HashMap<u16, u32> = // 不输出的端口
-    HashMap::<u16, u32>::with_max_entries(1024, 0);
+static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
+    HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
-#[xdp]
-pub fn xdp_firewall(ctx: XdpContext) -> u32 { // xdp程序-函数定义
-    match try_xdp_firewall(ctx) {
-        Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+#[kprobe]
+pub fn handle_tcp_sendmsg(ctx: ProbeContext) -> u32 {
+    match try_handle_tcp_sendmsg(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn handle_sock_set_state(ctx: TracePointContext) -> u32 {
+    match try_handle_sock_set_state(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
     }
 }
 
 #[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-
-    if start + offset + len > end {
-        return Err(());
-    }
-
-    Ok((start + offset) as *const T)
+fn ctx_u16(ctx: &TracePointContext, offset: usize) -> Result<u16, i32> {
+    unsafe { ctx.read_at::<u16>(offset) }
 }
 
-fn block_ip(address: u32) -> bool {
-    unsafe { BLOCK_SRC_ADDR_LIST.get(&address).is_some() }
+#[inline(always)]
+fn ctx_u32(ctx: &TracePointContext, offset: usize) -> Result<u32, i32> {
+    unsafe { ctx.read_at::<u32>(offset) }
 }
 
-fn ignore_port(port: u16) -> bool {
-    unsafe { IGNORE_DEST_PORT_LIST.get(&port).is_some() }
+#[inline(always)]
+fn ctx_u64(ctx: &TracePointContext, offset: usize) -> Result<u64, i32> {
+    unsafe { ctx.read_at::<u64>(offset) }
 }
 
-fn try_xdp_firewall(ctx: XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?; // 读取以太网报头
-    // ? 是 Rust 的错误传播（early return）运算符。
-    // 放在一个返回 Result 或 Option 的表达式后面，会做两件事：
-    // 成功分支：解包并拿到内部值（相当于 Ok(v) => v / Some(v) => v）
-    // 失败分支：立刻从当前函数返回错误（相当于 Err(e) => return Err(e) / None => return None）
-    match unsafe { (*ethhdr).ether_type() } {
-        Ok(EtherType::Ipv4) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+#[inline(always)]
+fn connection_id(tuple: &ConnectionTuple, role: u32) -> u32 {
+    let mut hash = 0x811C9DC5u32;
+    hash ^= tuple.src_ip;
+    hash = hash.wrapping_mul(0x01000193);
+    hash ^= tuple.dst_ip;
+    hash = hash.wrapping_mul(0x01000193);
+    hash ^= tuple.src_port as u32;
+    hash = hash.wrapping_mul(0x01000193);
+    hash ^= tuple.dst_port as u32;
+    hash = hash.wrapping_mul(0x01000193);
+    hash ^= role;
+    hash
+}
+
+#[inline(always)]
+fn mark_connection_closed(skaddr: u64, tuple: ConnectionTuple, role: u32) {
+    if role == CONNECTION_ROLE_UNKNOWN {
+        return;
     }
 
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-    let source_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
-    let dest_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).dst_addr });
-
-    let source_port = match unsafe { (*ipv4hdr).proto } {
-        IpProto::Tcp => {
-            let tcphdr: *const TcpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            u16::from_be_bytes(unsafe { (*tcphdr).source }) // 手动做大端转主机序
-        }
-        IpProto::Udp => {
-            let udphdr: *const UdpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            unsafe { (*udphdr).src_port() }
-        }
-        _ => return Err(()),
+    let key = ConnectionIdentifier {
+        id: connection_id(&tuple, role),
+        pid: 0,
+        tuple,
+        role,
     };
 
-    let dest_port = match unsafe { (*ipv4hdr).proto } {
-        IpProto::Tcp => {
-            let tcphdr: *const TcpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            u16::from_be_bytes(unsafe { (*tcphdr).dest })
-        }
-        IpProto::Udp => {
-            let udphdr: *const UdpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            unsafe { (*udphdr).dst_port() }
-        }
-        _ => return Err(()),
-    };
-
-    // 跳过忽略的目的端口
-    if ignore_port(dest_port) {
-        return Ok(xdp_action::XDP_PASS);
+    if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
+        let mut updated = *existing;
+        updated.is_active = 0;
+        let _ = CONNECTIONS.insert(&key, &updated, 0);
     }
 
-    let action = if block_ip(source_addr) {
-        xdp_action::XDP_ABORTED
-    } else {
-        xdp_action::XDP_PASS
-    };
-    // 记录 IP 和端口
-    // 把日志事件写入 Aya 日志通道（底层走 eBPF map + perf/ring buffer 机制）供用户态消费
-    info!(&ctx, "SRC IP: {:i}, SRC PORT: {}; DST IP: {:i}, DST PORT: {}. ACTION: {}",
-        source_addr, source_port, dest_addr, dest_port, action);
+    let _ = SOCK_TO_CONNECTION.remove(&skaddr);
+}
 
-    Ok(action)
+fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
+    // linux tracepoint/sock/inet_sock_set_state layout
+    // common header is 8 bytes, then fields start from offset 8
+    let skaddr = ctx_u64(ctx, 8)?;
+    let sport_raw = ctx_u16(ctx, 12)?;
+    let dport_raw = ctx_u16(ctx, 14)?;
+    let newstate = ctx_u16(ctx, 18)?;
+    let src_ip = ctx_u32(ctx, 20)?;
+    let dst_ip = ctx_u32(ctx, 24)?;
+
+    let tuple = ConnectionTuple {
+        src_ip,
+        dst_ip,
+        src_port: u16::from_be(sport_raw),
+        dst_port: u16::from_be(dport_raw),
+    };
+
+    let role = match newstate {
+        TCP_SYN_SENT => CONNECTION_ROLE_CLIENT,
+        TCP_SYN_RECV => CONNECTION_ROLE_SERVER,
+        TCP_CLOSE => CONNECTION_ROLE_UNKNOWN,
+        _ => CONNECTION_ROLE_UNKNOWN,
+    };
+
+    if newstate == TCP_CLOSE {
+        mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_CLIENT);
+        mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_SERVER);
+        return Ok(());
+    }
+
+    if role == CONNECTION_ROLE_UNKNOWN {
+        return Ok(());
+    }
+
+    let key = ConnectionIdentifier {
+        id: connection_id(&tuple, role),
+        pid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        tuple,
+        role,
+    };
+
+    let mut throughput = ConnectionThroughputStats {
+        bytes_sent: 0,
+        bytes_received: 0,
+        is_active: 1,
+    };
+
+    if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
+        throughput = *existing;
+        throughput.bytes_sent = throughput.bytes_sent.saturating_add(1);
+        throughput.is_active = 1;
+    }
+
+    CONNECTIONS.insert(&key, &throughput, 0)?;
+    SOCK_TO_CONNECTION.insert(&skaddr, &key, 0)?;
+    Ok(())
+}
+
+fn try_handle_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), i32> {
+    let sk: *const core::ffi::c_void = ctx.arg(0).ok_or(1)?;
+    let size: usize = ctx.arg(2).ok_or(1)?;
+    let skaddr = sk as u64;
+
+    let key = match unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+        Some(k) => *k,
+        None => return Ok(()),
+    };
+
+    let mut throughput = match unsafe { CONNECTIONS.get(&key) } {
+        Some(t) => *t,
+        None => {
+            let init = ConnectionThroughputStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                is_active: 1,
+            };
+            CONNECTIONS.insert(&key, &init, 0)?;
+            init
+        }
+    };
+
+    throughput.bytes_sent = throughput.bytes_sent.saturating_add(size as u64);
+    throughput.is_active = 1;
+    CONNECTIONS.insert(&key, &throughput, 0)?;
+
+    Ok(())
 }
 
 #[unsafe(link_section = "license")]
