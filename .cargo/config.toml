@@ -3,3 +3,4 @@ runner = "sudo -E"
 
 [env]
 KUBECONFIG = "/home/cbw/.kube/config"
+DEBUG_RESOLVER_ENABLED="true"

@@ -74,6 +74,14 @@ pub fn handle_tcp_sendmsg(ctx: ProbeContext) -> u32 {
     }
 }
 
+#[kprobe]
+pub fn handle_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
+    match try_handle_tcp_cleanup_rbuf(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 #[tracepoint]
 pub fn handle_sock_set_state(ctx: TracePointContext) -> u32 {
     match try_handle_sock_set_state(&ctx) {
@@ -226,6 +234,39 @@ fn try_handle_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), i32> {
     };
 
     throughput.bytes_sent = throughput.bytes_sent.saturating_add(size as u64);
+    throughput.is_active = 1;
+    CONNECTIONS.insert(&key, &throughput, 0)?;
+
+    Ok(())
+}
+
+fn try_handle_tcp_cleanup_rbuf(ctx: &ProbeContext) -> Result<(), i32> {
+    let sk: *const core::ffi::c_void = ctx.arg(0).ok_or(1)?;
+    let copied: i32 = ctx.arg(1).ok_or(1)?;
+    if copied <= 0 {
+        return Ok(());
+    }
+    let skaddr = sk as u64;
+
+    let key = match unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+        Some(k) => *k,
+        None => return Ok(()),
+    };
+
+    let mut throughput = match unsafe { CONNECTIONS.get(&key) } {
+        Some(t) => *t,
+        None => {
+            let init = ConnectionThroughputStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                is_active: 1,
+            };
+            CONNECTIONS.insert(&key, &init, 0)?;
+            init
+        }
+    };
+
+    throughput.bytes_received = throughput.bytes_received.saturating_add(copied as u64);
     throughput.is_active = 1;
     CONNECTIONS.insert(&key, &throughput, 0)?;
 

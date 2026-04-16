@@ -2,27 +2,35 @@ use anyhow::Context as _;
 use aya::maps::HashMap as BpfHashMap;
 use aya::programs::{KProbe, TracePoint};
 use clap::Parser;
+use futures_util::StreamExt;
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
+use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Node, Pod, Service};
-use kube::api::ListParams;
+use kube::api::{ListParams, WatchEvent, WatchParams};
 use kube::{Api, Client};
 use log::{info, warn};
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, Opts, TextEncoder};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, mpsc, watch};
 
 const DEFAULT_PROMETHEUS_ENDPOINT: &str = "/metrics";
 const DEFAULT_PROMETHEUS_PORT: u16 = 7117;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+const DEFAULT_DEBUG_RESOLVER_ENDPOINT: &str = "/debug/resolver";
+const DEFAULT_DEBUG_RESOLVER_ENABLED: bool = false;
+const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
 
 const ROLE_CLIENT: u32 = 1;
 const ROLE_SERVER: u32 = 2;
@@ -264,6 +272,12 @@ struct Opt {
     prometheus_endpoint: String,
     #[clap(long, default_value_t = DEFAULT_POLL_INTERVAL_SECS)]
     poll_interval: u64,
+    #[clap(long, default_value_t = DEFAULT_DEBUG_RESOLVER_ENABLED)]
+    debug_resolver_enabled: bool,
+    #[clap(long, default_value = DEFAULT_DEBUG_RESOLVER_ENDPOINT)]
+    debug_resolver_endpoint: String,
+    #[clap(long, default_value_t = DEFAULT_TRAVERSE_UP_HIERARCHY)]
+    traverse_up_hierarchy: bool,
 }
 
 impl Opt {
@@ -285,6 +299,21 @@ impl Opt {
                 opt.poll_interval = i.max(1);
             }
         }
+        if let Ok(v) = std::env::var("DEBUG_RESOLVER_ENABLED") {
+            if let Ok(enabled) = v.parse::<bool>() {
+                opt.debug_resolver_enabled = enabled;
+            }
+        }
+        if let Ok(v) = std::env::var("DEBUG_RESOLVER_ENDPOINT") {
+            if !v.is_empty() {
+                opt.debug_resolver_endpoint = v;
+            }
+        }
+        if let Ok(v) = std::env::var("TRAVERSE_UP_HIERARCHY") {
+            if let Ok(enabled) = v.parse::<bool>() {
+                opt.traverse_up_hierarchy = enabled;
+            }
+        }
 
         opt
     }
@@ -292,6 +321,9 @@ impl Opt {
 
 trait IpResolver: Send + Sync {
     fn resolve_ip(&self, ip: u32) -> Workload;
+    fn debug_snapshot(&self) -> Option<String> {
+        None
+    }
 }
 
 struct StaticResolver;
@@ -307,60 +339,285 @@ impl IpResolver for StaticResolver {
     }
 }
 
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct OwnerKey {
+    namespace: String,
+    kind: String,
+    name: String,
+}
+
+#[derive(Clone)]
+struct OwnerTarget {
+    kind: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct DebugResolverEntry {
+    ip: String,
+    name: String,
+    namespace: String,
+    kind: String,
+    owner: String,
+}
+
 struct K8sResolver {
-    ips: std::sync::RwLock<HashMap<u32, Workload>>,
+    client: Client,
+    ips: RwLock<HashMap<u32, Workload>>,
+    traverse_up_hierarchy: bool,
+    watch_events: AtomicU64,
 }
 
 impl K8sResolver {
-    async fn try_new() -> anyhow::Result<Arc<Self>> {
-        let resolver = Arc::new(Self {
-            ips: std::sync::RwLock::new(HashMap::new()),
-        });
-
+    async fn try_new(traverse_up_hierarchy: bool) -> anyhow::Result<Arc<Self>> {
         let client = Client::try_default()
             .await
             .context("failed to create Kubernetes client")?;
 
+        let resolver = Arc::new(Self {
+            client,
+            ips: RwLock::new(HashMap::new()),
+            traverse_up_hierarchy,
+            watch_events: AtomicU64::new(0),
+        });
+
         resolver
-            .refresh_with_client(&client)
+            .refresh_snapshot()
             .await
             .context("failed to load initial Kubernetes snapshot")?;
 
-        let resolver_clone = Arc::clone(&resolver);
+        resolver.spawn_watch_and_refresh_tasks();
+        Ok(resolver)
+    }
+
+    fn spawn_watch_and_refresh_tasks(self: &Arc<Self>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+
+        let refresh_resolver = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if let Err(err) = resolver_clone.refresh_with_client(&client).await {
-                    warn!("failed to refresh Kubernetes snapshot: {err}");
+            while rx.recv().await.is_some() {
+                if let Err(err) = refresh_resolver.refresh_snapshot().await {
+                    warn!("failed to refresh Kubernetes snapshot from watch event: {err}");
                 }
             }
         });
 
-        Ok(resolver)
+        let periodic_resolver = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                if let Err(err) = periodic_resolver.refresh_snapshot().await {
+                    warn!("failed to refresh Kubernetes snapshot on periodic tick: {err}");
+                }
+            }
+        });
+
+        Self::spawn_watch::<Pod>(Arc::clone(self), tx.clone(), "pods");
+        Self::spawn_watch::<Service>(Arc::clone(self), tx.clone(), "services");
+        Self::spawn_watch::<Node>(Arc::clone(self), tx.clone(), "nodes");
+        Self::spawn_watch::<ReplicaSet>(Arc::clone(self), tx.clone(), "replicasets");
+        Self::spawn_watch::<Deployment>(Arc::clone(self), tx.clone(), "deployments");
+        Self::spawn_watch::<StatefulSet>(Arc::clone(self), tx.clone(), "statefulsets");
+        Self::spawn_watch::<DaemonSet>(Arc::clone(self), tx.clone(), "daemonsets");
+        Self::spawn_watch::<Job>(Arc::clone(self), tx.clone(), "jobs");
+        Self::spawn_watch::<CronJob>(Arc::clone(self), tx, "cronjobs");
     }
 
-    async fn refresh_with_client(&self, client: &Client) -> anyhow::Result<()> {
-        let mut next = HashMap::new();
+    fn spawn_watch<K>(resolver: Arc<Self>, tx: mpsc::UnboundedSender<()>, watch_name: &'static str)
+    where
+        K: Clone
+            + core::fmt::Debug
+            + serde::de::DeserializeOwned
+            + kube::Resource<DynamicType = ()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        tokio::spawn(async move {
+            let api: Api<K> = Api::all(resolver.client.clone());
+            loop {
+                let mut stream = match api.watch(&WatchParams::default(), "0").await {
+                    Ok(stream) => stream.boxed(),
+                    Err(err) => {
+                        warn!("failed to start watch for {watch_name}: {err}");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
 
-        let pods: Api<Pod> = Api::all(client.clone());
-        let pod_list = pods.list(&ListParams::default()).await?;
-        for pod in pod_list.items {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(WatchEvent::Added(_))
+                        | Ok(WatchEvent::Modified(_))
+                        | Ok(WatchEvent::Deleted(_))
+                        | Ok(WatchEvent::Bookmark(_)) => {
+                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.send(());
+                        }
+                        Ok(WatchEvent::Error(e)) => {
+                            warn!("watch error event for {watch_name}: {:?}", e);
+                            break;
+                        }
+                        Err(err) => {
+                            warn!("watch stream error for {watch_name}: {err}");
+                            break;
+                        }
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    fn first_owner_target<T>(obj: &T) -> Option<OwnerTarget>
+    where
+        T: kube::Resource,
+    {
+        obj.meta()
+            .owner_references
+            .as_ref()
+            .and_then(|refs| refs.first())
+            .map(|r| OwnerTarget {
+                kind: r.kind.clone(),
+                name: r.name.clone(),
+            })
+    }
+
+    fn owner_key(namespace: &str, kind: &str, name: &str) -> OwnerKey {
+        OwnerKey {
+            namespace: namespace.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn trace_owner_hierarchy(
+        &self,
+        namespace: &str,
+        initial: Option<OwnerTarget>,
+        owners_index: &HashMap<OwnerKey, OwnerTarget>,
+    ) -> (String, String, String) {
+        let mut immediate_owner = String::new();
+        let mut final_kind = "Pod".to_string();
+        let mut final_name = String::new();
+
+        if let Some(first) = initial.clone() {
+            immediate_owner = first.name.clone();
+            final_kind = first.kind.clone();
+            final_name = first.name.clone();
+        }
+
+        if !self.traverse_up_hierarchy {
+            return (final_kind, final_name, immediate_owner);
+        }
+
+        let mut cur = initial;
+        for _ in 0..8 {
+            let Some(owner) = cur.clone() else {
+                break;
+            };
+            final_kind = owner.kind.clone();
+            final_name = owner.name.clone();
+
+            let key = Self::owner_key(namespace, &owner.kind, &owner.name);
+            cur = owners_index.get(&key).cloned();
+            if cur.is_none() {
+                break;
+            }
+        }
+
+        (final_kind, final_name, immediate_owner)
+    }
+
+    async fn refresh_snapshot(&self) -> anyhow::Result<()> {
+        let mut next = HashMap::new();
+        let mut owners_index: HashMap<OwnerKey, OwnerTarget> = HashMap::new();
+
+        let replicasets: Api<ReplicaSet> = Api::all(self.client.clone());
+        for rs in replicasets.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                rs.metadata.namespace.clone(),
+                rs.metadata.name.clone(),
+                Self::first_owner_target(&rs),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "ReplicaSet", &name), parent);
+            }
+        }
+
+        let deployments: Api<Deployment> = Api::all(self.client.clone());
+        for d in deployments.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                d.metadata.namespace.clone(),
+                d.metadata.name.clone(),
+                Self::first_owner_target(&d),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "Deployment", &name), parent);
+            }
+        }
+
+        let statefulsets: Api<StatefulSet> = Api::all(self.client.clone());
+        for s in statefulsets.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                s.metadata.namespace.clone(),
+                s.metadata.name.clone(),
+                Self::first_owner_target(&s),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "StatefulSet", &name), parent);
+            }
+        }
+
+        let daemonsets: Api<DaemonSet> = Api::all(self.client.clone());
+        for d in daemonsets.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                d.metadata.namespace.clone(),
+                d.metadata.name.clone(),
+                Self::first_owner_target(&d),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "DaemonSet", &name), parent);
+            }
+        }
+
+        let jobs: Api<Job> = Api::all(self.client.clone());
+        for j in jobs.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                j.metadata.namespace.clone(),
+                j.metadata.name.clone(),
+                Self::first_owner_target(&j),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "Job", &name), parent);
+            }
+        }
+
+        let cronjobs: Api<CronJob> = Api::all(self.client.clone());
+        for c in cronjobs.list(&ListParams::default()).await?.items {
+            if let (Some(ns), Some(name), Some(parent)) = (
+                c.metadata.namespace.clone(),
+                c.metadata.name.clone(),
+                Self::first_owner_target(&c),
+            ) {
+                owners_index.insert(Self::owner_key(&ns, "CronJob", &name), parent);
+            }
+        }
+
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        for pod in pods.list(&ListParams::default()).await?.items {
             let namespace = pod.metadata.namespace.clone().unwrap_or_default();
-            let name = pod.metadata.name.clone().unwrap_or_default();
-            let owner = pod
-                .metadata
-                .owner_references
-                .as_ref()
-                .and_then(|refs| refs.first())
-                .map(|r| r.name.clone())
-                .unwrap_or_default();
+            let pod_name = pod.metadata.name.clone().unwrap_or_default();
+            let owner_ref = Self::first_owner_target(&pod);
+            let (resolved_kind, resolved_name, immediate_owner) =
+                self.trace_owner_hierarchy(&namespace, owner_ref, &owners_index);
 
             let workload = Workload {
-                name,
+                name: if resolved_name.is_empty() {
+                    pod_name
+                } else {
+                    resolved_name
+                },
                 namespace,
-                kind: "Pod".to_string(),
-                owner,
+                kind: resolved_kind,
+                owner: immediate_owner,
             };
 
             if let Some(status) = pod.status {
@@ -378,9 +635,8 @@ impl K8sResolver {
             }
         }
 
-        let services: Api<Service> = Api::all(client.clone());
-        let service_list = services.list(&ListParams::default()).await?;
-        for svc in service_list.items {
+        let services: Api<Service> = Api::all(self.client.clone());
+        for svc in services.list(&ListParams::default()).await?.items {
             let namespace = svc.metadata.namespace.clone().unwrap_or_default();
             let name = svc.metadata.name.clone().unwrap_or_default();
             let workload = Workload {
@@ -406,9 +662,8 @@ impl K8sResolver {
             }
         }
 
-        let nodes: Api<Node> = Api::all(client.clone());
-        let node_list = nodes.list(&ListParams::default()).await?;
-        for node in node_list.items {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        for node in nodes.list(&ListParams::default()).await?.items {
             let name = node.metadata.name.clone().unwrap_or_default();
             let workload = Workload {
                 name,
@@ -426,9 +681,8 @@ impl K8sResolver {
             }
         }
 
-        if let Ok(mut guard) = self.ips.write() {
-            *guard = next;
-        }
+        let mut guard = self.ips.write().await;
+        *guard = next;
 
         Ok(())
     }
@@ -436,7 +690,7 @@ impl K8sResolver {
 
 impl IpResolver for K8sResolver {
     fn resolve_ip(&self, ip: u32) -> Workload {
-        if let Ok(guard) = self.ips.read() {
+        if let Ok(guard) = self.ips.try_read() {
             if let Some(workload) = guard.get(&ip) {
                 return workload.clone();
             }
@@ -448,6 +702,30 @@ impl IpResolver for K8sResolver {
             kind: "external".to_string(),
             owner: String::new(),
         }
+    }
+
+    fn debug_snapshot(&self) -> Option<String> {
+        let guard = self.ips.try_read().ok()?;
+        let mut entries: Vec<DebugResolverEntry> = guard
+            .iter()
+            .map(|(ip, workload)| DebugResolverEntry {
+                ip: Ipv4Addr::from(*ip).to_string(),
+                name: workload.name.clone(),
+                namespace: workload.namespace.clone(),
+                kind: workload.kind.clone(),
+                owner: workload.owner.clone(),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.ip.cmp(&b.ip));
+
+        Some(
+            serde_json::json!({
+                "watch_events": self.watch_events.load(Ordering::Relaxed),
+                "count": entries.len(),
+                "entries": entries,
+            })
+            .to_string(),
+        )
     }
 }
 
@@ -607,6 +885,9 @@ fn handle_tcp_metric(connection: &TcpConnection) {
 async fn run_metrics_server(
     addr: SocketAddr,
     endpoint: String,
+    debug_resolver_enabled: bool,
+    debug_resolver_endpoint: String,
+    resolver: Arc<dyn IpResolver>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
@@ -623,6 +904,8 @@ async fn run_metrics_server(
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
                 let endpoint = endpoint.clone();
+                let debug_resolver_endpoint = debug_resolver_endpoint.clone();
+                let resolver = Arc::clone(&resolver);
                 tokio::spawn(async move {
                     let mut req = [0u8; 1024];
                     let n = match stream.read(&mut req).await {
@@ -632,6 +915,7 @@ async fn run_metrics_server(
 
                     let first_line = String::from_utf8_lossy(&req[..n]);
                     let expected = format!("GET {endpoint} ");
+                    let debug_expected = format!("GET {debug_resolver_endpoint} ");
                     let (status, body, content_type) = if first_line.starts_with(&expected) {
                         let encoder = TextEncoder::new();
                         let mf = prometheus::gather();
@@ -644,6 +928,20 @@ async fn run_metrics_server(
                             )
                         } else {
                             ("200 OK", buffer, encoder.format_type().to_string())
+                        }
+                    } else if debug_resolver_enabled && first_line.starts_with(&debug_expected) {
+                        if let Some(snapshot) = resolver.debug_snapshot() {
+                            (
+                                "200 OK",
+                                snapshot.into_bytes(),
+                                String::from("application/json"),
+                            )
+                        } else {
+                            (
+                                "503 Service Unavailable",
+                                b"resolver snapshot unavailable".to_vec(),
+                                String::from("text/plain"),
+                            )
                         }
                     } else {
                         (
@@ -689,6 +987,13 @@ async fn main() -> anyhow::Result<()> {
     kprobe.load()?;
     kprobe.attach("tcp_sendmsg", 0)?;
 
+    let kprobe_recv: &mut KProbe = ebpf
+        .program_mut("handle_tcp_cleanup_rbuf")
+        .context("kprobe program handle_tcp_cleanup_rbuf not found")?
+        .try_into()?;
+    kprobe_recv.load()?;
+    kprobe_recv.attach("tcp_cleanup_rbuf", 0)?;
+
     let offsets = parse_tracepoint_offsets("/sys/kernel/tracing/events/sock/inet_sock_set_state/format")?;
     let offsets_key = 0u32;
     let mut offsets_map: BpfHashMap<_, u32, TraceOffsets> = BpfHashMap::try_from(
@@ -718,11 +1023,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         format!("/{}", opt.prometheus_endpoint)
     };
+    let debug_resolver_endpoint = if opt.debug_resolver_endpoint.starts_with('/') {
+        opt.debug_resolver_endpoint.clone()
+    } else {
+        format!("/{}", opt.debug_resolver_endpoint)
+    };
 
-    let metrics_task = tokio::spawn(run_metrics_server(metrics_addr, endpoint.clone(), shutdown_rx));
-    info!("metrics server listening on {}{}", metrics_addr, endpoint);
-
-    let resolver: Arc<dyn IpResolver> = match K8sResolver::try_new().await {
+    let resolver: Arc<dyn IpResolver> = match K8sResolver::try_new(opt.traverse_up_hierarchy).await {
         Ok(r) => {
             info!("kubernetes resolver enabled");
             r
@@ -732,6 +1039,18 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(StaticResolver)
         }
     };
+    if opt.debug_resolver_enabled {
+        info!("debug resolver endpoint enabled at {}", debug_resolver_endpoint);
+    }
+    let metrics_task = tokio::spawn(run_metrics_server(
+        metrics_addr,
+        endpoint.clone(),
+        opt.debug_resolver_enabled,
+        debug_resolver_endpoint,
+        Arc::clone(&resolver),
+        shutdown_rx,
+    ));
+    info!("metrics server listening on {}{}", metrics_addr, endpoint);
     let mut past_links: HashMap<NetworkLink, u64> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
 
@@ -781,7 +1100,8 @@ async fn main() -> anyhow::Result<()> {
                         Err(_) => continue,
                     };
 
-                    *current_links.entry(link).or_insert(0) += throughput.bytes_sent;
+                    *current_links.entry(link).or_insert(0) +=
+                        throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     current_tcp_connections.push(tcp);
                 }
 
@@ -809,7 +1129,8 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn) {
-                        *past_links.entry(link).or_insert(0) += throughput.bytes_sent;
+                        *past_links.entry(link).or_insert(0) +=
+                            throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     }
                     MAP_DELETIONS.inc();
                 }
