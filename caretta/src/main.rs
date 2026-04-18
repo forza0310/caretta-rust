@@ -2,6 +2,7 @@ use anyhow::Context as _;
 use aya::maps::HashMap as BpfHashMap;
 use aya::programs::{KProbe, TracePoint};
 use clap::Parser;
+use dns_lookup::lookup_addr;
 use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
@@ -9,6 +10,7 @@ use k8s_openapi::api::core::v1::{Node, Pod, Service};
 use kube::api::{ListParams, WatchEvent, WatchParams};
 use kube::{Api, Client};
 use log::{info, warn};
+use lru::LruCache;
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, Opts, TextEncoder};
 use serde::Serialize;
@@ -16,8 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +33,8 @@ const DEFAULT_PROMETHEUS_PORT: u16 = 7117;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const DEFAULT_DEBUG_RESOLVER_ENDPOINT: &str = "/debug/resolver";
 const DEFAULT_DEBUG_RESOLVER_ENABLED: bool = false;
+const DEFAULT_RESOLVE_DNS: bool = true;
+const DEFAULT_DNS_CACHE_SIZE: usize = 10000;
 const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
 const DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST: &str = "";
 const DEFAULT_OWNER_KIND_PRIORITY: &str = "";
@@ -278,6 +283,10 @@ struct Opt {
     debug_resolver_enabled: bool,
     #[clap(long, default_value = DEFAULT_DEBUG_RESOLVER_ENDPOINT)]
     debug_resolver_endpoint: String,
+    #[clap(long, default_value_t = DEFAULT_RESOLVE_DNS)]
+    resolve_dns: bool,
+    #[clap(long, default_value_t = DEFAULT_DNS_CACHE_SIZE)]
+    dns_cache_size: usize,
     #[clap(long, default_value_t = DEFAULT_TRAVERSE_UP_HIERARCHY)]
     traverse_up_hierarchy: bool,
     #[clap(long, default_value = DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST)]
@@ -323,6 +332,16 @@ impl Opt {
                 opt.debug_resolver_endpoint = v;
             }
         }
+        if let Ok(v) = std::env::var("RESOLVE_DNS") {
+            if let Ok(enabled) = v.parse::<bool>() {
+                opt.resolve_dns = enabled;
+            }
+        }
+        if let Ok(v) = std::env::var("DNS_CACHE_SIZE") {
+            if let Ok(size) = v.parse::<usize>() {
+                opt.dns_cache_size = size.max(1);
+            }
+        }
         if let Ok(v) = std::env::var("TRAVERSE_UP_HIERARCHY") {
             if let Ok(enabled) = v.parse::<bool>() {
                 opt.traverse_up_hierarchy = enabled;
@@ -360,12 +379,58 @@ trait IpResolver: Send + Sync {
     }
 }
 
-struct StaticResolver;
+struct DnsCache {
+    enabled: bool,
+    cache: Mutex<LruCache<u32, String>>,
+}
+
+impl DnsCache {
+    fn new(enabled: bool, cache_size: usize) -> Self {
+        let cache_size = NonZeroUsize::new(cache_size.max(1)).expect("non-zero dns cache size");
+        Self {
+            enabled,
+            cache: Mutex::new(LruCache::new(cache_size)),
+        }
+    }
+
+    fn resolve_name(&self, ip: u32) -> String {
+        let fallback = Ipv4Addr::from(ip).to_string();
+        if !self.enabled {
+            return fallback;
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(host) = cache.get(&ip) {
+                return host.clone();
+            }
+        }
+
+        let host = lookup_addr(&IpAddr::V4(Ipv4Addr::from(ip))).unwrap_or_else(|_| fallback.clone());
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(ip, host.clone());
+        }
+
+        host
+    }
+}
+
+struct StaticResolver {
+    dns_cache: DnsCache,
+}
+
+impl StaticResolver {
+    fn new(resolve_dns: bool, dns_cache_size: usize) -> Self {
+        Self {
+            dns_cache: DnsCache::new(resolve_dns, dns_cache_size),
+        }
+    }
+}
 
 impl IpResolver for StaticResolver {
     fn resolve_ip(&self, ip: u32) -> Workload {
         Workload {
-            name: Ipv4Addr::from(ip).to_string(),
+            name: self.dns_cache.resolve_name(ip),
             namespace: "external".to_string(),
             kind: "external".to_string(),
             owner: String::new(),
@@ -398,6 +463,7 @@ struct DebugResolverEntry {
 struct K8sResolver {
     client: Client,
     ips: RwLock<HashMap<u32, Workload>>,
+    dns_cache: DnsCache,
     traverse_up_hierarchy: bool,
     owner_kind_allowlist: HashSet<String>,
     owner_kind_priority: HashMap<String, usize>,
@@ -406,6 +472,8 @@ struct K8sResolver {
 
 impl K8sResolver {
     async fn try_new(
+        resolve_dns: bool,
+        dns_cache_size: usize,
         traverse_up_hierarchy: bool,
         owner_kind_allowlist: HashSet<String>,
         owner_kind_priority: HashMap<String, usize>,
@@ -417,6 +485,7 @@ impl K8sResolver {
         let resolver = Arc::new(Self {
             client,
             ips: RwLock::new(HashMap::new()),
+            dns_cache: DnsCache::new(resolve_dns, dns_cache_size),
             traverse_up_hierarchy,
             owner_kind_allowlist,
             owner_kind_priority,
@@ -786,7 +855,7 @@ impl IpResolver for K8sResolver {
         }
 
         Workload {
-            name: Ipv4Addr::from(ip).to_string(),
+            name: self.dns_cache.resolve_name(ip),
             namespace: "external".to_string(),
             kind: "external".to_string(),
             owner: String::new(),
@@ -1121,7 +1190,15 @@ async fn main() -> anyhow::Result<()> {
     let owner_kind_allowlist = opt.owner_kind_allowlist();
     let owner_kind_priority = opt.owner_kind_priority();
 
+    if opt.resolve_dns {
+        info!("reverse DNS enabled (cache size={})", opt.dns_cache_size);
+    } else {
+        info!("reverse DNS disabled");
+    }
+
     let resolver: Arc<dyn IpResolver> = match K8sResolver::try_new(
+        opt.resolve_dns,
+        opt.dns_cache_size,
         opt.traverse_up_hierarchy,
         owner_kind_allowlist,
         owner_kind_priority,
@@ -1134,7 +1211,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(err) => {
             warn!("kubernetes resolver unavailable, fallback to static resolver: {err}");
-            Arc::new(StaticResolver)
+            Arc::new(StaticResolver::new(opt.resolve_dns, opt.dns_cache_size))
         }
     };
     if opt.debug_resolver_enabled {

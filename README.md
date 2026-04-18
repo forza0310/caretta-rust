@@ -61,6 +61,14 @@
 
 ### Resolver 行为
 
+- RESOLVE_DNS
+	- 可选值: true 或 false
+	- 默认: true
+	- 作用: 对未命中 K8s 映射的 external IP 做反向 DNS 解析
+- DNS_CACHE_SIZE
+	- 可选值: 正整数
+	- 默认: 10000
+	- 作用: LRU 缓存容量(缓存 external IP 到反向解析主机名)
 - TRAVERSE_UP_HIERARCHY
 	- 可选值: true 或 false
 	- 默认: true
@@ -83,6 +91,11 @@ Installation 场景示例:
 	OWNER_KIND_PRIORITY=Installation,Deployment,StatefulSet,DaemonSet
 
 当链路为 Pod -> ReplicaSet -> Deployment -> Installation 时，最终会归并到 Installation。
+
+external 回退行为:
+
+- 当 RESOLVE_DNS=true 且解析成功时，external 名称会显示为反向 DNS 结果。
+- 当 RESOLVE_DNS=false 或解析失败时，external 名称回退为原始 IP 字符串。
 
 ### 调试端点
 
