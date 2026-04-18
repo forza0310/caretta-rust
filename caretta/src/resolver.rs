@@ -153,7 +153,10 @@ impl K8sResolver {
     }
 
     fn spawn_watch_and_refresh_tasks(self: &Arc<Self>) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+        // Coalesce bursty watch events into a small bounded queue.
+        // If a refresh signal is already pending, dropping extra signals is acceptable because
+        // refresh_snapshot is a full rebuild of current cluster state.
+        let (tx, mut rx) = mpsc::channel::<()>(1);
 
         let refresh_resolver = Arc::clone(self);
         tokio::spawn(async move {
@@ -186,7 +189,7 @@ impl K8sResolver {
         Self::spawn_watch::<CronJob>(Arc::clone(self), tx, "cronjobs");
     }
 
-    fn spawn_watch<K>(resolver: Arc<Self>, tx: mpsc::UnboundedSender<()>, watch_name: &'static str)
+    fn spawn_watch<K>(resolver: Arc<Self>, tx: mpsc::Sender<()>, watch_name: &'static str)
     where
         K: Clone
             + core::fmt::Debug
@@ -215,7 +218,7 @@ impl K8sResolver {
                         | Ok(WatchEvent::Deleted(_))
                         | Ok(WatchEvent::Bookmark(_)) => {
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(());
+                            let _ = tx.try_send(());
                         }
                         Ok(WatchEvent::Error(e)) => {
                             warn!("watch error event for {watch_name}: {:?}", e);

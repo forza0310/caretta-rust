@@ -110,6 +110,7 @@ fn ctx_i32(ctx: &TracePointContext, offset: usize) -> Result<i32, i32> {
     unsafe { ctx.read_at::<i32>(offset) }
 }
 
+// FNV-1a hash of the 4-tuple and role, used as a key for identifying connections in maps.
 #[inline(always)]
 fn connection_id(tuple: &ConnectionTuple, role: u32) -> u32 {
     let mut hash = 0x811C9DC5u32;
@@ -126,22 +127,17 @@ fn connection_id(tuple: &ConnectionTuple, role: u32) -> u32 {
 }
 
 #[inline(always)]
-fn mark_connection_closed(skaddr: u64, tuple: ConnectionTuple, role: u32) {
-    if role == CONNECTION_ROLE_UNKNOWN {
-        return;
-    }
-
-    let key = ConnectionIdentifier {
-        id: connection_id(&tuple, role),
-        pid: 0,
-        tuple,
-        role,
-    };
-
-    if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
-        let mut updated = *existing;
-        updated.is_active = 0;
-        let _ = CONNECTIONS.insert(&key, &updated, 0);
+fn mark_connection_closed(skaddr: u64) {
+    // Close path must reuse the exact key that was associated with this socket.
+    // Building a new key from tuple/role can miss because pid (and potentially other fields)
+    // may differ from the original insertion key.
+    if let Some(key) = unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+        let key = *key;
+        if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
+            let mut updated = *existing;
+            updated.is_active = 0;
+            let _ = CONNECTIONS.insert(&key, &updated, 0);
+        }
     }
 
     let _ = SOCK_TO_CONNECTION.remove(&skaddr);
@@ -177,8 +173,9 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     };
 
     if newstate == BPF_TCP_CLOSE as i32 {
-        mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_CLIENT);
-        mark_connection_closed(skaddr, tuple, CONNECTION_ROLE_SERVER);
+        // The socket->connection map tracks the active key for this socket, so a single
+        // close operation is sufficient and avoids key reconstruction mismatches.
+        mark_connection_closed(skaddr);
         return Ok(());
     }
 
@@ -201,7 +198,8 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
 
     if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
         throughput = *existing;
-        throughput.bytes_sent = throughput.bytes_sent.saturating_add(1);
+        // State transitions should not mutate byte counters.
+        // Bytes are only accounted in tcp_sendmsg/tcp_cleanup_rbuf probes.
         throughput.is_active = 1;
     }
 

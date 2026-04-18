@@ -8,7 +8,7 @@ static LINKS_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
     let g = GaugeVec::new(
         Opts::new(
             "caretta_links_observed",
-            "total bytes_sent value of links observed by caretta since its launch",
+            "total bytes transferred (bytes_sent + bytes_received) observed per link since launch",
         ),
         &[
             "link_id",
