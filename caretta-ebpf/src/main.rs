@@ -13,6 +13,8 @@ const CONNECTION_ROLE_SERVER: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+// Raw tracepoint layout offsets for inet_sock_set_state; these are populated from tracefs at
+// runtime so the program can read kernel fields without hardcoding kernel-version-specific values.
 pub struct TraceOffsets {
     pub skaddr_off: u32,
     pub newstate_off: u32,
@@ -24,6 +26,7 @@ pub struct TraceOffsets {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+// Raw 4-tuple extracted from the kernel socket state tracepoint.
 pub struct ConnectionTuple {
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -33,6 +36,8 @@ pub struct ConnectionTuple {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+// Connection identity used as the userspace-visible map key.
+// It combines the raw socket tuple, role, and current process id.
 pub struct ConnectionIdentifier {
     pub id: u32,
     pub pid: u32,
@@ -42,6 +47,9 @@ pub struct ConnectionIdentifier {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+// Per-connection counters tracked in eBPF maps.
+// bytes_sent comes from tcp_sendmsg, bytes_received comes from tcp_cleanup_rbuf,
+// and is_active tracks whether the socket is still open.
 pub struct ConnectionThroughputStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -74,6 +82,10 @@ pub fn handle_tcp_sendmsg(ctx: ProbeContext) -> u32 {
     }
 }
 
+// kprobe on tcp_sendmsg captures raw write-side data from the socket layer.
+// The probe reads:
+// - ctx.arg(0): struct sock * as the socket identity key
+// - ctx.arg(2): payload size in bytes
 #[kprobe]
 pub fn handle_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     match try_handle_tcp_cleanup_rbuf(&ctx) {
@@ -82,6 +94,8 @@ pub fn handle_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     }
 }
 
+// tracepoint on sock/inet_sock_set_state captures TCP state transitions and the raw
+// socket tuple fields exported by the kernel tracepoint payload.
 #[tracepoint]
 pub fn handle_sock_set_state(ctx: TracePointContext) -> u32 {
     match try_handle_sock_set_state(&ctx) {

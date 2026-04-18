@@ -9,6 +9,10 @@ This guide applies to tests under:
 - `caretta/src` (unit tests)
 - `caretta/tests` (integration and regression tests)
 
+Related runtime documentation:
+
+- [EBPF_DATA_COLLECTION.md](EBPF_DATA_COLLECTION.md)
+
 ## Test Layers
 
 1. Unit tests (`#[cfg(test)]` inside source files)
