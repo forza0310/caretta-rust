@@ -551,8 +551,9 @@ fn parse_ipv4_to_u32(ip: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    // Confirms DNS layer is a no-op when disabled and keeps literal IP names.
     #[test]
-    fn dns_cache_returns_ip_string_when_disabled() {
+    fn should_return_ip_string_when_dns_cache_is_disabled() {
         let cache = DnsCache::new(false, 8);
         let ip = u32::from(Ipv4Addr::new(8, 8, 8, 8));
 
@@ -560,8 +561,9 @@ mod tests {
         assert_eq!(name, "8.8.8.8");
     }
 
+    // Verifies static resolver emits external identity when no cluster mapping exists.
     #[test]
-    fn static_resolver_falls_back_to_external_with_ip_name_when_dns_disabled() {
+    fn should_fallback_to_external_identity_when_dns_is_disabled() {
         let resolver = StaticResolver::new(false, 8);
         let ip = u32::from(Ipv4Addr::new(1, 2, 3, 4));
 
@@ -571,8 +573,9 @@ mod tests {
         assert_eq!(workload.kind, "external");
     }
 
+    // Prevents regressions where invalid cache size could panic at construction time.
     #[test]
-    fn dns_cache_size_zero_is_normalized() {
+    fn should_normalize_cache_size_when_configured_as_zero() {
         let cache = DnsCache::new(false, 0);
         let ip = u32::from(Ipv4Addr::new(127, 0, 0, 1));
 
