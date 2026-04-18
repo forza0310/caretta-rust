@@ -12,7 +12,7 @@ use log::{info, warn};
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, Opts, TextEncoder};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -31,6 +31,8 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const DEFAULT_DEBUG_RESOLVER_ENDPOINT: &str = "/debug/resolver";
 const DEFAULT_DEBUG_RESOLVER_ENABLED: bool = false;
 const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
+const DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST: &str = "";
+const DEFAULT_OWNER_KIND_PRIORITY: &str = "";
 
 const ROLE_CLIENT: u32 = 1;
 const ROLE_SERVER: u32 = 2;
@@ -278,9 +280,21 @@ struct Opt {
     debug_resolver_endpoint: String,
     #[clap(long, default_value_t = DEFAULT_TRAVERSE_UP_HIERARCHY)]
     traverse_up_hierarchy: bool,
+    #[clap(long, default_value = DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST)]
+    owner_resolve_kind_allowlist: String,
+    #[clap(long, default_value = DEFAULT_OWNER_KIND_PRIORITY)]
+    owner_kind_priority: String,
 }
 
 impl Opt {
+    fn parse_csv_values(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn from_env_and_args() -> Self {
         let mut opt = Self::parse();
 
@@ -314,8 +328,28 @@ impl Opt {
                 opt.traverse_up_hierarchy = enabled;
             }
         }
+        if let Ok(v) = std::env::var("OWNER_RESOLVE_KIND_ALLOWLIST") {
+            opt.owner_resolve_kind_allowlist = v;
+        }
+        if let Ok(v) = std::env::var("OWNER_KIND_PRIORITY") {
+            opt.owner_kind_priority = v;
+        }
 
         opt
+    }
+
+    fn owner_kind_allowlist(&self) -> HashSet<String> {
+        Self::parse_csv_values(&self.owner_resolve_kind_allowlist)
+            .into_iter()
+            .collect()
+    }
+
+    fn owner_kind_priority(&self) -> HashMap<String, usize> {
+        Self::parse_csv_values(&self.owner_kind_priority)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, kind)| (kind, idx))
+            .collect()
     }
 }
 
@@ -365,11 +399,17 @@ struct K8sResolver {
     client: Client,
     ips: RwLock<HashMap<u32, Workload>>,
     traverse_up_hierarchy: bool,
+    owner_kind_allowlist: HashSet<String>,
+    owner_kind_priority: HashMap<String, usize>,
     watch_events: AtomicU64,
 }
 
 impl K8sResolver {
-    async fn try_new(traverse_up_hierarchy: bool) -> anyhow::Result<Arc<Self>> {
+    async fn try_new(
+        traverse_up_hierarchy: bool,
+        owner_kind_allowlist: HashSet<String>,
+        owner_kind_priority: HashMap<String, usize>,
+    ) -> anyhow::Result<Arc<Self>> {
         let client = Client::try_default()
             .await
             .context("failed to create Kubernetes client")?;
@@ -378,6 +418,8 @@ impl K8sResolver {
             client,
             ips: RwLock::new(HashMap::new()),
             traverse_up_hierarchy,
+            owner_kind_allowlist,
+            owner_kind_priority,
             watch_events: AtomicU64::new(0),
         });
 
@@ -513,11 +555,13 @@ impl K8sResolver {
             return (final_kind, final_name, immediate_owner);
         }
 
+        let mut chain: Vec<OwnerTarget> = Vec::new();
         let mut cur = initial;
         for _ in 0..8 {
             let Some(owner) = cur.clone() else {
                 break;
             };
+            chain.push(owner.clone());
             final_kind = owner.kind.clone();
             final_name = owner.name.clone();
 
@@ -528,7 +572,52 @@ impl K8sResolver {
             }
         }
 
+        if let Some(selected) = self.select_owner_from_chain(&chain) {
+            final_kind = selected.kind.clone();
+            final_name = selected.name.clone();
+        }
+
         (final_kind, final_name, immediate_owner)
+    }
+
+    fn select_owner_from_chain<'a>(&self, chain: &'a [OwnerTarget]) -> Option<&'a OwnerTarget> {
+        if chain.is_empty() {
+            return None;
+        }
+
+        let allow_all = self.owner_kind_allowlist.is_empty();
+        let mut best: Option<(usize, usize)> = None;
+
+        for (idx, owner) in chain.iter().enumerate() {
+            if !allow_all && !self.owner_kind_allowlist.contains(&owner.kind) {
+                continue;
+            }
+
+            let rank = self
+                .owner_kind_priority
+                .get(&owner.kind)
+                .copied()
+                .unwrap_or(usize::MAX);
+
+            match best {
+                None => best = Some((idx, rank)),
+                Some((best_idx, best_rank)) => {
+                    if rank < best_rank || (rank == best_rank && idx > best_idx) {
+                        best = Some((idx, rank));
+                    }
+                }
+            }
+        }
+
+        if let Some((idx, _)) = best {
+            return chain.get(idx);
+        }
+
+        if allow_all {
+            chain.last()
+        } else {
+            chain.first()
+        }
     }
 
     async fn refresh_snapshot(&self) -> anyhow::Result<()> {
@@ -1029,7 +1118,16 @@ async fn main() -> anyhow::Result<()> {
         format!("/{}", opt.debug_resolver_endpoint)
     };
 
-    let resolver: Arc<dyn IpResolver> = match K8sResolver::try_new(opt.traverse_up_hierarchy).await {
+    let owner_kind_allowlist = opt.owner_kind_allowlist();
+    let owner_kind_priority = opt.owner_kind_priority();
+
+    let resolver: Arc<dyn IpResolver> = match K8sResolver::try_new(
+        opt.traverse_up_hierarchy,
+        owner_kind_allowlist,
+        owner_kind_priority,
+    )
+    .await
+    {
         Ok(r) => {
             info!("kubernetes resolver enabled");
             r

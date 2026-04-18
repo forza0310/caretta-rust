@@ -65,6 +65,24 @@
 	- 可选值: true 或 false
 	- 默认: true
 	- 作用: 是否沿 owner 链继续上卷到更稳定工作负载
+- OWNER_RESOLVE_KIND_ALLOWLIST
+	- 格式: 逗号分隔 Kind 列表
+	- 默认: 空(表示不限制)
+	- 作用: 限制哪些 Kind 可以作为最终归并目标
+	- 示例: Deployment,StatefulSet,DaemonSet,Installation
+- OWNER_KIND_PRIORITY
+	- 格式: 逗号分隔 Kind 列表，越靠前优先级越高
+	- 默认: 空(表示按 owner 链最高层目标归并)
+	- 作用: 当 owner 链上存在多个候选 Kind 时，按优先级挑选最终归并目标
+	- 示例: Installation,Deployment,StatefulSet,DaemonSet,Job,CronJob,ReplicaSet
+
+Installation 场景示例:
+
+	TRAVERSE_UP_HIERARCHY=true
+	OWNER_RESOLVE_KIND_ALLOWLIST=Deployment,StatefulSet,DaemonSet,Installation
+	OWNER_KIND_PRIORITY=Installation,Deployment,StatefulSet,DaemonSet
+
+当链路为 Pod -> ReplicaSet -> Deployment -> Installation 时，最终会归并到 Installation。
 
 ### 调试端点
 
