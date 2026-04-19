@@ -30,6 +30,33 @@
 - 指标端点: http://127.0.0.1:7117/metrics
 - 调试端点: 按环境变量控制，默认关闭
 
+## 镜像构建与 GHCR 发布
+
+仓库已提供：
+
+- Dockerfile: [Dockerfile](Dockerfile)
+- GitHub Actions: [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)
+
+触发方式：
+
+- push 到 master 分支
+- push 版本 tag（例如 v0.1.0）
+- 手动触发 workflow_dispatch
+
+发布地址：
+
+- ghcr.io/<owner>/<repo>
+
+例如当前仓库通常会发布到：
+
+- ghcr.io/forza0310/caretta-rust
+
+注意：
+
+- workflow 使用 GitHub 自带的 GITHUB_TOKEN 推送 ghcr，需要仓库允许 packages:write。
+- CI 会先在 GitHub Actions 里编译 Rust 二进制，再用 Dockerfile 打包运行时镜像并推送到 GHCR。
+- Dockerfile 只负责运行时环境配置和复制 `target/release/caretta`，不再执行源码编译。
+
 ## 端点说明
 
 ### 1) /metrics

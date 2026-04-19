@@ -1,0 +1,10 @@
+target/*
+!target/release/
+target/release/*
+!target/release/caretta
+.git
+.github
+.idea
+.vscode
+**/*.md
+**/*.log

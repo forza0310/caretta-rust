@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caretta-rust
+  labels:
+    app: caretta-rust
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: caretta-rust
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: caretta-rust
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: caretta-rust
+subjects:
+  - kind: ServiceAccount
+    name: caretta-rust
+    namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caretta-rust
+  labels:
+    app: caretta-rust
+spec:
+  selector:
+    app: caretta-rust
+  ports:
+    - name: metrics
+      port: 7117
+      targetPort: 7117
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: caretta-rust
+  labels:
+    app: caretta-rust
+spec:
+  selector:
+    matchLabels:
+      app: caretta-rust
+  template:
+    metadata:
+      labels:
+        app: caretta-rust
+    spec:
+      serviceAccountName: caretta-rust
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: caretta-rust
+          image: ghcr.io/forza0310/caretta-rust:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: PROMETHEUS_PORT
+              value: "7117"
+            - name: PROMETHEUS_ENDPOINT
+              value: "/metrics"
+            - name: RESOLVE_DNS
+              value: "true"
+            - name: DNS_CACHE_SIZE
+              value: "10000"
+            - name: DEBUG_RESOLVER_ENABLED
+              value: "true"
+            - name: DEBUG_RESOLVER_ENDPOINT
+              value: "/debug/resolver"
+            - name: TRAVERSE_UP_HIERARCHY
+              value: "true"
+          ports:
+            - name: metrics
+              containerPort: 7117
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

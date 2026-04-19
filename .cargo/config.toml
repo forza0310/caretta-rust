@@ -1,8 +1,0 @@
-[target."cfg(all())"]
-runner = "sudo -E"
-
-[env]
-KUBECONFIG = "/home/cbw/.kube/config"
-DEBUG_RESOLVER_ENABLED="true"
-# Resolver 行为
-OWNER_RESOLVE_KIND_ALLOWLIST="Deployment,StatefulSet,DaemonSet,Installation"

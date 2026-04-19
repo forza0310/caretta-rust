@@ -1,3 +1,6 @@
+/.idea
+/.vscode
+/.cargo
+
 /target
-.idea
-caretta-go/
+/caretta-go
