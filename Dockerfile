@@ -7,12 +7,17 @@ WORKDIR /workspace
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup
 
-RUN ln -snf /usr/share/zoneinfo/PRC /etc/localtime \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+    && ln -snf /usr/share/zoneinfo/PRC /etc/localtime \
     && echo PRC > /etc/timezone \
     && rustup toolchain install nightly --profile minimal \
     && rustup default nightly \
     && rustup component add rust-src --toolchain nightly \
-    && cargo install --locked bpf-linker \
+    && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    && cargo binstall -y bpf-linker \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
@@ -21,8 +26,9 @@ COPY . .
 # same libc that will be available in the runtime stage.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release -p caretta \
-    && strip /workspace/target/release/caretta \
+    cargo build --release -p caretta
+
+RUN strip /workspace/target/release/caretta \
     && mv /workspace/target/release/caretta /tmp/caretta \
     && cargo clean \
     && rm -rf /var/lib/apt/lists/* /usr/local/cargo/registry /usr/local/cargo/git
