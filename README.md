@@ -49,6 +49,51 @@
 	DEBUG_RESOLVER_ENABLED=true cargo run
 	curl -s http://127.0.0.1:7117/debug/resolver | head -n 40
 
+## Grafana 接入
+
+当前 Rust 版已经暴露了 Prometheus 兼容指标端点，可以直接接入 Grafana。最短路径是先让 Prometheus 抓取 /metrics，再让 Grafana 连接这个 Prometheus 数据源，最后导入 caretta 的 dashboard。
+
+部署模板见 [deploy/README.md](deploy/README.md)。
+
+### 1) 让 Prometheus 抓取本项目指标
+
+- 指标端点默认是 http://127.0.0.1:7117/metrics
+- 如果你部署到 Kubernetes，建议用 Pod 发现或 ServiceMonitor 抓取这个端点
+- 抓取间隔建议与 poll interval 保持在同一量级，例如 5s 到 15s
+
+一个最小 Prometheus scrape 配置示例：
+
+```yaml
+scrape_configs:
+	- job_name: caretta-rust
+		metrics_path: /metrics
+		scrape_interval: 5s
+		kubernetes_sd_configs:
+			- role: pod
+		relabel_configs:
+			- source_labels: [__meta_kubernetes_pod_label_app]
+				regex: caretta-rust
+				action: keep
+```
+
+### 2) 在 Grafana 中添加 Prometheus 数据源
+
+- 数据源类型选择 Prometheus
+- URL 指向你的 Prometheus 地址，例如 http://prometheus:9090
+- 如果你已经有现成的 Grafana/Prometheus 组件，可以直接复用 caretta-go 的部署方式
+
+### 3) 导入 dashboard
+
+- 这份 Rust 版和 caretta-go 保持了核心指标名一致，主要包括 caretta_links_observed 和 caretta_tcp_states
+- 可以直接参考 caretta-go/chart/dashboard.json 的面板定义，迁移时重点核对查询里的标签名是否与当前部署一致
+- 如果你是想快速验证，先在 Grafana Explore 里查 caretta_links_observed，再逐步导入 node graph 和 throughput 面板
+
+### 4) 排查建议
+
+- 先确认 /metrics 有数据，再看 Prometheus Targets 是否是 Up
+- 如果 Grafana 面板是空的，优先检查 job label、metrics_path 和 scrape_interval 是否匹配
+- 如果看不到外部流量名称，确认 RESOLVE_DNS 是否开启，以及 DNS 解析是否成功
+
 ## 环境变量
 
 ### Kubernetes 凭据

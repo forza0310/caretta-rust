@@ -1,0 +1,73 @@
+# Caretta Rust observability template.
+#
+# This file mirrors the caretta-go Helm values layout so you can wire the Rust binary into
+# a Prometheus + Grafana stack with minimal changes.
+#
+# Assumptions:
+# - the workload label is `app=caretta-rust`
+# - the metrics endpoint is exposed on `/metrics`
+# - Grafana reads dashboards from a ConfigMap mounted into `/var/lib/grafana/dashboards`
+
+prometheus:
+  enabled: true
+  scrapeInterval: 5s
+  scrapeConfigs:
+    - job_name: caretta-rust
+      metrics_path: /metrics
+      scrape_interval: 5s
+      kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            own_namespace: true
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          regex: caretta-rust
+          action: keep
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: caretta_pod
+        - source_labels: [__meta_kubernetes_pod_node_name]
+          action: replace
+          target_label: caretta_node
+
+# Grafana data source configuration. Point this URL at the Prometheus instance that scrapes caretta-rust.
+grafana:
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          editable: true
+          isDefault: true
+
+  # Mount dashboard JSON files through a ConfigMap and point Grafana at the same path as caretta-go.
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+            foldersFromFilesStructure: true
+
+  grafanaIni:
+    auth.anonymous:
+      enabled: true
+    dashboards:
+      default_home_dashboard_path: /var/lib/grafana/dashboards/default-dashboard.json
+
+  # Update this ConfigMap name to the one you use for the dashboard JSON.
+  dashboardsConfigMaps:
+    default: caretta-rust-grafana-dashboards
+
+# Example placeholder for the dashboard ConfigMap name used by Grafana.
+# Put your dashboard.json into this ConfigMap, or reuse the caretta-go dashboard JSON after
+# verifying the label names match the Rust build.

@@ -63,14 +63,22 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 #[map]
+// Primary per-connection store. Userspace iterates this map to read throughput and liveness
+// for each observed TCP connection.
 static CONNECTIONS: HashMap<ConnectionIdentifier, ConnectionThroughputStats> =
     HashMap::<ConnectionIdentifier, ConnectionThroughputStats>::with_max_entries(131072, 0);
 
 #[map]
+// Reverse lookup from raw socket identity to the active connection key.
+// This lets the close path and byte-accounting probes find the exact connection entry without
+// rebuilding the key from tuple fields.
 static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
 #[map]
+// Runtime-discovered tracepoint field offsets for sock/inet_sock_set_state.
+// Userspace fills this once at startup so the tracepoint can read kernel fields safely across
+// kernel versions.
 static TRACEPOINT_OFFSETS: HashMap<u32, TraceOffsets> =
     HashMap::<u32, TraceOffsets>::with_max_entries(1, 0);
 
