@@ -25,7 +25,6 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-          targets: bpfel-unknown-none
 
       - name: Install system packages
         run: |
