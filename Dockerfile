@@ -12,13 +12,15 @@ RUN apt-get update \
         curl \
         ca-certificates \
     && ln -snf /usr/share/zoneinfo/PRC /etc/localtime \
-    && echo PRC > /etc/timezone \
-    && rustup toolchain install nightly --profile minimal \
+    && echo PRC > /etc/timezone
+
+RUN rustup toolchain install nightly --profile minimal \
     && rustup default nightly \
     && rustup component add rust-src --toolchain nightly \
-    # && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
-    && cargo binstall -y bpf-linker \
-    && rm -rf /var/lib/apt/lists/*
+    && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    && cargo binstall -y bpf-linker
+    
+RUN rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
