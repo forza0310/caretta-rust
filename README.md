@@ -55,7 +55,7 @@
 
 - workflow 使用 GitHub 自带的 GITHUB_TOKEN 推送 ghcr，需要仓库允许 packages:write。
 - CI 会先在 GitHub Actions 里编译 Rust 二进制，再用 Dockerfile 打包运行时镜像并推送到 GHCR。
-- CI 使用 nightly 工具链，并安装 rust-src 与 bpfel-unknown-none target 以满足 aya/eBPF 构建要求。
+- CI 使用 nightly 工具链并安装 rust-src；不依赖下载 `bpfel-unknown-none` 预编译组件，以避免 nightly 组件缺失导致流水线失败。
 - Dockerfile 只负责运行时环境配置和复制 `target/release/caretta`，不再执行源码编译。
 
 ## 端点说明
