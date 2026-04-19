@@ -16,7 +16,7 @@ RUN apt-get update \
     && rustup toolchain install nightly --profile minimal \
     && rustup default nightly \
     && rustup component add rust-src --toolchain nightly \
-    && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    # && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
     && cargo binstall -y bpf-linker \
     && rm -rf /var/lib/apt/lists/*
 
@@ -33,7 +33,7 @@ RUN strip /workspace/target/release/caretta \
     && cargo clean \
     && rm -rf /var/lib/apt/lists/* /usr/local/cargo/registry /usr/local/cargo/git
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 ENV TZ=PRC \
     RUST_LOG=info
