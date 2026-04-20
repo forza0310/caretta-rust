@@ -2,7 +2,7 @@
 
 use crate::types::{NetworkLink, TcpConnection, fnv_hash};
 use once_cell::sync::Lazy;
-use prometheus::{Gauge, GaugeVec, IntCounter, Opts};
+use prometheus::{Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
 
 static LINKS_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
     let g = GaugeVec::new(
@@ -117,6 +117,40 @@ static MAP_DELETIONS: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+// Counts all processed watch stream events by Kubernetes object type.
+// This helps quantify watcher churn and event pressure during control-plane instability.
+static WATCHER_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "caretta_watcher_events_count",
+            "total number of Kubernetes watcher events processed by object type",
+        ),
+        &["object_type"],
+    )
+    .expect("create caretta_watcher_events_count");
+    prometheus::default_registry()
+        .register(Box::new(c.clone()))
+        .expect("register caretta_watcher_events_count");
+    c
+});
+
+// Counts successful watch stream re-establishments by object type.
+// The initial watch start is excluded; only reconnects are counted.
+static WATCHER_RESETS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "caretta_watcher_resets_count",
+            "total number of Kubernetes watcher reconnects by object type",
+        ),
+        &["object_type"],
+    )
+    .expect("create caretta_watcher_resets_count");
+    prometheus::default_registry()
+        .register(Box::new(c.clone()))
+        .expect("register caretta_watcher_resets_count");
+    c
+});
+
 pub fn mark_poll() {
     POLLS_MADE.inc();
 }
@@ -135,6 +169,20 @@ pub fn mark_failed_connection_deletion() {
 
 pub fn mark_map_deletion() {
     MAP_DELETIONS.inc();
+}
+
+// Record one watcher event for the given object type label.
+pub fn mark_watcher_event(object_type: &str) {
+    WATCHER_EVENTS_COUNT
+        .with_label_values(&[object_type])
+        .inc();
+}
+
+    // Record one watcher reconnect/reset for the given object type label.
+pub fn mark_watcher_reset(object_type: &str) {
+    WATCHER_RESETS_COUNT
+        .with_label_values(&[object_type])
+        .inc();
 }
 
 /// Update the link throughput gauge for a single normalized link.

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 
+use crate::metrics;
 use crate::types::Workload;
 
 pub trait IpResolver: Send + Sync {
@@ -200,10 +201,17 @@ impl K8sResolver {
             + 'static,
     {
         tokio::spawn(async move {
+            let mut started_once = false;
             let api: Api<K> = Api::all(resolver.client.clone());
             loop {
                 let mut stream = match api.watch(&WatchParams::default(), "0").await {
-                    Ok(stream) => stream.boxed(),
+                    Ok(stream) => {
+                        if started_once {
+                            metrics::mark_watcher_reset(watch_name);
+                        }
+                        started_once = true;
+                        stream.boxed()
+                    }
                     Err(err) => {
                         warn!("failed to start watch for {watch_name}: {err}");
                         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -217,6 +225,7 @@ impl K8sResolver {
                         | Ok(WatchEvent::Modified(_))
                         | Ok(WatchEvent::Deleted(_))
                         | Ok(WatchEvent::Bookmark(_)) => {
+                            metrics::mark_watcher_event(watch_name);
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
                         }
