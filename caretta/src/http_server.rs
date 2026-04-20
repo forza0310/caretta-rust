@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Serve /metrics and optional resolver debug endpoint until shutdown is signaled.
 pub async fn run_metrics_server(
@@ -16,11 +16,23 @@ pub async fn run_metrics_server(
     debug_resolver_enabled: bool,
     debug_resolver_endpoint: String,
     resolver: Arc<dyn IpResolver>,
+    startup_tx: oneshot::Sender<anyhow::Result<()>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr)
+    let listener = match TcpListener::bind(addr)
         .await
-        .with_context(|| format!("failed to bind metrics server at {addr}"))?;
+        .with_context(|| format!("failed to bind metrics server at {addr}"))
+    {
+        Ok(listener) => {
+            let _ = startup_tx.send(Ok(()));
+            listener
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = startup_tx.send(Err(anyhow::anyhow!(msg)));
+            return Err(e);
+        }
+    };
 
     loop {
         tokio::select! {

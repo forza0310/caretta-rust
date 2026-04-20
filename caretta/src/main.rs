@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, TraceOffsets, TcpConnection,
     is_loopback, parse_tracepoint_offsets, reduce_connection_to_link, reduce_connection_to_tcp,
@@ -141,14 +141,28 @@ async fn main() -> anyhow::Result<()> {
     if opt.debug_resolver_enabled {
         info!("debug resolver endpoint enabled at {}", debug_resolver_endpoint);
     }
+
+    let (metrics_startup_tx, metrics_startup_rx) = oneshot::channel();
     let metrics_task = tokio::spawn(http_server::run_metrics_server(
         metrics_addr,
         endpoint.clone(),
         opt.debug_resolver_enabled,
         debug_resolver_endpoint,
         Arc::clone(&resolver),
+        metrics_startup_tx,
         shutdown_rx,
     ));
+
+    match metrics_startup_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "metrics server startup signal dropped: {e}"
+            ));
+        }
+    }
+
     info!("metrics server listening on {}{}", metrics_addr, endpoint);
     let mut past_links: HashMap<NetworkLink, u64> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
