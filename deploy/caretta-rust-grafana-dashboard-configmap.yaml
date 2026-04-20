@@ -354,7 +354,7 @@ data:
           },
           "gridPos": {
             "h": 8,
-            "w": 12,
+            "w": 24,
             "x": 0,
             "y": 24
           },
@@ -378,10 +378,43 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (object_type, event_type) (rate(caretta_k8s_events_count[$__rate_interval]))",
-              "legendFormat": "{{object_type}}/{{event_type}}",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"added\"}[$__rate_interval]))",
+              "legendFormat": "added/{{object_type}}",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"modified\"}[$__rate_interval]))",
+              "legendFormat": "modified/{{object_type}}",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"deleted\"}[$__rate_interval]))",
+              "legendFormat": "deleted/{{object_type}}",
+              "range": true,
+              "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"bookmark\"}[$__rate_interval]))",
+              "legendFormat": "bookmark/{{object_type}}",
+              "range": true,
+              "refId": "D"
             }
           ],
           "title": "K8s Event Rate",
