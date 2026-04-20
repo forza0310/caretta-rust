@@ -85,7 +85,8 @@
 ### 1) 让 Prometheus 抓取本项目指标
 
 - 指标端点默认是 http://127.0.0.1:7117/metrics
-- 如果你部署到 Kubernetes，建议用 Pod 发现或 ServiceMonitor 抓取这个端点
+- 如果你部署到 Kubernetes 且使用当前 DaemonSet 清单（hostNetwork=true），每个节点会直接在 NodeIP:7117 暴露 /metrics
+- Prometheus 建议使用基于 Pod/Node 的发现与 relabel 后按 NodeIP:7117 抓取，不需要 ClusterIP Service
 - 抓取间隔建议与 poll interval 保持在同一量级，例如 5s 到 15s
 
 一个最小 Prometheus scrape 配置示例：
@@ -174,7 +175,7 @@ external 回退行为:
 - DEBUG_RESOLVER_ENABLED
 	- 可选值: true 或 false
 	- 默认: false
-	- 作用: 开启或关闭 resolver 调试端点
+	- 作用: 开启或关闭 resolver 调试端点（K8s 清单默认关闭）
 - DEBUG_RESOLVER_ENDPOINT
 	- 默认: /debug/resolver
 	- 作用: 自定义调试端点路径

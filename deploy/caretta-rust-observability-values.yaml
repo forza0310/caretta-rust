@@ -6,6 +6,8 @@
 # Assumptions:
 # - the workload label is `app=caretta-rust`
 # - the metrics endpoint is exposed on `/metrics`
+# - the DaemonSet runs with `hostNetwork: true`, so Prometheus should scrape NodeIP:7117
+#   directly; no ClusterIP Service is required
 # - Grafana reads dashboards from a ConfigMap mounted into `/var/lib/grafana/dashboards`
 
 prometheus:

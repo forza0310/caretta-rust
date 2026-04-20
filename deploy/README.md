@@ -6,7 +6,7 @@ This directory contains the minimal observability template for the Rust rewrite.
 
 - [caretta-rust-observability-values.yaml](caretta-rust-observability-values.yaml): Helm-style values template for a Prometheus + Grafana stack.
 - [caretta-rust-grafana-dashboard-configmap.yaml](caretta-rust-grafana-dashboard-configmap.yaml): Ready-to-apply ConfigMap with embedded dashboard JSON.
-- [caretta-rust-k8s.yaml](caretta-rust-k8s.yaml): Minimal DaemonSet, RBAC, and metrics Service for Kubernetes deployment.
+- [caretta-rust-k8s.yaml](caretta-rust-k8s.yaml): Minimal DaemonSet, RBAC, and hostNetwork metrics endpoint for Kubernetes deployment.
 
 ## How to use
 
@@ -21,6 +21,7 @@ This directory contains the minimal observability template for the Rust rewrite.
 
 - The template assumes Prometheus is reachable at `http://prometheus:9090`.
 - If your Prometheus service name differs, update the datasource URL.
-- For in-cluster scraping, a ServiceMonitor is also fine if your stack already uses the Prometheus Operator.
+- The DaemonSet uses `hostNetwork: true`, so each node exposes the metrics endpoint directly on `NodeIP:7117`; Prometheus can scrape those node IPs without a ClusterIP Service.
+- If your stack already uses the Prometheus Operator, use PodMonitor or equivalent pod-based discovery against `NodeIP:7117` instead of a ServiceMonitor.
 - The dashboard file is mounted as `default-dashboard.json`, which matches the Grafana home-dashboard path in the values template.
 - The DaemonSet runs privileged with host networking so eBPF probes can load on each node.
