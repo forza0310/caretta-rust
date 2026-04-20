@@ -348,7 +348,7 @@ data:
                   }
                 ]
               },
-              "unit": "ops"
+              "unit": "suffix:ops/min"
             },
             "overrides": []
           },
@@ -378,7 +378,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"added\"}[$__rate_interval]))",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"added\"}[$__rate_interval]) * 60)",
               "legendFormat": "added/{{object_type}}",
               "range": true,
               "refId": "A"
@@ -389,7 +389,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"modified\"}[$__rate_interval]))",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"modified\"}[$__rate_interval]) * 60)",
               "legendFormat": "modified/{{object_type}}",
               "range": true,
               "refId": "B"
@@ -400,7 +400,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"deleted\"}[$__rate_interval]))",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"deleted\"}[$__rate_interval]) * 60)",
               "legendFormat": "deleted/{{object_type}}",
               "range": true,
               "refId": "C"
@@ -411,7 +411,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"bookmark\"}[$__rate_interval]))",
+              "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"bookmark\"}[$__rate_interval]) * 60)",
               "legendFormat": "bookmark/{{object_type}}",
               "range": true,
               "refId": "D"
