@@ -16,8 +16,10 @@ use config::Opt;
 use log::{info, warn};
 use resolver::{IpResolver, K8sResolver, StaticResolver};
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -26,6 +28,31 @@ use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, TraceOffsets, TcpConnection,
     is_loopback, parse_tracepoint_offsets, reduce_connection_to_link, reduce_connection_to_tcp,
 };
+
+const TRACEPOINT_FORMAT_PATH: &str = "/sys/kernel/tracing/events/sock/inet_sock_set_state/format";
+
+fn ensure_tracepoint_format_readable(path: &str) -> anyhow::Result<()> {
+    let path_ref = Path::new(path);
+    if !path_ref.exists() {
+        anyhow::bail!(
+            "tracepoint format file not found: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
+            path
+        );
+    }
+    if !path_ref.is_file() {
+        anyhow::bail!(
+            "tracepoint format path is not a file: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
+            path
+        );
+    }
+    File::open(path_ref).with_context(|| {
+        format!(
+            "tracepoint format file is not readable: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
+            path
+        )
+    })?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
     kprobe_recv.attach("tcp_cleanup_rbuf", 0)?;
 
     // Resolve tracepoint field offsets dynamically to avoid kernel-version-specific hardcoding.
-    let offsets =
-        parse_tracepoint_offsets("/sys/kernel/tracing/events/sock/inet_sock_set_state/format")?;
+    ensure_tracepoint_format_readable(TRACEPOINT_FORMAT_PATH)?;
+    let offsets = parse_tracepoint_offsets(TRACEPOINT_FORMAT_PATH)?;
     let offsets_key = 0u32;
     let mut offsets_map: BpfHashMap<_, u32, TraceOffsets> = BpfHashMap::try_from(
         ebpf.map_mut("TRACEPOINT_OFFSETS")

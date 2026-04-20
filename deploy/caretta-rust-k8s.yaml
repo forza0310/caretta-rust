@@ -33,20 +33,6 @@ subjects:
     name: caretta-rust
     namespace: default
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: caretta-rust
-  labels:
-    app: caretta-rust
-spec:
-  selector:
-    app: caretta-rust
-  ports:
-    - name: metrics
-      port: 7117
-      targetPort: 7117
----
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -63,7 +49,12 @@ spec:
         app: caretta-rust
     spec:
       serviceAccountName: caretta-rust
+      # Use hostNetwork so the agent runs in the node network namespace and can observe
+      # host-level socket activity consistently for eBPF-based tracing.
+      # This also exposes port 7117 directly on each node IP, rather than through
+      # an in-cluster ClusterIP Service.
       hostNetwork: true
+      # Keep cluster DNS resolution while using host network namespace.
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: caretta-rust
@@ -89,6 +80,10 @@ spec:
           ports:
             - name: metrics
               containerPort: 7117
+          volumeMounts:
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -96,3 +91,8 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
+            type: Directory
