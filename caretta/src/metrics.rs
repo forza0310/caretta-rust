@@ -2,10 +2,12 @@
 
 use crate::types::{NetworkLink, TcpConnection, fnv_hash};
 use once_cell::sync::Lazy;
-use prometheus::{Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
+use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-static LINKS_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
-    let g = GaugeVec::new(
+static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
         Opts::new(
             "caretta_links_observed",
             "total bytes transferred (bytes_sent + bytes_received) observed per link since launch",
@@ -27,10 +29,14 @@ static LINKS_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
     )
     .expect("create caretta_links_observed");
     prometheus::default_registry()
-        .register(Box::new(g.clone()))
+        .register(Box::new(c.clone()))
         .expect("register caretta_links_observed");
-    g
+    c
 });
+
+// Keep the last cumulative value per link so we can emit only deltas into the Counter metric.
+static LAST_LINK_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
     let g = GaugeVec::new(
@@ -163,7 +169,7 @@ pub fn mark_k8s_event(object_type: &str, event_type: &str) {
         .inc();
 }
 
-/// Update the link throughput gauge for a single normalized link.
+/// Update the link throughput counter for a single normalized link.
 pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
     let link_id = (fnv_hash(
         &(link.client.name.clone()
@@ -176,6 +182,33 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
     let server_id = fnv_hash(&(link.server.name.clone() + &link.server.namespace)).to_string();
     let server_port = link.server_port.to_string();
     let role = link.role.to_string();
+    let link_key = [
+        link_id.as_str(),
+        client_id.as_str(),
+        link.client.name.as_str(),
+        link.client.namespace.as_str(),
+        link.client.kind.as_str(),
+        link.client.owner.as_str(),
+        server_id.as_str(),
+        link.server.name.as_str(),
+        link.server.namespace.as_str(),
+        link.server.kind.as_str(),
+        server_port.as_str(),
+        role.as_str(),
+    ]
+    .join("\x1f");
+
+    let delta = if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
+        let previous = seen.get(&link_key).copied().unwrap_or(0);
+        seen.insert(link_key, throughput);
+        throughput.saturating_sub(previous)
+    } else {
+        0
+    };
+
+    if delta == 0 {
+        return;
+    }
 
     LINKS_METRICS
         .with_label_values(&[
@@ -192,7 +225,7 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
             &server_port,
             &role,
         ])
-        .set(throughput as f64);
+        .inc_by(delta as f64);
 }
 
 /// Update the state gauge for a single TCP connection observation.

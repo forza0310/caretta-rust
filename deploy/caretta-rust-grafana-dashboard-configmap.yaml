@@ -68,7 +68,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "increase((sum by (id, title, subTitle, detail__kind, arc__color) (label_replace((label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"$1\", \"server_kind\", \"(.*)\"), \"subTitle\", \"$1\", \"server_namespace\", \"(.*)\"), \"title\", \"$1\", \"server_name\", \"(.*)\"), \"id\", \"$1\", \"server_id\", \"(.*)\") or label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"$1\", \"client_kind\", \"(.*)\"), \"subTitle\", \"$1\", \"client_namespace\", \"(.*)\"), \"title\", \"$1\", \"client_name\", \"(.*)\"), \"id\", \"$1\", \"client_id\", \"(.*)\")  ), \"arc__color\", \"1\", \"link_id\", \"(.*)\")) )[$__range:$__interval])  > 0",
+              "expr": "round(increase((sum by (id, title, subTitle, detail__kind, arc__color) (label_replace((label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"$1\", \"server_kind\", \"(.*)\"), \"subTitle\", \"$1\", \"server_namespace\", \"(.*)\"), \"title\", \"$1\", \"server_name\", \"(.*)\"), \"id\", \"$1\", \"server_id\", \"(.*)\") or label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"$1\", \"client_kind\", \"(.*)\"), \"subTitle\", \"$1\", \"client_namespace\", \"(.*)\"), \"title\", \"$1\", \"client_name\", \"(.*)\"), \"id\", \"$1\", \"client_id\", \"(.*)\")  ), \"arc__color\", \"1\", \"link_id\", \"(.*)\")) )[$__range:$__interval]))  > 0",
               "format": "table",
               "instant": true,
               "legendFormat": "__auto",
@@ -82,7 +82,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "increase((sum by (id, source, target, mainStat) ((label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"id\", \"$1\", \"link_id\", \"(.*)\"), \"source\", \"$1\", \"client_id\", \"(.*)\"), \"target\", \"$1\", \"server_id\", \"(.*)\"), \"mainStat\", \"$1\", \"server_port\", \"(.*)\"))) )[$__range:$__interval]) > 0",
+              "expr": "round(increase((sum by (id, source, target, mainStat) ((label_replace(label_replace(label_replace(label_replace((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"id\", \"$1\", \"link_id\", \"(.*)\"), \"source\", \"$1\", \"client_id\", \"(.*)\"), \"target\", \"$1\", \"server_id\", \"(.*)\"), \"mainStat\", \"$1\", \"server_port\", \"(.*)\"))) )[$__range:$__interval])) > 0",
               "format": "table",
               "hide": false,
               "instant": true,
@@ -91,7 +91,7 @@ data:
               "refId": "edges"
             }
           ],
-          "title": "Service Map ☸️",
+          "title": "Service Map",
           "type": "nodeGraph"
         },
         {
@@ -153,7 +153,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (server_port) (increase((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})[$__range:$__interval])) > 0",
+              "expr": "round(sum by (server_port) (increase((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})[$__range:$__interval]))) > 0",
               "legendFormat": "__auto",
               "range": true,
               "refId": "A"
