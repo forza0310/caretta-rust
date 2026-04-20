@@ -121,37 +121,18 @@ static MAP_DELETIONS: Lazy<IntCounter> = Lazy::new(|| {
 // This helps quantify watcher churn and event pressure during control-plane instability.
 // 量化事件压力：当控制平面（如 API Server 或 etcd）发生故障或网络抖动时，短时间内可能触发大量资源更新。该指标的陡增能直接反映“事件风暴”。
 // 发现异常波动：如果一个平时事件量很少的控制器突然收到海量事件，可能是上游系统（如 HPA）频繁修改资源，或者集群发生了大规模驱逐。
-static WATCHER_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+static K8S_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
-            "caretta_watcher_events_count",
-            "total number of Kubernetes watcher events processed by object type",
+            "caretta_k8s_events_count",
+            "total number of Kubernetes watch events processed by object type",
         ),
         &["object_type"],
     )
-    .expect("create caretta_watcher_events_count");
+    .expect("create caretta_k8s_events_count");
     prometheus::default_registry()
         .register(Box::new(c.clone()))
-        .expect("register caretta_watcher_events_count");
-    c
-});
-
-// Counts successful watch stream re-establishments by object type.
-// The initial watch start is excluded; only reconnects are counted.
-// 当 Watch 长连接断开后，客户端成功与 API Server 重新建立连接并恢复监听的次数。
-// 衡量连接稳定性：频繁的重连意味着客户端与 API Server 之间的网络不稳定，或者 API Server 负载过高导致超时。
-static WATCHER_RESETS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "caretta_watcher_resets_count",
-            "total number of Kubernetes watcher reconnects by object type",
-        ),
-        &["object_type"],
-    )
-    .expect("create caretta_watcher_resets_count");
-    prometheus::default_registry()
-        .register(Box::new(c.clone()))
-        .expect("register caretta_watcher_resets_count");
+        .expect("register caretta_k8s_events_count");
     c
 });
 
@@ -176,15 +157,8 @@ pub fn mark_map_deletion() {
 }
 
 // Record one watcher event for the given object type label.
-pub fn mark_watcher_event(object_type: &str) {
-    WATCHER_EVENTS_COUNT
-        .with_label_values(&[object_type])
-        .inc();
-}
-
-    // Record one watcher reconnect/reset for the given object type label.
-pub fn mark_watcher_reset(object_type: &str) {
-    WATCHER_RESETS_COUNT
+pub fn mark_k8s_event(object_type: &str) {
+    K8S_EVENTS_COUNT
         .with_label_values(&[object_type])
         .inc();
 }
