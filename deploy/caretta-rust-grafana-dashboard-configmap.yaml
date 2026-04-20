@@ -384,7 +384,7 @@ data:
               "refId": "A"
             }
           ],
-          "title": "Watcher Events Rate",
+          "title": "K8s Event Rate",
           "type": "timeseries"
         },
         {
@@ -443,7 +443,7 @@ data:
               "refId": "A"
             }
           ],
-          "title": "Watcher Resets Increase",
+          "title": "K8s Watcher Reset Counts",
           "type": "timeseries"
         }
       ],
