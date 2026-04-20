@@ -214,11 +214,23 @@ impl K8sResolver {
 
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(WatchEvent::Added(_))
-                        | Ok(WatchEvent::Modified(_))
-                        | Ok(WatchEvent::Deleted(_))
-                        | Ok(WatchEvent::Bookmark(_)) => {
-                            metrics::mark_k8s_event(watch_name);
+                        Ok(WatchEvent::Added(_)) => {
+                            metrics::mark_k8s_event(watch_name, "added");
+                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.try_send(());
+                        }
+                        Ok(WatchEvent::Modified(_)) => {
+                            metrics::mark_k8s_event(watch_name, "modified");
+                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.try_send(());
+                        }
+                        Ok(WatchEvent::Deleted(_)) => {
+                            metrics::mark_k8s_event(watch_name, "deleted");
+                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.try_send(());
+                        }
+                        Ok(WatchEvent::Bookmark(_)) => {
+                            metrics::mark_k8s_event(watch_name, "bookmark");
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
                         }

@@ -125,9 +125,9 @@ static K8S_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
             "caretta_k8s_events_count",
-            "total number of Kubernetes watch events processed by object type",
+            "total number of Kubernetes watch events processed by object and event type",
         ),
-        &["object_type"],
+        &["object_type", "event_type"],
     )
     .expect("create caretta_k8s_events_count");
     prometheus::default_registry()
@@ -156,10 +156,10 @@ pub fn mark_map_deletion() {
     MAP_DELETIONS.inc();
 }
 
-// Record one watcher event for the given object type label.
-pub fn mark_k8s_event(object_type: &str) {
+// Record one watcher event for the given object and event type labels.
+pub fn mark_k8s_event(object_type: &str, event_type: &str) {
     K8S_EVENTS_COUNT
-        .with_label_values(&[object_type])
+    .with_label_values(&[object_type, event_type])
         .inc();
 }
 
