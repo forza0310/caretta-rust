@@ -68,7 +68,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "round(increase((sum by (id, title, subTitle, detail__kind, arc__color) (label_replace((label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"server_kind\"), \"subTitle\", \"\", \"server_namespace\"), \"title\", \"\", \"server_name\"), \"id\", \"\", \"server_id\") or label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"client_kind\"), \"subTitle\", \"\", \"client_namespace\"), \"title\", \"\", \"client_name\"), \"id\", \"\", \"client_id\")), \"arc__color\", \"1\", \"link_id\", \"(.*)\")) )[$__range:$__interval]))  > 0",
+              "expr": "round(\n  increase(\n    (\n      sum by (id, title, subTitle, detail__kind, arc__color) (\n        label_replace(\n          (\n            label_join(label_join(label_join(label_join(${links_base}, \"detail__kind\", \"\", \"server_kind\"), \"subTitle\", \"\", \"server_namespace\"), \"title\", \"\", \"server_name\"), \"id\", \"\", \"server_id\")\n            or\n            label_join(label_join(label_join(label_join(${links_base}, \"detail__kind\", \"\", \"client_kind\"), \"subTitle\", \"\", \"client_namespace\"), \"title\", \"\", \"client_name\"), \"id\", \"\", \"client_id\")\n          ),\n          \"arc__color\", \"1\", \"link_id\", \"(.*)\"\n        )\n      )\n    )[$__range:$__interval]\n  )\n) > 0",
               "format": "table",
               "instant": true,
               "legendFormat": "__auto",
@@ -82,7 +82,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "round(increase(((sum by (id, source, target, mainStat, secondaryStat) (label_join(label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"source\", \"\", \"client_id\"), \"target\", \"\", \"server_id\"), \"id\", \"\", \"link_id\"), \"mainStat\", \"\", \"client_ip\"), \"secondaryStat\", \":\", \"server_ip\", \"server_port\"))) and on(source) label_replace(sum by (id) ((label_replace((label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"server_kind\"), \"subTitle\", \"\", \"server_namespace\"), \"title\", \"\", \"server_name\"), \"id\", \"\", \"server_id\") or label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"client_kind\"), \"subTitle\", \"\", \"client_namespace\"), \"title\", \"\", \"client_name\"), \"id\", \"\", \"client_id\")), \"arc__color\", \"1\", \"link_id\", \"(.*)\"))), \"source\", \"$1\", \"id\", \"(.*)\") and on(target) label_replace(sum by (id) ((label_replace((label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"server_kind\"), \"subTitle\", \"\", \"server_namespace\"), \"title\", \"\", \"server_name\"), \"id\", \"\", \"server_id\") or label_join(label_join(label_join(label_join((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}), \"detail__kind\", \"\", \"client_kind\"), \"subTitle\", \"\", \"client_namespace\"), \"title\", \"\", \"client_name\"), \"id\", \"\", \"client_id\")), \"arc__color\", \"1\", \"link_id\", \"(.*)\"))), \"target\", \"$1\", \"id\", \"(.*)\"))[$__range:$__interval])) > 0",
+              "expr": "round(\n  increase(\n    (\n      (\n        sum by (id, source, target, mainStat, secondaryStat) (\n          label_join(label_join(label_join(label_join(label_join(${links_base}, \"source\", \"\", \"client_id\"), \"target\", \"\", \"server_id\"), \"id\", \"\", \"link_id\"), \"mainStat\", \"\", \"client_ip\"), \"secondaryStat\", \":\", \"server_ip\", \"server_port\")\n        )\n      )\n      and on(source)\n      sum by (source) (label_join(${links_base}, \"source\", \"\", \"client_id\"))\n      and on(target)\n      sum by (target) (label_join(${links_base}, \"target\", \"\", \"server_id\"))\n    )[$__range:$__interval]\n  )\n) > 0",
               "format": "table",
               "hide": false,
               "instant": true,
@@ -153,7 +153,7 @@ data:
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "round(sum by (server_port) (increase((caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})[$__range:$__interval]))) > 0",
+              "expr": "round(sum by (server_port) (increase(${links_base}[$__range:$__interval]))) > 0",
               "legendFormat": "__auto",
               "range": true,
               "refId": "A"
@@ -445,6 +445,19 @@ data:
             "regex": "",
             "skipUrlSync": false,
             "type": "datasource"
+          },
+          {
+            "current": {
+              "selected": false,
+              "text": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})",
+              "value": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})"
+            },
+            "hide": 2,
+            "label": "links base",
+            "name": "links_base",
+            "query": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})",
+            "skipUrlSync": true,
+            "type": "constant"
           },
           {
             "allValue": "(.*)",
