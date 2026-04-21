@@ -15,15 +15,18 @@ static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
         &[
             "link_id",
             "client_id",
+            "client_ip",
+            "client_port",
             "client_name",
             "client_namespace",
             "client_kind",
             "client_owner",
             "server_id",
+            "server_ip",
+            "server_port",
             "server_name",
             "server_namespace",
             "server_kind",
-            "server_port",
             "role",
         ],
     )
@@ -180,20 +183,24 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
         .to_string();
     let client_id = fnv_hash(&(link.client.name.clone() + &link.client.namespace)).to_string();
     let server_id = fnv_hash(&(link.server.name.clone() + &link.server.namespace)).to_string();
+    let client_port = link.client_port.to_string();
     let server_port = link.server_port.to_string();
     let role = link.role.to_string();
     let link_key = [
         link_id.as_str(),
         client_id.as_str(),
+        link.client_ip.as_str(),
+        client_port.as_str(),
         link.client.name.as_str(),
         link.client.namespace.as_str(),
         link.client.kind.as_str(),
         link.client.owner.as_str(),
         server_id.as_str(),
+        link.server_ip.as_str(),
+        server_port.as_str(),
         link.server.name.as_str(),
         link.server.namespace.as_str(),
         link.server.kind.as_str(),
-        server_port.as_str(),
         role.as_str(),
     ]
     .join("\x1f");
@@ -214,15 +221,18 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
         .with_label_values(&[
             &link_id,
             &client_id,
+            &link.client_ip,
+            &client_port,
             &link.client.name,
             &link.client.namespace,
             &link.client.kind,
             &link.client.owner,
             &server_id,
+            &link.server_ip,
+            &server_port,
             &link.server.name,
             &link.server.namespace,
             &link.server.kind,
-            &server_port,
             &role,
         ])
         .inc_by(delta as f64);

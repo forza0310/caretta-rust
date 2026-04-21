@@ -3,6 +3,7 @@
 use crate::resolver::IpResolver;
 use anyhow::Context as _;
 use std::fmt;
+use std::net::Ipv4Addr;
 
 pub const ROLE_CLIENT: u32 = 1;
 pub const ROLE_SERVER: u32 = 2;
@@ -65,6 +66,9 @@ pub struct Workload {
 pub struct NetworkLink {
     pub client: Workload,
     pub server: Workload,
+    pub client_ip: String,
+    pub server_ip: String,
+    pub client_port: u16,
     pub server_port: u16,
     pub role: u32,
 }
@@ -82,11 +86,14 @@ impl fmt::Display for NetworkLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}({}) -> {}({}) : {} role={}",
+            "{}({} {}:{}) -> {}({} {}:{}) role={}",
             self.client.name,
             self.client.namespace,
+            self.client_ip,
+            self.client_port,
             self.server.name,
             self.server.namespace,
+            self.server_ip,
             self.server_port,
             self.role
         )
@@ -105,12 +112,18 @@ pub fn reduce_connection_to_link(
         ROLE_CLIENT => Ok(NetworkLink {
             client: src,
             server: dst,
+            client_ip: Ipv4Addr::from(conn.tuple.src_ip).to_string(),
+            server_ip: Ipv4Addr::from(conn.tuple.dst_ip).to_string(),
+            client_port: conn.tuple.src_port,
             server_port: conn.tuple.dst_port,
             role: conn.role,
         }),
         ROLE_SERVER => Ok(NetworkLink {
             client: dst,
             server: src,
+            client_ip: Ipv4Addr::from(conn.tuple.dst_ip).to_string(),
+            server_ip: Ipv4Addr::from(conn.tuple.src_ip).to_string(),
+            client_port: conn.tuple.dst_port,
             server_port: conn.tuple.src_port,
             role: conn.role,
         }),
@@ -238,6 +251,9 @@ mod tests {
         let link = reduce_connection_to_link(&resolver, conn).expect("client role should map");
         assert_eq!(link.client.name, "ip-1");
         assert_eq!(link.server.name, "ip-2");
+        assert_eq!(link.client_ip, "0.0.0.1");
+        assert_eq!(link.server_ip, "0.0.0.2");
+        assert_eq!(link.client_port, 1000);
         assert_eq!(link.server_port, 2000);
     }
 
@@ -260,6 +276,9 @@ mod tests {
         let link = reduce_connection_to_link(&resolver, conn).expect("server role should map");
         assert_eq!(link.client.name, "ip-2");
         assert_eq!(link.server.name, "ip-1");
+        assert_eq!(link.client_ip, "0.0.0.2");
+        assert_eq!(link.server_ip, "0.0.0.1");
+        assert_eq!(link.client_port, 4000);
         assert_eq!(link.server_port, 3000);
     }
 
