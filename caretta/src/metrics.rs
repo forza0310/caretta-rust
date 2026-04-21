@@ -16,7 +16,6 @@ static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
             "link_id",
             "client_id",
             "client_ip",
-            "client_port",
             "client_name",
             "client_namespace",
             "client_kind",
@@ -183,14 +182,12 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
         .to_string();
     let client_id = fnv_hash(&(link.client.name.clone() + &link.client.namespace)).to_string();
     let server_id = fnv_hash(&(link.server.name.clone() + &link.server.namespace)).to_string();
-    let client_port = link.client_port.to_string();
     let server_port = link.server_port.to_string();
     let role = link.role.to_string();
     let link_key = [
         link_id.as_str(),
         client_id.as_str(),
         link.client_ip.as_str(),
-        client_port.as_str(),
         link.client.name.as_str(),
         link.client.namespace.as_str(),
         link.client.kind.as_str(),
@@ -222,7 +219,6 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
             &link_id,
             &client_id,
             &link.client_ip,
-            &client_port,
             &link.client.name,
             &link.client.namespace,
             &link.client.kind,

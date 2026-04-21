@@ -58,7 +58,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: caretta-rust
-          image: ghcr.io/forza0310/caretta-rust:latest
+          image: ghcr.io/forza0310/caretta-rust:sha-26c8af3
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
