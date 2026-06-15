@@ -1,6 +1,7 @@
 //! Kubernetes and static IP resolvers used to map connection IPs into workload identities.
 
 use anyhow::Context as _;
+use arc_swap::ArcSwap;
 use dns_lookup::lookup_addr;
 use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
@@ -17,7 +18,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use crate::metrics;
 use crate::types::Workload;
@@ -113,7 +114,34 @@ struct DebugResolverEntry {
 
 pub struct K8sResolver {
     client: Client,
-    ips: RwLock<HashMap<u32, Workload>>,
+    // IP→Workload 映射使用 ArcSwap 而非 RwLock，因为本场景具备三个适合 ArcSwap 的特征：
+    //
+    //   1) 读多写少：resolve_ip 在每次 poll tick 里被每条连接调用（每秒可达上千次），而
+    //      refresh_snapshot 仅在 watch 事件触发或 30s 定时刷新时执行。
+    //   2) 写是整体替换：refresh_snapshot 始终在本地构建一张全新的 HashMap，最后整体替换，
+    //      没有局部增量修改的需求——这正是 ArcSwap 的 store(Arc::new(...)) 模型。
+    //   3) 读路径在 sync 上下文：trait IpResolver::resolve_ip 是同步方法，无法 .await。
+    //      若使用 tokio::sync::RwLock，sync 路径只能在 try_read（拿不到立刻 Err）和
+    //      blocking_read（卡住 tokio worker 线程）之间二选一，二者皆不理想。
+    //
+    // 读写时序示意（V1 是旧快照，V2 是新快照）：
+    //
+    //   T0  reader A 调 ips.load() -> 拿到 Arc<HashMap V1>，开始 lookup
+    //   T1  writer  调 ips.store(Arc::new(V2))，原子替换槽位指针
+    //                |- reader A 仍持有 V1 的 Arc，V1 不会被回收
+    //   T2  reader B 调 ips.load() -> 拿到 Arc<HashMap V2>
+    //   T3  reader A 用完 drop V1 的 Arc -> 引用计数归零 -> V1 被释放
+    //
+    // 关键性质：
+    //   - load() 永不阻塞、永不返回 Err，从根上消除"读拿不到锁→误归类为 external"
+    //     这条 failure path（这是替换 RwLock 的核心动机）。
+    //   - 写者切换指针的瞬间不会打断 reader：每个 reader 在自己的 load() 调用周期内
+    //     看到的是某个一致的版本，不存在读到半截 HashMap 的可能。
+    //   - 写瞬间内存中可能同时存在 V1 和 V2，待最后一个 V1 reader 释放后 V1 才被回收；
+    //     因 IP→Workload 表规模有限（数千~数万条），这点额外内存可以接受。
+    //   - reader 看到的是"某个略早的一致快照"。resolver 数据本身就是异步刷新，读到的
+    //     workload 信息天然容许毫秒级滞后，无需读取最新版本。
+    ips: ArcSwap<HashMap<u32, Workload>>,
     dns_cache: DnsCache,
     traverse_up_hierarchy: bool,
     owner_kind_allowlist: HashSet<String>,
@@ -136,7 +164,7 @@ impl K8sResolver {
 
         let resolver = Arc::new(Self {
             client,
-            ips: RwLock::new(HashMap::new()),
+            ips: ArcSwap::from_pointee(HashMap::new()),
             dns_cache: DnsCache::new(resolve_dns, dns_cache_size),
             traverse_up_hierarchy,
             owner_kind_allowlist,
@@ -509,8 +537,10 @@ impl K8sResolver {
             }
         }
 
-        let mut guard = self.ips.write().await;
-        *guard = next;
+        // 整体替换 IP→Workload 快照：原子地把槽位指向新 Arc。在此瞬间正在执行
+        // resolve_ip 的 reader 会继续看到旧快照，待其 load() 出来的 Arc drop 时旧
+        // HashMap 才会被回收，写者无需等待任何 reader。
+        self.ips.store(Arc::new(next));
 
         Ok(())
     }
@@ -518,10 +548,12 @@ impl K8sResolver {
 
 impl IpResolver for K8sResolver {
     fn resolve_ip(&self, ip: u32) -> Workload {
-        if let Ok(guard) = self.ips.try_read() {
-            if let Some(workload) = guard.get(&ip) {
-                return workload.clone();
-            }
+        // load() 是无锁原子读，永不阻塞、永不失败：拿到的是当前发布的快照 Arc。
+        // 这是用 ArcSwap 替换 RwLock 的核心收益——sync trait 方法不再有"拿不到锁
+        // 就走 fallback"的歧义路径，None 分支只可能因 map 中真的没有该 IP 才进入。
+        let snapshot = self.ips.load();
+        if let Some(workload) = snapshot.get(&ip) {
+            return workload.clone();
         }
 
         Workload {
@@ -533,8 +565,8 @@ impl IpResolver for K8sResolver {
     }
 
     fn debug_snapshot(&self) -> Option<String> {
-        let guard = self.ips.try_read().ok()?;
-        let mut entries: Vec<DebugResolverEntry> = guard
+        let snapshot = self.ips.load();
+        let mut entries: Vec<DebugResolverEntry> = snapshot
             .iter()
             .map(|(ip, workload)| DebugResolverEntry {
                 ip: Ipv4Addr::from(*ip).to_string(),
