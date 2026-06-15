@@ -1,6 +1,6 @@
 //! Prometheus metric definitions and update helpers for links and TCP states.
 
-use crate::types::{NetworkLink, TcpConnection, fnv_hash};
+use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash};
 use once_cell::sync::Lazy;
 use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
 use std::collections::HashMap;
@@ -36,7 +36,26 @@ static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
     c
 });
 
-// Keep the last cumulative value per link so we can emit only deltas into the Counter metric.
+// 每条 link 上次上报到的累计字节数。存在的唯一目的是把"绝对值"翻译成"delta"。
+//
+// 上下文：caretta_links_observed 是 prometheus 的 CounterVec，对外语义是"自启动以来
+// 累计字节"。Counter 的 API 只有 inc_by(delta)，不接受 set(absolute)。但我们的数据
+// 源（main.rs poll loop 里的 current_links）拿到的是绝对值——既包含 eBPF map 当前
+// 还活着的连接的字节数，也包含已死亡 link 在 main.rs `links` 表里累计下来的字节数。
+//
+// 所以每次 handle_link_metric(link, throughput) 时：
+//   delta = throughput - LAST_LINK_TOTALS[link_key]
+//   LAST_LINK_TOTALS[link_key] = throughput
+//   LINKS_METRICS.inc_by(delta)
+//
+// 为什么不能让 main.rs 自己算 delta：因为 main.rs 那边的 `links` 表只记账已死亡部分，
+// 活着部分的字节是从 eBPF map 现读的，两者合并后才是"这条 link 当前应有的累计值"，
+// 这个合并的绝对值在 caretta 进程层面就是源头——再往上找差分基准就只能在 prometheus
+// 视角找。LAST_LINK_TOTALS 就是 caretta 自己持有的"上次上报快照"，避免依赖 prometheus
+// 状态做差分（prometheus 端 Counter reset/staleness 不可控）。
+//
+// 生命周期管理：与 main.rs `links` 表一一对应。链路 GC 时（main.rs 的 retain）调
+// metrics::forget_link()，forget_link 会同时把这里的 entry 也抹掉，避免泄漏。
 static LAST_LINK_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -171,36 +190,59 @@ pub fn mark_k8s_event(object_type: &str, event_type: &str) {
         .inc();
 }
 
-/// Update the link throughput counter for a single normalized link.
-pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
+/// 构造 `caretta_links_observed` 这条 series 的全部 label values。
+///
+/// 抽出来的关键动机：`handle_link_metric`（写入）和 `forget_link`（删除 series）
+/// 必须用 100% 相同的 label values，否则 forget 会漏删——prometheus 是按 label
+/// 组合定位 series 的，差一个字符就找不到。把构造逻辑收敛到一处，编译期保证一致。
+///
+/// 返回 14 元素数组，顺序与 LINKS_METRICS 注册时的 label 顺序严格一一对应。
+fn link_label_values(link: &NetworkLink) -> [String; 14] {
     let link_id = (fnv_hash(
         &(link.client.name.clone()
+            + "\x1f"
             + &link.client.namespace
+            + "\x1f"
             + &link.server.name
+            + "\x1f"
             + &link.server.namespace),
-    ) + link.role)
+    ) ^ link.role.wrapping_mul(0x9E3779B1))
         .to_string();
-    let client_id = fnv_hash(&(link.client.name.clone() + &link.client.namespace)).to_string();
-    let server_id = fnv_hash(&(link.server.name.clone() + &link.server.namespace)).to_string();
-    let server_port = link.server_port.to_string();
-    let role = link.role.to_string();
-    let link_key = [
-        link_id.as_str(),
-        client_id.as_str(),
-        link.client_ip.as_str(),
-        link.client.name.as_str(),
-        link.client.namespace.as_str(),
-        link.client.kind.as_str(),
-        link.client.owner.as_str(),
-        server_id.as_str(),
-        link.server_ip.as_str(),
-        server_port.as_str(),
-        link.server.name.as_str(),
-        link.server.namespace.as_str(),
-        link.server.kind.as_str(),
-        role.as_str(),
+    // 注：原实现是 fnv_hash(name+ns+name+ns) + role，没有分隔符也没把 role 充分混
+    // 入。这次顺手收紧（review 问题 9）：拼接时用 \x1f 防止 ("ab","cd") 与
+    // ("a","bcd") 撞同一串；role 用 wrapping_mul 一个 32-bit 黄金比例常数后再 xor，
+    // 让不同 role 的 link_id 在所有 bit 上充分发散，而不是只差最低位。
+    let client_id = fnv_hash(&(link.client.name.clone() + "\x1f" + &link.client.namespace))
+        .to_string();
+    let server_id = fnv_hash(&(link.server.name.clone() + "\x1f" + &link.server.namespace))
+        .to_string();
+    [
+        link_id,
+        client_id,
+        link.client_ip.clone(),
+        link.client.name.clone(),
+        link.client.namespace.clone(),
+        link.client.kind.clone(),
+        link.client.owner.clone(),
+        server_id,
+        link.server_ip.clone(),
+        link.server_port.to_string(),
+        link.server.name.clone(),
+        link.server.namespace.clone(),
+        link.server.kind.clone(),
+        link.role.to_string(),
     ]
-    .join("\x1f");
+}
+
+/// 把 label values 拼成 LAST_LINK_TOTALS 的 key。同样和 produce 路径共用。
+fn link_totals_key(label_values: &[String; 14]) -> String {
+    label_values.join("\x1f")
+}
+
+/// Update the link throughput counter for a single normalized link.
+pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
+    let label_values = link_label_values(link);
+    let link_key = link_totals_key(&label_values);
 
     let delta = if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
         let previous = seen.get(&link_key).copied().unwrap_or(0);
@@ -214,56 +256,239 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
         return;
     }
 
-    LINKS_METRICS
-        .with_label_values(&[
-            &link_id,
-            &client_id,
-            &link.client_ip,
-            &link.client.name,
-            &link.client.namespace,
-            &link.client.kind,
-            &link.client.owner,
-            &server_id,
-            &link.server_ip,
-            &server_port,
-            &link.server.name,
-            &link.server.namespace,
-            &link.server.kind,
-            &role,
-        ])
-        .inc_by(delta as f64);
+    // Prometheus 的 with_label_values 接受 &[&str]，这里把 String 切片现拷一遍。
+    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+    LINKS_METRICS.with_label_values(&refs).inc_by(delta as f64);
+}
+
+/// 清理一条 link 占用的所有用户态/Prometheus 状态。GC 必须把 LAST_LINK_TOTALS 里
+/// 的"上次值"和 LINKS_METRICS 里的 series 一起删——只删一个会出现"差分基准消失但
+/// series 还在"的诡异状态，下次同名 link 复活时会被算成"绝对值=delta"猛灌一笔。
+///
+/// 调用方需要保证：传入的 link 至少已经 N 个 tick 没有流量（main.rs 的 GC 阈值
+/// LINK_GC_TTL 控制，默认 5 分钟）。删早了会让 series 在 prometheus staleness
+/// 窗口里"消失—又出现"，有损监控连续性。
+pub fn forget_link(link: &NetworkLink) {
+    let label_values = link_label_values(link);
+    let link_key = link_totals_key(&label_values);
+
+    if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
+        seen.remove(&link_key);
+    }
+
+    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+    // remove_label_values 找不到对应 series 时返回 Err；GC 端可能在 series 从未
+    // 真正注册过（delta 一直是 0、从未 inc_by）的边界情况下进来，所以忽略错误。
+    let _ = LINKS_METRICS.remove_label_values(&refs);
+}
+
+/// 构造 `caretta_tcp_states` 这条 series 的全部 label values。
+///
+/// 与 link_label_values 同理——给 handle_tcp_metric 和 forget_tcp 共用。
+/// 注意签名收的是 TcpConnectionKey 而不是 TcpConnection：state 不参与 label
+/// 集合（state 在 GaugeVec 里是值不是 label），不该影响 label 拼装。
+fn tcp_label_values(key: &TcpConnectionKey) -> [String; 12] {
+    let link_id = (fnv_hash(
+        &(key.client.name.clone()
+            + "\x1f"
+            + &key.client.namespace
+            + "\x1f"
+            + &key.server.name
+            + "\x1f"
+            + &key.server.namespace),
+    ) ^ key.role.wrapping_mul(0x9E3779B1))
+        .to_string();
+    let client_id =
+        fnv_hash(&(key.client.name.clone() + "\x1f" + &key.client.namespace)).to_string();
+    let server_id =
+        fnv_hash(&(key.server.name.clone() + "\x1f" + &key.server.namespace)).to_string();
+    [
+        link_id,
+        client_id,
+        key.client.name.clone(),
+        key.client.namespace.clone(),
+        key.client.kind.clone(),
+        key.client.owner.clone(),
+        server_id,
+        key.server.name.clone(),
+        key.server.namespace.clone(),
+        key.server.kind.clone(),
+        key.server_port.to_string(),
+        key.role.to_string(),
+    ]
 }
 
 /// Update the state gauge for a single TCP connection observation.
 pub fn handle_tcp_metric(connection: &TcpConnection) {
-    let link_id = (fnv_hash(
-        &(connection.client.name.clone()
-            + &connection.client.namespace
-            + &connection.server.name
-            + &connection.server.namespace),
-    ) + connection.role)
-        .to_string();
-    let client_id =
-        fnv_hash(&(connection.client.name.clone() + &connection.client.namespace)).to_string();
-    let server_id =
-        fnv_hash(&(connection.server.name.clone() + &connection.server.namespace)).to_string();
-    let server_port = connection.server_port.to_string();
-    let role = connection.role.to_string();
-
+    let key = TcpConnectionKey::from(connection);
+    let label_values = tcp_label_values(&key);
+    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
     TCP_STATE_METRICS
-        .with_label_values(&[
-            &link_id,
-            &client_id,
-            &connection.client.name,
-            &connection.client.namespace,
-            &connection.client.kind,
-            &connection.client.owner,
-            &server_id,
-            &connection.server.name,
-            &connection.server.namespace,
-            &connection.server.kind,
-            &server_port,
-            &role,
-        ])
+        .with_label_values(&refs)
         .set(connection.state as f64);
+}
+
+/// 清理一条 TCP series。GC 端调用，删除条件由 main.rs 维护：
+/// 连续 N 个 tick 在 eBPF map 里没看到这条连接 + 已经处于 CLOSED 状态。
+///
+/// 否则 review 问题 4 描述的场景仍会泄漏：handle_tcp_metric 把 state 写成
+/// CLOSED_STATE=3 是把 gauge 值改了，**series 本身依旧存活**，cardinality 一路涨。
+pub fn forget_tcp(key: &TcpConnectionKey) {
+    let label_values = tcp_label_values(key);
+    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+    let _ = TCP_STATE_METRICS.remove_label_values(&refs);
+}
+
+#[cfg(test)]
+mod tests {
+    //! 这一组测试聚焦 review 问题 3/4 修复的边界条件，不重复测 happy-path 数值正确性
+    //! ——那部分由 review_regressions.rs 的源码守卫 + 集成路径覆盖。
+    //!
+    //! 关键不变量（修复必须保住的）：
+    //!   I1. produce 路径与 forget 路径用完全相同的 label 集合，否则 forget 漏删 → 泄漏依旧。
+    //!   I2. forget_link 必须同时清空差分基准 LAST_LINK_TOTALS，否则同名 link 复活时
+    //!       会把"复活后的绝对值"全量灌入 Counter，造成毛刺。
+    //!   I3. forget 对从未注册过的 series 必须无副作用（GC 在边界条件下可能重复调）。
+    //!   I4. link_id 的 FNV 拼接要使用分隔符，且 role 要被充分混入——否则
+    //!       ("ab","cd") vs ("a","bcd") 或不同 role 会撞 link_id（review 问题 9/10）。
+
+    use super::*;
+    use crate::types::{ROLE_CLIENT, ROLE_SERVER, Workload};
+
+    fn mk_workload(ns: &str, name: &str) -> Workload {
+        Workload {
+            name: name.to_string(),
+            namespace: ns.to_string(),
+            kind: "Pod".to_string(),
+            owner: String::new(),
+        }
+    }
+
+    fn mk_link(client_name: &str, server_name: &str, role: u32) -> NetworkLink {
+        NetworkLink {
+            client: mk_workload("ns", client_name),
+            server: mk_workload("ns", server_name),
+            client_ip: "10.0.0.1".to_string(),
+            server_ip: "10.0.0.2".to_string(),
+            server_port: 80,
+            role,
+        }
+    }
+
+    // I1 + I2: forget 后再 produce 同样字节数，差分基准应为 0 → delta = throughput
+    // 全量重新上报。如果 forget 没清 LAST_LINK_TOTALS，这里 delta 会是 0。
+    #[test]
+    fn forget_link_should_reset_delta_baseline() {
+        let link = mk_link("uniq-client-A", "uniq-server-A", ROLE_CLIENT);
+
+        handle_link_metric(&link, 1000);
+        // 第一次 1000 → delta 1000，基准记到 1000。
+        handle_link_metric(&link, 1000);
+        // 第二次同值 → delta 0，handle 早退；基准仍是 1000。
+
+        forget_link(&link);
+
+        handle_link_metric(&link, 1000);
+        // 如果 forget 漏清基准：previous=1000, throughput=1000 → delta=0；series
+        // 不会被重新创建。下面这次 forget 找不到 series 也悄悄 no-op，测试通过——
+        // 这正是修复前的"泄漏 + 漂移"行为，所以我们要从相反方向断言：第二次 forget
+        // 必须真的找到 series 才能删（remove_label_values 成功）。
+        let label_values = link_label_values(&link);
+        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+        // remove_label_values 成功 → series 存在 → forget 后 produce 重建成功 →
+        // 基准真被清空。
+        assert!(
+            LINKS_METRICS.remove_label_values(&refs).is_ok(),
+            "forget_link must reset baseline so subsequent produce re-registers series"
+        );
+    }
+
+    // I3: forget 对从未存在的 link 是 no-op，不应 panic / 不应污染状态。
+    #[test]
+    fn forget_link_should_be_noop_for_never_seen_link() {
+        let link = mk_link("never-existed-x", "never-existed-y", ROLE_CLIENT);
+        // 不 produce，直接 forget——多次也应安全。
+        forget_link(&link);
+        forget_link(&link);
+    }
+
+    // I4: 验证拼 link_id 时 ("ab","cd") 与 ("a","bcd") 不会撞——这是 review 问题 9。
+    #[test]
+    fn link_label_should_disambiguate_concatenated_names() {
+        let link_a = NetworkLink {
+            client: mk_workload("ab", "x"),
+            server: mk_workload("cd", "y"),
+            client_ip: "1.1.1.1".to_string(),
+            server_ip: "2.2.2.2".to_string(),
+            server_port: 80,
+            role: ROLE_CLIENT,
+        };
+        let link_b = NetworkLink {
+            client: mk_workload("a", "x"),
+            server: mk_workload("bcd", "y"),
+            client_ip: "1.1.1.1".to_string(),
+            server_ip: "2.2.2.2".to_string(),
+            server_port: 80,
+            role: ROLE_CLIENT,
+        };
+        let id_a = &link_label_values(&link_a)[0];
+        let id_b = &link_label_values(&link_b)[0];
+        assert_ne!(
+            id_a, id_b,
+            "link_id must disambiguate name/namespace concatenation"
+        );
+    }
+
+    // I4 续: 同 4-tuple 不同 role 的 link_id 必须在 hash 高位也分开，而不是只差最低位
+    // —— review 问题 10。我们不能直接断言"差很多 bit"，但可以验证 ROLE_CLIENT/SERVER
+    // 之间的 id 完全不同。
+    #[test]
+    fn link_id_should_diverge_across_roles() {
+        let client_link = mk_link("c", "s", ROLE_CLIENT);
+        let server_link = mk_link("c", "s", ROLE_SERVER);
+        let id_c = &link_label_values(&client_link)[0];
+        let id_s = &link_label_values(&server_link)[0];
+        assert_ne!(id_c, id_s, "different role must produce different link_id");
+    }
+
+    // I3 for TCP: forget_tcp 对从未存在的 series 应 no-op。
+    #[test]
+    fn forget_tcp_should_be_noop_for_never_seen_key() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "uniq-tcp-x"),
+            server: mk_workload("ns", "uniq-tcp-y"),
+            server_port: 9999,
+            role: ROLE_CLIENT,
+        };
+        forget_tcp(&key);
+        forget_tcp(&key);
+    }
+
+    // I1 for TCP: TcpConnectionKey 不依赖 state，同一连接的 OPEN/CLOSED 写法应映射
+    // 到同一组 label —— 否则 GC 会按 state 分裂出多条 series。
+    #[test]
+    fn tcp_key_should_be_state_independent() {
+        let conn_open = TcpConnection {
+            client: mk_workload("ns", "tcp-open-x"),
+            server: mk_workload("ns", "tcp-open-y"),
+            server_port: 80,
+            role: ROLE_CLIENT,
+            state: 1, // OPEN
+        };
+        let conn_closed = TcpConnection {
+            state: 3, // CLOSED
+            ..conn_open.clone()
+        };
+        let key_open = TcpConnectionKey::from(&conn_open);
+        let key_closed = TcpConnectionKey::from(&conn_closed);
+        assert_eq!(
+            key_open, key_closed,
+            "TcpConnectionKey must collapse state variants to a single GC entry"
+        );
+        assert_eq!(
+            tcp_label_values(&key_open),
+            tcp_label_values(&key_closed),
+            "label values must be identical regardless of state"
+        );
+    }
 }

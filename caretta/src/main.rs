@@ -21,15 +21,55 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, TraceOffsets, TcpConnection,
-    is_loopback, parse_tracepoint_offsets, reduce_connection_to_link, reduce_connection_to_tcp,
+    TcpConnectionKey, is_loopback, parse_tracepoint_offsets, reduce_connection_to_link,
+    reduce_connection_to_tcp,
 };
 
 const TRACEPOINT_FORMAT_PATH: &str = "/sys/kernel/tracing/events/sock/inet_sock_set_state/format";
+
+/// 一条 link 在最后一次观测到流量后多久没活动就 GC 掉对应的 prometheus series + 用户态记账。
+///
+/// 选 5 分钟的考虑：
+///   - prometheus 默认 staleness 窗口 5 分钟。在窗口内 series 消失，PromQL 仍能用
+///     最近一次 sample 平滑过渡；窗口外才真正"消失"。提前删掉等价于 staleness 自然到期。
+///   - 短连接抖动场景：滚动更新等突发但回不来的 link 在 5 分钟后才回收，足够 dashboard
+///     的 5m rate 窗口算完最后一笔；再短就可能算到 partial 区间。
+///   - 真正长尾活跃但稀疏的 link（每 10 分钟才一次心跳）会被反复 GC + 重建，prometheus
+///     会出现 series gap。如果业务里有这种链路，把 TTL 调到能覆盖最长心跳间隔即可——
+///     5 分钟是给"业务流量持续 ≥ 1Hz 级"的 caretta 默认环境的一个保守值。
+const LINK_GC_TTL: Duration = Duration::from_secs(300);
+
+/// 一条 TCP series 连续多少个 tick 没在 eBPF map 里出现就 GC。
+///
+/// 与 LINK_GC_TTL 形态不同：tcp_states 是 gauge 不是 counter，没有"差分基准要保留"的
+/// 顾虑，删掉再重新出现就是 gauge 重新有值，不会有数值毛刺。窗口可以更激进一些——
+/// 这里取 12 个 tick（默认 poll 1s ≈ 12s 没出现就删）。tick 数而不是绝对时间是因为
+/// poll_interval 可配置。
+const TCP_GC_MISSED_TICKS: u32 = 12;
+
+/// past_links 表里每条 link 的状态。
+struct LinkState {
+    /// 自启动以来这条 link 的累计字节数（活着的 + 已死亡部分）。
+    /// 每次 poll 用它合并出 current_links。
+    cumulative_bytes: u64,
+    /// 最近一次"还在产生流量"的时间。GC 用 now() - last_active > TTL 判定回收。
+    /// 任何让 cumulative_bytes 变大的写入都要刷新这里。
+    last_active: Instant,
+}
+
+/// tcp_states 表里每条连接的 GC 状态。
+struct TcpState {
+    /// 上一次在本 tick 看到这条连接时的 TcpConnection 快照——GC 时需要拿它去删 series。
+    /// 也用于在 main loop 里 push 到 current_tcp_connections 上报。
+    last_seen_conn: TcpConnection,
+    /// 自上次出现以来连续没出现的 tick 数；超过 TCP_GC_MISSED_TICKS 就 forget。
+    missed_ticks: u32,
+}
 
 fn ensure_tracepoint_format_readable(path: &str) -> anyhow::Result<()> {
     let path_ref = Path::new(path);
@@ -164,7 +204,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("metrics server listening on {}{}", metrics_addr, endpoint);
-    let mut past_links: HashMap<NetworkLink, u64> = HashMap::new();
+    // 用户态 link 记账 + GC 状态。把原来的 past_links: HashMap<NetworkLink, u64> 升级
+    // 成持有 LinkState（cumulative + last_active）。
+    //
+    // 为什么这张表必须存在（即使 prometheus 自己也是个 KV 存储）：
+    //   - caretta_links_observed 是 Counter，对外语义"自启动以来累计字节"，单调不减。
+    //   - 字节的真源头在 eBPF CONNECTIONS map 里：每条 4-tuple 对应一份 bytes_sent
+    //     /bytes_received 计数。但连接关闭后这份计数会被用户态在收割阶段从 map 删除
+    //     —— 那一瞬间，该 link 在 eBPF 视角"消失"。
+    //   - 如果不在用户态把已死连接的字节数记住，下一个 tick 上报时这条 link 的累计
+    //     字节数会跌到 0，prometheus 看到 Counter 倒退会触发 reset 处理，PromQL 的
+    //     rate()/increase() 全部失真。所以必须在用户态另开一张表把死连接的字节累加
+    //     进来，每次 poll 把"活的（来自 eBPF map）" + "死的（来自这张表）"合并出
+    //     真正的累计值，再交给 metrics::handle_link_metric。
+    //   - 另一个更朴素的方案是改 prometheus metric 类型：用 GaugeVec 直接 set 绝对值，
+    //     然后让 PromQL 里用 `last_over_time + topk` 拼出"累计字节"——但这会把
+    //     rate()/increase() 这类 Counter 专属算子全部废掉，dashboard 全要重写。所以
+    //     维持 Counter 语义、用户态自己持有累计状态是更小的改动面。
+    //
+    // 为什么需要 GC（之前的 past_links 没做的事）：原实现一旦写入永不回收。短连接
+    // 抖动、滚动更新换 IP、外部 IP 大量进出，都会让表无界膨胀——同时同步泄漏
+    // LAST_LINK_TOTALS 和 LINKS_METRICS 的 prometheus series（review 问题 3）。GC 用
+    // LINK_GC_TTL 给一条 link 没活动后 N 分钟的宽限，过期后调 metrics::forget_link
+    // 一并清掉所有相关状态。
+    let mut links: HashMap<NetworkLink, LinkState> = HashMap::new();
+
+    // TCP series 生命周期跟踪——修 review 问题 4：handle_tcp_metric 把已关闭连接
+    // 写成 state=CLOSED 只是把 gauge 值改了，series 本身永远活着。我们在用户态另开
+    // 一张表记"每条连接最近 N 个 tick 的可见性"，连续 missed_ticks > 阈值就调
+    // metrics::forget_tcp 把 series 真正从注册表里抠掉。
+    let mut tcp_states: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
+
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
 
     loop {
@@ -176,8 +246,17 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = ticker.tick() => {
                 metrics::mark_poll();
+                let now = Instant::now();
 
                 let mut current_links: HashMap<NetworkLink, u64> = HashMap::new();
+                // 本 tick 在 eBPF map 里实际见到（活跃或刚关闭）的 link 集合——只有
+                // 这些 link 在 GC 端会被刷新 last_active。已经从 eBPF map 消失、仅靠
+                // past 累计值留在 links 表里的 link 不在此集合中，它们会自然老化。
+                let mut link_seen_this_tick: std::collections::HashSet<NetworkLink> =
+                    std::collections::HashSet::new();
+                // 本 tick 看到的 TCP 连接 key 集合——GC 用它来增 missed_ticks 计数。
+                let mut tcp_seen_this_tick: std::collections::HashSet<TcpConnectionKey> =
+                    std::collections::HashSet::new();
                 let mut current_tcp_connections: Vec<TcpConnection> = Vec::new();
                 let mut to_delete: Vec<ConnectionIdentifier> = Vec::new();
                 let mut loopback_counter = 0u64;
@@ -213,16 +292,23 @@ async fn main() -> anyhow::Result<()> {
                         Err(_) => continue,
                     };
 
-                    *current_links.entry(link).or_insert(0) +=
-                        throughput.bytes_sent.saturating_add(throughput.bytes_received);
+                    let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
+                    *current_links.entry(link.clone()).or_insert(0) += bytes;
+                    link_seen_this_tick.insert(link);
+                    tcp_seen_this_tick.insert(TcpConnectionKey::from(&tcp));
                     current_tcp_connections.push(tcp);
                 }
 
                 metrics::set_map_size(items_counter);
                 metrics::set_filtered_loopback_connections(loopback_counter);
 
-                for (past_link, past_throughput) in &past_links {
-                    *current_links.entry(past_link.clone()).or_insert(0) += *past_throughput;
+                // 把已死亡 link 的累计字节数合并进本 tick 的 current_links。注意只读
+                // 不写——last_active 不在这里刷新，否则一条死了一小时的 link 仍会每
+                // tick 被"复活"，GC 永远不触发。真正活着的证据只有两条：本 tick 在
+                // eBPF map 里看到（link_seen_this_tick），或被加入 to_delete（下面）。
+                for (past_link, past_state) in &links {
+                    *current_links.entry(past_link.clone()).or_insert(0) +=
+                        past_state.cumulative_bytes;
                 }
 
                 for conn in to_delete {
@@ -242,19 +328,82 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn).await {
-                        *past_links.entry(link).or_insert(0) +=
-                            throughput.bytes_sent.saturating_add(throughput.bytes_received);
+                        let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
+                        // 写入即"还活着的证据"——刷新 last_active 让 GC 重新计时。
+                        let entry = links.entry(link).or_insert_with(|| LinkState {
+                            cumulative_bytes: 0,
+                            last_active: now,
+                        });
+                        entry.cumulative_bytes = entry.cumulative_bytes.saturating_add(bytes);
+                        entry.last_active = now;
                     }
                     metrics::mark_map_deletion();
                 }
 
+                // 上报 link counter。同时对"本 tick 真正看到的"link 刷新 last_active
+                // ——已死、靠 past 累计值进 current_links 的 link 不进 link_seen，
+                // 不被刷新，也就不会逃过 GC。
                 for (link, throughput) in current_links {
                     metrics::handle_link_metric(&link, throughput);
+                    if link_seen_this_tick.contains(&link) {
+                        links
+                            .entry(link)
+                            .and_modify(|s| s.last_active = now)
+                            .or_insert(LinkState {
+                                cumulative_bytes: 0,
+                                last_active: now,
+                            });
+                    }
                 }
 
                 for tcp in current_tcp_connections {
                     metrics::handle_tcp_metric(&tcp);
+                    let key = TcpConnectionKey::from(&tcp);
+                    tcp_states
+                        .entry(key)
+                        .and_modify(|s| {
+                            s.last_seen_conn = tcp.clone();
+                            s.missed_ticks = 0;
+                        })
+                        .or_insert(TcpState {
+                            last_seen_conn: tcp,
+                            missed_ticks: 0,
+                        });
                 }
+
+                // ---- GC: link series ----
+                // 把 last_active 早于 (now - LINK_GC_TTL) 的 link 全部清掉，并同步删除
+                // 它们在 prometheus 注册表 + LAST_LINK_TOTALS 里的状态。这是修 review
+                // 问题 3 的关键步骤——前面 links.entry(...) 和 cumulative 写入只是让表
+                // 单调增长，没有这一步表会变成无界的内存 + cardinality 黑洞。
+                let ttl = LINK_GC_TTL;
+                links.retain(|link, state| {
+                    if now.duration_since(state.last_active) > ttl {
+                        metrics::forget_link(link);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // ---- GC: tcp series ----
+                // 本 tick 没看到的连接 missed_ticks +1；超过阈值的 forget 并从表里抹去。
+                // 修 review 问题 4：connection 被 ebpf map 删除后仍保留 series。
+                tcp_states.retain(|key, state| {
+                    if tcp_seen_this_tick.contains(key) {
+                        // 在本 tick 已被上面的 entry().and_modify() 重置过 missed_ticks
+                        // 与 last_seen_conn——这里只需保留即可。
+                        true
+                    } else {
+                        state.missed_ticks = state.missed_ticks.saturating_add(1);
+                        if state.missed_ticks > TCP_GC_MISSED_TICKS {
+                            metrics::forget_tcp(key);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                });
             }
         }
     }

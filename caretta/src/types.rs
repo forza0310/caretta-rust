@@ -81,6 +81,35 @@ pub struct TcpConnection {
     pub state: u32,
 }
 
+/// 用于跟踪单条 TCP series 生命周期的稳定 key。
+///
+/// 为什么要单独再造一个 key 类型而不直接拿 `TcpConnection` 当 HashMap key：
+///   - `TcpConnection` 含 `state` 字段，state 在同一条连接上会变（OPEN→CLOSED）；
+///     直接做 key 会让"同一条连接的不同 state"被记成两条不同 entry，GC 表里会
+///     堆出冗余项，更糟的是 forget 时可能漏删某些 state 的 series。
+///   - GC 真正关心的"这条 series 是否还活着"由 client/server/server_port/role
+///     这五个维度决定（与 `caretta_tcp_states` 的 label 集对应），其他都是数据。
+///
+/// 派生 Eq/Hash 让它可以直接当 HashMap key 使。
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TcpConnectionKey {
+    pub client: Workload,
+    pub server: Workload,
+    pub server_port: u16,
+    pub role: u32,
+}
+
+impl From<&TcpConnection> for TcpConnectionKey {
+    fn from(conn: &TcpConnection) -> Self {
+        Self {
+            client: conn.client.clone(),
+            server: conn.server.clone(),
+            server_port: conn.server_port,
+            role: conn.role,
+        }
+    }
+}
+
 impl fmt::Display for NetworkLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
