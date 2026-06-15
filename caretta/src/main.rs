@@ -203,12 +203,12 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let link = match reduce_connection_to_link(resolver.as_ref(), conn) {
+                    let link = match reduce_connection_to_link(resolver.as_ref(), conn).await {
                         Ok(link) => link,
                         Err(_) => continue,
                     };
 
-                    let tcp = match reduce_connection_to_tcp(resolver.as_ref(), conn, throughput) {
+                    let tcp = match reduce_connection_to_tcp(resolver.as_ref(), conn, throughput).await {
                         Ok(tcp) => tcp,
                         Err(_) => continue,
                     };
@@ -241,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn) {
+                    if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn).await {
                         *past_links.entry(link).or_insert(0) +=
                             throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     }

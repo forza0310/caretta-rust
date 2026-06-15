@@ -70,7 +70,7 @@ pub async fn run_metrics_server(
                             ("200 OK", buffer, encoder.format_type().to_string())
                         }
                     } else if debug_resolver_enabled && first_line.starts_with(&debug_expected) {
-                        if let Some(snapshot) = resolver.debug_snapshot() {
+                        if let Some(snapshot) = resolver.debug_snapshot().await {
                             (
                                 "200 OK",
                                 snapshot.into_bytes(),

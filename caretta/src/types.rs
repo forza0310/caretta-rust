@@ -99,12 +99,18 @@ impl fmt::Display for NetworkLink {
 }
 
 /// Reduce a directional connection tuple into a normalized client->server link.
-pub fn reduce_connection_to_link(
+///
+/// 现在是 async：内部对 src/dst 两个 IP 并发 resolve_ip。两次 K8s 缓存命中在 ~µs 级；
+/// 命中 fallback 走 DNS 时 .await 让出 task 而不是阻塞线程，最坏单次时延受
+/// DnsCache::DNS_LOOKUP_TIMEOUT 上限保护。
+pub async fn reduce_connection_to_link(
     resolver: &dyn IpResolver,
     conn: ConnectionIdentifier,
 ) -> anyhow::Result<NetworkLink> {
-    let src = resolver.resolve_ip(conn.tuple.src_ip);
-    let dst = resolver.resolve_ip(conn.tuple.dst_ip);
+    let (src, dst) = tokio::join!(
+        resolver.resolve_ip(conn.tuple.src_ip),
+        resolver.resolve_ip(conn.tuple.dst_ip),
+    );
 
     match conn.role {
         ROLE_CLIENT => Ok(NetworkLink {
@@ -128,13 +134,15 @@ pub fn reduce_connection_to_link(
 }
 
 /// Build a TCP connection state view from eBPF tuple+throughput data.
-pub fn reduce_connection_to_tcp(
+pub async fn reduce_connection_to_tcp(
     resolver: &dyn IpResolver,
     conn: ConnectionIdentifier,
     throughput: ConnectionThroughputStats,
 ) -> anyhow::Result<TcpConnection> {
-    let src = resolver.resolve_ip(conn.tuple.src_ip);
-    let dst = resolver.resolve_ip(conn.tuple.dst_ip);
+    let (src, dst) = tokio::join!(
+        resolver.resolve_ip(conn.tuple.src_ip),
+        resolver.resolve_ip(conn.tuple.dst_ip),
+    );
 
     let mut connection = match conn.role {
         ROLE_CLIENT => TcpConnection {
@@ -214,11 +222,13 @@ pub fn parse_tracepoint_offsets(path: &str) -> anyhow::Result<TraceOffsets> {
 mod tests {
     use super::*;
     use crate::resolver::IpResolver;
+    use async_trait::async_trait;
 
     struct MockResolver;
 
+    #[async_trait]
     impl IpResolver for MockResolver {
-        fn resolve_ip(&self, ip: u32) -> Workload {
+        async fn resolve_ip(&self, ip: u32) -> Workload {
             Workload {
                 name: format!("ip-{ip}"),
                 namespace: "ns".to_string(),
@@ -229,8 +239,8 @@ mod tests {
     }
 
     // Ensures client-role tuples keep direction: src is client, dst is server.
-    #[test]
-    fn should_map_src_to_client_when_role_is_client() {
+    #[tokio::test]
+    async fn should_map_src_to_client_when_role_is_client() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
             id: 1,
@@ -244,7 +254,9 @@ mod tests {
             role: ROLE_CLIENT,
         };
 
-        let link = reduce_connection_to_link(&resolver, conn).expect("client role should map");
+        let link = reduce_connection_to_link(&resolver, conn)
+            .await
+            .expect("client role should map");
         assert_eq!(link.client.name, "ip-1");
         assert_eq!(link.server.name, "ip-2");
         assert_eq!(link.client_ip, "0.0.0.1");
@@ -253,8 +265,8 @@ mod tests {
     }
 
     // Ensures server-role tuples are normalized into client->server orientation.
-    #[test]
-    fn should_map_dst_to_client_when_role_is_server() {
+    #[tokio::test]
+    async fn should_map_dst_to_client_when_role_is_server() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
             id: 2,
@@ -268,7 +280,9 @@ mod tests {
             role: ROLE_SERVER,
         };
 
-        let link = reduce_connection_to_link(&resolver, conn).expect("server role should map");
+        let link = reduce_connection_to_link(&resolver, conn)
+            .await
+            .expect("server role should map");
         assert_eq!(link.client.name, "ip-2");
         assert_eq!(link.server.name, "ip-1");
         assert_eq!(link.client_ip, "0.0.0.2");
@@ -277,8 +291,8 @@ mod tests {
     }
 
     // Guards against silently accepting unknown role values.
-    #[test]
-    fn should_return_error_when_role_is_unknown() {
+    #[tokio::test]
+    async fn should_return_error_when_role_is_unknown() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
             id: 3,
@@ -287,12 +301,12 @@ mod tests {
             role: 999,
         };
 
-        assert!(reduce_connection_to_link(&resolver, conn).is_err());
+        assert!(reduce_connection_to_link(&resolver, conn).await.is_err());
     }
 
     // Verifies inactive entries are exposed as CLOSED in TCP state view.
-    #[test]
-    fn should_mark_tcp_state_closed_when_entry_is_inactive() {
+    #[tokio::test]
+    async fn should_mark_tcp_state_closed_when_entry_is_inactive() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
             id: 4,
@@ -312,6 +326,7 @@ mod tests {
         };
 
         let tcp = reduce_connection_to_tcp(&resolver, conn, throughput)
+            .await
             .expect("tcp reduction should succeed");
         assert_eq!(tcp.state, TCP_CONNECTION_CLOSED_STATE);
     }

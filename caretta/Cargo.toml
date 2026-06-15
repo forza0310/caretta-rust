@@ -20,9 +20,10 @@ kube = { version = "0.98.0", default-features = false, features = ["client", "ru
 futures-util = "0.3.31"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-dns-lookup = "2.0"
 lru = "0.12"
 arc-swap = "1.7"
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+async-trait = "0.1"
 tokio = { workspace = true, features = [
     "io-util",
     "macros",
