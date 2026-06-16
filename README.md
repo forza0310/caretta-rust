@@ -191,3 +191,9 @@ external 回退行为:
 1. 看程序日志，确认是否打印 kubernetes resolver enabled。
 2. 访问 /metrics，确认有 caretta_links_observed 等指标。
 3. 开启 DEBUG_RESOLVER_ENABLED 后访问调试端点，核对目标 IP 的解析结果。
+
+## 对比 caretta go 原版的关键改进
+
+随手记一项,后续会整理成完整对照表:
+
+- **sock 复用 race 修复**:caretta-go 的反查表 `sock_infos` 用 `struct sock *` 裸地址做 key([caretta-go/pkg/tracing/ebpf/caretta.bpf.c:13-18](caretta-go/pkg/tracing/ebpf/caretta.bpf.c#L13-L18)),sock 被 free 后内核可能把同一片 slab 内存分给新连接 → 旧 close 与新 sendmsg 互相串扰,表现为同一条 link 出现两次或被错误标记 inactive。Rust 版改用 `bpf_get_socket_cookie()` (kernel ≥ 5.7) 做 key,cookie 一生一码、sock free 后不会复用,从根上消掉这条 race。守卫见 [caretta/tests/review_regressions.rs](caretta/tests/review_regressions.rs) 的 `should_key_socket_reverse_map_by_cookie_not_raw_address`。

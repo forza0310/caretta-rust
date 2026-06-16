@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::bindings::{BPF_TCP_CLOSE, BPF_TCP_SYN_RECV, BPF_TCP_SYN_SENT};
-use aya_ebpf::helpers::bpf_get_current_pid_tgid;
+use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie};
 use aya_ebpf::macros::{kprobe, map, tracepoint};
 use aya_ebpf::maps::HashMap;
 use aya_ebpf::programs::{ProbeContext, TracePointContext};
@@ -69,9 +69,11 @@ static CONNECTIONS: HashMap<ConnectionIdentifier, ConnectionThroughputStats> =
     HashMap::<ConnectionIdentifier, ConnectionThroughputStats>::with_max_entries(131072, 0);
 
 #[map]
-// Reverse lookup from raw socket identity to the active connection key.
-// This lets the close path and byte-accounting probes find the exact connection entry without
-// rebuilding the key from tuple fields.
+// sock cookie → 活跃连接 key 的反查表。
+// cookie 在 sock 生命周期内分配一次、sock free 后不会复用,
+// 所以即使新分配的 sock 恰好落在刚刚释放的那块内存上,
+// 它一定拿到不同的 cookie。这条不变量把 sendmsg/recvmsg 计费路径和 close 路径,
+// 从 "sock-slab 复用 race" 中保护出来。
 static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
@@ -149,11 +151,21 @@ fn connection_id(tuple: &ConnectionTuple, role: u32) -> u32 {
 }
 
 #[inline(always)]
-fn mark_connection_closed(skaddr: u64) {
-    // Close path must reuse the exact key that was associated with this socket.
-    // Building a new key from tuple/role can miss because pid (and potentially other fields)
-    // may differ from the original insertion key.
-    if let Some(key) = unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+fn sock_cookie(skaddr: u64) -> u64 {
+    // bpf_get_socket_cookie(struct sock *) — 内核 ≥ 5.7 提供的 helper。
+    // 返回 64-bit、单调递增、sock 生命周期内唯一、sock free 后不会复用的标识符
+    // (即使下一次 alloc 拿到同一个 `struct sock *` 地址,cookie 也会是新值)。
+    //
+    // 0 表示 helper 在当前 program type 上不可用,或 sock 指针为空。调用方必须把 0
+    // 当 "本次跳过" 处理,而不是当合法 key,否则多个不相关的 sock 会在 cookie==0 上互撞。
+    unsafe { bpf_get_socket_cookie(skaddr as *mut core::ffi::c_void) }
+}
+
+#[inline(always)]
+fn mark_connection_closed(cookie: u64) {
+    // close 路径必须复用 open 路径写下的那把 key——直接从 tuple/role 现拼一把
+    // 可能落空，pid 等字段在 close 时未必和 open 时一致。
+    if let Some(key) = unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
         let key = *key;
         if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
             let mut updated = *existing;
@@ -162,7 +174,7 @@ fn mark_connection_closed(skaddr: u64) {
         }
     }
 
-    let _ = SOCK_TO_CONNECTION.remove(&skaddr);
+    let _ = SOCK_TO_CONNECTION.remove(&cookie);
 }
 
 fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
@@ -195,13 +207,26 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     };
 
     if newstate == BPF_TCP_CLOSE as i32 {
-        // The socket->connection map tracks the active key for this socket, so a single
-        // close operation is sufficient and avoids key reconstruction mismatches.
-        mark_connection_closed(skaddr);
+        // cookie→连接 key 的反查表保存了这条 sock 的活跃 key,close 时只用 cookie 就能找回,
+        // 不必再用 tuple+role 现拼,避免拼错。
+        // cookie 不会在 sock free/realloc 之间存活,所以即便 close 事件比 sock 复用慢一拍,
+        // 拿到的 cookie 也已经属于新 sock,不会污染上一代的连接条目。
+        let cookie = sock_cookie(skaddr);
+        if cookie == 0 {
+            return Ok(());
+        }
+        mark_connection_closed(cookie);
         return Ok(());
     }
 
     if role == CONNECTION_ROLE_UNKNOWN {
+        return Ok(());
+    }
+
+    let cookie = sock_cookie(skaddr);
+    if cookie == 0 {
+        // 没有稳定身份就没法把后续 sendmsg/recvmsg 安全归到这条连接,直接跳过,
+        // 避免不同 sock 一起在 cookie==0 上撞 key。
         return Ok(());
     }
 
@@ -226,16 +251,19 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     }
 
     CONNECTIONS.insert(&key, &throughput, 0)?;
-    SOCK_TO_CONNECTION.insert(&skaddr, &key, 0)?;
+    SOCK_TO_CONNECTION.insert(&cookie, &key, 0)?;
     Ok(())
 }
 
 fn try_handle_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), i32> {
     let sk: *const core::ffi::c_void = ctx.arg(0).ok_or(1)?;
     let size: usize = ctx.arg(2).ok_or(1)?;
-    let skaddr = sk as u64;
+    let cookie = sock_cookie(sk as u64);
+    if cookie == 0 {
+        return Ok(());
+    }
 
-    let key = match unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+    let key = match unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
         Some(k) => *k,
         None => return Ok(()),
     };
@@ -266,9 +294,12 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &ProbeContext) -> Result<(), i32> {
     if copied <= 0 {
         return Ok(());
     }
-    let skaddr = sk as u64;
+    let cookie = sock_cookie(sk as u64);
+    if cookie == 0 {
+        return Ok(());
+    }
 
-    let key = match unsafe { SOCK_TO_CONNECTION.get(&skaddr) } {
+    let key = match unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
         Some(k) => *k,
         None => return Ok(()),
     };

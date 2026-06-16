@@ -22,16 +22,73 @@ fn read_repo_file(path_from_repo_root: &str) -> String {
     let src = read_repo_file("caretta-ebpf/src/main.rs");
 
     assert!(
-        src.contains("fn mark_connection_closed(skaddr: u64)"),
-        "close helper should only need skaddr"
+        src.contains("fn mark_connection_closed(cookie: u64)"),
+        "close helper should look up the original key by sock cookie"
     );
     assert!(
-        src.contains("SOCK_TO_CONNECTION.get(&skaddr)"),
+        src.contains("SOCK_TO_CONNECTION.get(&cookie)"),
         "close path should look up original key from SOCK_TO_CONNECTION"
     );
     assert!(
         !src.contains("pid: 0,"),
         "close path should not construct a pid=0 key"
+    );
+}
+
+// ---- review 问题 6:struct sock 内存复用导致的 reverse-map race ----
+//
+// SOCK_TO_CONNECTION 不能用 raw `struct sock *` 地址做 key——sock 被 free 后内核会把同一片
+// slab 内存重新分配给新连接,导致两代 sock 共用同一个 skaddr,旧 close 与新 sendmsg 互相
+// 串扰。修复方案是改用 bpf_get_socket_cookie(struct sock *)(kernel >= 5.7),它对每个 sock
+// 实例返回一个一生一码的 64-bit 标识,sock free 后不会复用。
+//
+// 这组守卫钉死三件事:
+//   1. helper 真的被引入(import 进来,不被未来的 cleanup 误删)。
+//   2. SOCK_TO_CONNECTION 的反查 key 全部走 cookie 而不是 skaddr。
+//   3. cookie==0 的 fallback 路径存在(避免 helper 不可用时多 sock 在 0 上碰撞)。
+#[test]
+fn should_key_socket_reverse_map_by_cookie_not_raw_address() {
+    let src = read_repo_file("caretta-ebpf/src/main.rs");
+
+    assert!(
+        src.contains("bpf_get_socket_cookie"),
+        "ebpf prog should call bpf_get_socket_cookie helper"
+    );
+    assert!(
+        src.contains("fn sock_cookie(skaddr: u64) -> u64"),
+        "ebpf prog should expose a sock_cookie() wrapper"
+    );
+    // 反查表插入路径必须用 cookie。
+    assert!(
+        src.contains("SOCK_TO_CONNECTION.insert(&cookie, &key, 0)"),
+        "open path should insert into SOCK_TO_CONNECTION keyed by cookie"
+    );
+    // sendmsg/recvmsg 都必须先取 cookie 再查表。
+    let cookie_lookup_count = src.matches("SOCK_TO_CONNECTION.get(&cookie)").count();
+    assert!(
+        cookie_lookup_count >= 3,
+        "close + sendmsg + recvmsg should each look up by cookie (got {cookie_lookup_count})"
+    );
+    // 任何残留的 skaddr-as-key 用法都应当被拔除。
+    assert!(
+        !src.contains("SOCK_TO_CONNECTION.insert(&skaddr"),
+        "no path should still insert into SOCK_TO_CONNECTION keyed by skaddr"
+    );
+    assert!(
+        !src.contains("SOCK_TO_CONNECTION.get(&skaddr)"),
+        "no path should still look up SOCK_TO_CONNECTION by skaddr"
+    );
+}
+
+#[test]
+fn should_skip_when_socket_cookie_is_unavailable() {
+    let src = read_repo_file("caretta-ebpf/src/main.rs");
+
+    // cookie==0 表示 helper 不可用或 sock NULL。直接 return 而不是把多 sock 都映射到 key=0。
+    let zero_guard_count = src.matches("if cookie == 0 {").count();
+    assert!(
+        zero_guard_count >= 4,
+        "every cookie consumer should bail out on cookie==0 (got {zero_guard_count})"
     );
 }
 
