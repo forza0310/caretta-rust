@@ -5,9 +5,9 @@
 ## 当前能力总览
 
 - eBPF 采集
-	- kprobe tcp_sendmsg: 统计 bytes_sent
-	- kprobe tcp_cleanup_rbuf: 统计 bytes_received
-	- tracepoint sock/inet_sock_set_state: 追踪连接状态变化
+	- fentry tcp_sendmsg: 统计 bytes_sent
+	- fentry tcp_cleanup_rbuf: 统计 bytes_received
+	- tp_btf sock/inet_sock_set_state: 追踪连接状态变化
 - 吞吐语义
 	- 用户态链路吞吐采用 bytes_sent + bytes_received
 - Kubernetes 解析
@@ -17,6 +17,14 @@
 - 可观测性
 	- Prometheus 指标端点
 	- Resolver 调试端点
+
+## 环境要求
+
+- 内核版本 ≥ 5.5(fentry / tp_btf 需要 BPF_PROG_TYPE_TRACING)。该程序类型才能使用
+  `bpf_get_socket_cookie()`,这是 sock 复用 race 修复的关键 helper。
+- 内核启用 `CONFIG_DEBUG_INFO_BTF=y`,5.5+ 主流发行版默认开。
+- 容器化部署需要把 host 的 `/sys/kernel/btf` 挂入容器(用于 vmlinux BTF 解析,见
+  [deploy/caretta-rust-k8s.yaml](deploy/caretta-rust-k8s.yaml))。
 
 ## 运行方式
 
@@ -194,6 +202,15 @@ external 回退行为:
 
 ## 对比 caretta go 原版的关键改进
 
-随手记一项,后续会整理成完整对照表:
+随手记两项,后续会整理成完整对照表:
 
-- **sock 复用 race 修复**:caretta-go 的反查表 `sock_infos` 用 `struct sock *` 裸地址做 key([caretta-go/pkg/tracing/ebpf/caretta.bpf.c:13-18](caretta-go/pkg/tracing/ebpf/caretta.bpf.c#L13-L18)),sock 被 free 后内核可能把同一片 slab 内存分给新连接 → 旧 close 与新 sendmsg 互相串扰,表现为同一条 link 出现两次或被错误标记 inactive。Rust 版改用 `bpf_get_socket_cookie()` (kernel ≥ 5.7) 做 key,cookie 一生一码、sock free 后不会复用,从根上消掉这条 race。守卫见 [caretta/tests/review_regressions.rs](caretta/tests/review_regressions.rs) 的 `should_key_socket_reverse_map_by_cookie_not_raw_address`。
+- **sock 复用 race 修复**:caretta-go 的反查表 `sock_infos` 用 `struct sock *` 裸地址做 key([caretta-go/pkg/tracing/ebpf/caretta.bpf.c:13-18](caretta-go/pkg/tracing/ebpf/caretta.bpf.c#L13-L18)),sock 被 free 后内核可能把同一片 slab 内存分给新连接 → 旧 close 与新 sendmsg 互相串扰,表现为同一条 link 出现两次或被错误标记 inactive。Rust 版改用 `bpf_get_socket_cookie()` (kernel ≥ 5.7) 做 key,cookie 一生一码、sock free 后不会复用,从根上消掉这条 race。
+
+  注意:cookie helper 在 verifier 里按 program type 白名单注册,只在 BPF_PROG_TYPE_TRACING 系(fentry / fexit / tp_btf)可用,legacy kprobe / tracepoint 调用会被 verifier 拒绝(`unknown func bpf_get_socket_cookie#46`)。修这条 race 必然要把三个程序一起迁到 TRACING——见下一条。守卫见 [caretta/tests/review_regressions.rs](caretta/tests/review_regressions.rs) 的 `should_key_socket_reverse_map_by_cookie_not_raw_address`。
+
+- **eBPF 程序类型现代化**:caretta-go 用 `BPF_PROG_TYPE_KPROBE` + `BPF_PROG_TYPE_TRACEPOINT`(legacy);Rust 版改成 `BPF_PROG_TYPE_TRACING`——`tcp_sendmsg`/`tcp_cleanup_rbuf` 走 fentry,`inet_sock_set_state` 走 tp_btf。收益:
+  - 解锁 `bpf_get_socket_cookie()`,从根上修上面那条 race
+  - BTF 类型化 args,不再写 `PT_REGS_PARM*` 寄存器猜参,签名跟内核函数原型一一对应
+  - 解析对象从 `/sys/kernel/tracing/events/.../format` 文本换成 `/sys/kernel/btf/vmlinux` 二进制(标准化、不依赖 tracefs 挂载,任何 ≥ 5.5 内核都能跑)
+
+  代价:tp_btf 拿不到 legacy tracepoint 那种"已经平铺好的 IP/端口字段",IP/端口要从 `struct sock *` 走 `bpf_probe_read_kernel` 读 sock_common——这就需要用户态在启动期解析 vmlinux BTF 拿字段偏移。caretta 内置了一个最小 BTF parser(只读 sock_common 一个 path,代码量约 200 行),不依赖 `btf` 第三方 crate。守卫见 [caretta/tests/review_regressions.rs](caretta/tests/review_regressions.rs) 的 `should_use_fentry_for_byte_accounting_probes`、`should_use_btf_tracepoint_for_state_transitions`、`should_resolve_sock_field_offsets_from_vmlinux_btf`。

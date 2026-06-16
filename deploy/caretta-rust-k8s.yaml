@@ -81,8 +81,8 @@ spec:
             - name: metrics
               containerPort: 7117
           volumeMounts:
-            - name: tracefs
-              mountPath: /sys/kernel/tracing
+            - name: vmlinux-btf
+              mountPath: /sys/kernel/btf
               readOnly: true
           resources:
             requests:
@@ -92,7 +92,7 @@ spec:
               cpu: 500m
               memory: 512Mi
       volumes:
-        - name: tracefs
+        - name: vmlinux-btf
           hostPath:
-            path: /sys/kernel/tracing
+            path: /sys/kernel/btf
             type: Directory

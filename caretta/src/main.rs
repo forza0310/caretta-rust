@@ -3,6 +3,7 @@
 //! This file now focuses on orchestration only: loading eBPF, wiring resolver + HTTP server,
 //! and running the polling loop. Domain logic is split into dedicated modules.
 
+mod btf;
 mod config;
 mod http_server;
 mod metrics;
@@ -10,27 +11,24 @@ mod resolver;
 mod types;
 
 use anyhow::Context as _;
+use aya::Btf;
 use aya::maps::HashMap as BpfHashMap;
-use aya::programs::{KProbe, TracePoint};
+use aya::programs::{BtfTracePoint, FEntry};
 use config::Opt;
 use log::{info, warn};
 use resolver::{IpResolver, K8sResolver, StaticResolver};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use types::{
-    ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, TraceOffsets, TcpConnection,
-    TcpConnectionKey, is_loopback, parse_tracepoint_offsets, reduce_connection_to_link,
+    ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
+    TcpConnectionKey, is_loopback, parse_sock_offsets, reduce_connection_to_link,
     reduce_connection_to_tcp,
 };
-
-const TRACEPOINT_FORMAT_PATH: &str = "/sys/kernel/tracing/events/sock/inet_sock_set_state/format";
 
 /// 一条 link 在最后一次观测到流量后多久没活动就 GC 掉对应的 prometheus series + 用户态记账。
 ///
@@ -71,27 +69,19 @@ struct TcpState {
     missed_ticks: u32,
 }
 
-fn ensure_tracepoint_format_readable(path: &str) -> anyhow::Result<()> {
-    let path_ref = Path::new(path);
-    if !path_ref.exists() {
-        anyhow::bail!(
-            "tracepoint format file not found: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
-            path
-        );
-    }
-    if !path_ref.is_file() {
-        anyhow::bail!(
-            "tracepoint format path is not a file: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
-            path
-        );
-    }
-    File::open(path_ref).with_context(|| {
-        format!(
-            "tracepoint format file is not readable: {}\nK8s hint: mount host /sys/kernel/tracing into the container at /sys/kernel/tracing (readOnly).",
-            path
-        )
-    })?;
-    Ok(())
+fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
+    // 加载内核暴露的 vmlinux BTF。fentry / tp_btf 程序在 verifier attach 时需要 kernel
+    // BTF 做 type 检查;同一份 BTF 我们启动期也用来解 sock_common 字段偏移。
+    //
+    // 失败原因常见两类,合并写在 hint 里方便容器化部署排查:
+    //   - 内核 < 5.5 或编译时未启用 CONFIG_DEBUG_INFO_BTF=y
+    //   - 容器没把 host 的 /sys/kernel/btf 挂进来
+    Btf::from_sys_fs().with_context(|| {
+        "vmlinux BTF not available; kernel must be built with CONFIG_DEBUG_INFO_BTF=y \
+         (linux ≥ 5.5). K8s hint: mount host /sys/kernel/btf into the container at \
+         /sys/kernel/btf (readOnly)."
+            .to_string()
+    })
 }
 
 #[tokio::main]
@@ -108,37 +98,40 @@ async fn main() -> anyhow::Result<()> {
         warn!("failed to initialize eBPF logger: {e}");
     }
 
-    let kprobe: &mut KProbe = ebpf
+    // 同一份 BTF 给三类 program 用:fentry/tp_btf 在 attach 时会按 BTF 校验 args,
+    // 之后还要再用同一份 BTF 解 sock_common 字段偏移。
+    let btf = ensure_vmlinux_btf_available()?;
+
+    let kprobe: &mut FEntry = ebpf
         .program_mut("handle_tcp_sendmsg")
-        .context("kprobe program handle_tcp_sendmsg not found")?
+        .context("fentry program handle_tcp_sendmsg not found")?
         .try_into()?;
-    kprobe.load()?;
-    kprobe.attach("tcp_sendmsg", 0)?;
+    kprobe.load("tcp_sendmsg", &btf)?;
+    kprobe.attach()?;
 
-    let kprobe_recv: &mut KProbe = ebpf
+    let kprobe_recv: &mut FEntry = ebpf
         .program_mut("handle_tcp_cleanup_rbuf")
-        .context("kprobe program handle_tcp_cleanup_rbuf not found")?
+        .context("fentry program handle_tcp_cleanup_rbuf not found")?
         .try_into()?;
-    kprobe_recv.load()?;
-    kprobe_recv.attach("tcp_cleanup_rbuf", 0)?;
+    kprobe_recv.load("tcp_cleanup_rbuf", &btf)?;
+    kprobe_recv.attach()?;
 
-    // Resolve tracepoint field offsets dynamically to avoid kernel-version-specific hardcoding.
-    ensure_tracepoint_format_readable(TRACEPOINT_FORMAT_PATH)?;
-    let offsets = parse_tracepoint_offsets(TRACEPOINT_FORMAT_PATH)?;
+    // SOCK_OFFSETS:从 vmlinux BTF 解出的 sock_common 字段偏移,推到 eBPF 端给
+    // try_handle_sock_set_state 走 bpf_probe_read_kernel 用。
+    let offsets = parse_sock_offsets()?;
     let offsets_key = 0u32;
-    let mut offsets_map: BpfHashMap<_, u32, TraceOffsets> = BpfHashMap::try_from(
-        ebpf.map_mut("TRACEPOINT_OFFSETS")
-            .context("TRACEPOINT_OFFSETS map not found")?,
+    let mut offsets_map: BpfHashMap<_, u32, SockOffsets> = BpfHashMap::try_from(
+        ebpf.map_mut("SOCK_OFFSETS")
+            .context("SOCK_OFFSETS map not found")?,
     )?;
     offsets_map.insert(offsets_key, offsets, 0)?;
 
-    let tracepoint: &mut TracePoint = ebpf
+    let tracepoint: &mut BtfTracePoint = ebpf
         .program_mut("handle_sock_set_state")
-        .context("tracepoint program handle_sock_set_state not found")?
+        .context("btf_tracepoint program handle_sock_set_state not found")?
         .try_into()?;
-    tracepoint.load()?;
-
-    tracepoint.attach("sock", "inet_sock_set_state")?;
+    tracepoint.load("inet_sock_set_state", &btf)?;
+    tracepoint.attach()?;
 
     let connections_map = ebpf
         .take_map("CONNECTIONS")

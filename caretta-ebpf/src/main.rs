@@ -2,10 +2,10 @@
 #![no_main]
 
 use aya_ebpf::bindings::{BPF_TCP_CLOSE, BPF_TCP_SYN_RECV, BPF_TCP_SYN_SENT};
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie};
-use aya_ebpf::macros::{kprobe, map, tracepoint};
+use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_probe_read_kernel};
+use aya_ebpf::macros::{btf_tracepoint, fentry, map};
 use aya_ebpf::maps::HashMap;
-use aya_ebpf::programs::{ProbeContext, TracePointContext};
+use aya_ebpf::programs::{BtfTracePointContext, FEntryContext};
 
 const CONNECTION_ROLE_UNKNOWN: u32 = 0;
 const CONNECTION_ROLE_CLIENT: u32 = 1;
@@ -13,20 +13,26 @@ const CONNECTION_ROLE_SERVER: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-// Raw tracepoint layout offsets for inet_sock_set_state; these are populated from tracefs at
-// runtime so the program can read kernel fields without hardcoding kernel-version-specific values.
-pub struct TraceOffsets {
-    pub skaddr_off: u32,
-    pub newstate_off: u32,
-    pub sport_off: u32,
-    pub dport_off: u32,
-    pub saddr_off: u32,
-    pub daddr_off: u32,
+// `struct sock_common` 关键字段在该内核 vmlinux BTF 里的 byte offset。
+// 用户态在启动期解析 /sys/kernel/btf/vmlinux 写入,eBPF 端 bpf_probe_read_kernel
+// 时按这些 offset 从 sock 指针读字段——这样不依赖任何 kernel-version-specific
+// 硬编码,内核改 ABI 时启动就 fail,而不是默默读垃圾。
+//
+// 字段语义:
+//   skc_daddr_off      —— __be32,对端 IP(对 sk_common 而言是 "destination")
+//   skc_rcv_saddr_off  —— __be32,本端 IP(实际接收/绑定地址)
+//   skc_dport_off      —— __be16,对端 port(network byte order)
+//   skc_num_off        —— u16,本端 port(host byte order,sk 内核就是原生序)
+pub struct SockOffsets {
+    pub skc_daddr_off: u32,
+    pub skc_rcv_saddr_off: u32,
+    pub skc_dport_off: u32,
+    pub skc_num_off: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-// Raw 4-tuple extracted from the kernel socket state tracepoint.
+// Raw 4-tuple extracted from the kernel socket struct.
 pub struct ConnectionTuple {
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -78,60 +84,42 @@ static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
 #[map]
-// Runtime-discovered tracepoint field offsets for sock/inet_sock_set_state.
-// Userspace fills this once at startup so the tracepoint can read kernel fields safely across
-// kernel versions.
-static TRACEPOINT_OFFSETS: HashMap<u32, TraceOffsets> =
-    HashMap::<u32, TraceOffsets>::with_max_entries(1, 0);
+// Runtime-discovered sock_common field offsets. Userspace populates this once at startup
+// after parsing /sys/kernel/btf/vmlinux,eBPF 端按这些 offset 读 sock 字段。
+static SOCK_OFFSETS: HashMap<u32, SockOffsets> =
+    HashMap::<u32, SockOffsets>::with_max_entries(1, 0);
 
-#[kprobe]
-pub fn handle_tcp_sendmsg(ctx: ProbeContext) -> u32 {
+// fentry on tcp_sendmsg captures TCP write-side payload size.
+// fentry 类型签名按 vmlinux BTF 决定,内核函数原型 (struct sock *sk, struct msghdr *msg, size_t size)。
+// fentry 是 BPF_PROG_TYPE_TRACING,bpf_get_socket_cookie() helper 在这个 program type 下可用。
+#[fentry(function = "tcp_sendmsg")]
+pub fn handle_tcp_sendmsg(ctx: FEntryContext) -> u32 {
     match try_handle_tcp_sendmsg(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-// kprobe on tcp_sendmsg captures raw write-side data from the socket layer.
-// The probe reads:
-// - ctx.arg(0): struct sock * as the socket identity key
-// - ctx.arg(2): payload size in bytes
-#[kprobe]
-pub fn handle_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
+// fentry on tcp_cleanup_rbuf captures TCP read-side accounting.
+// 内核函数原型 (struct sock *sk, int copied)。
+#[fentry(function = "tcp_cleanup_rbuf")]
+pub fn handle_tcp_cleanup_rbuf(ctx: FEntryContext) -> u32 {
     match try_handle_tcp_cleanup_rbuf(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-// tracepoint on sock/inet_sock_set_state captures TCP state transitions and the raw
-// socket tuple fields exported by the kernel tracepoint payload.
-#[tracepoint]
-pub fn handle_sock_set_state(ctx: TracePointContext) -> u32 {
+// btf_tracepoint on sock/inet_sock_set_state — 同一个内核 hook,但程序类型从 legacy
+// BPF_PROG_TYPE_TRACEPOINT 升级到 BPF_PROG_TYPE_TRACING,因此 cookie helper 可用。
+// args: (struct sock *sk, int oldstate, int newstate, int family, u16 protocol, ...)
+// 我们只读 sk 与 newstate;IP/端口从 sk 走 sock_common 字段。
+#[btf_tracepoint(function = "inet_sock_set_state")]
+pub fn handle_sock_set_state(ctx: BtfTracePointContext) -> u32 {
     match try_handle_sock_set_state(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
-}
-
-#[inline(always)]
-fn ctx_u16(ctx: &TracePointContext, offset: usize) -> Result<u16, i32> {
-    unsafe { ctx.read_at::<u16>(offset) }
-}
-
-#[inline(always)]
-fn ctx_u32(ctx: &TracePointContext, offset: usize) -> Result<u32, i32> {
-    unsafe { ctx.read_at::<u32>(offset) }
-}
-
-#[inline(always)]
-fn ctx_u64(ctx: &TracePointContext, offset: usize) -> Result<u64, i32> {
-    unsafe { ctx.read_at::<u64>(offset) }
-}
-
-#[inline(always)]
-fn ctx_i32(ctx: &TracePointContext, offset: usize) -> Result<i32, i32> {
-    unsafe { ctx.read_at::<i32>(offset) }
 }
 
 // FNV-1a hash of the 4-tuple and role, used as a key for identifying connections in maps.
@@ -158,13 +146,26 @@ fn sock_cookie(skaddr: u64) -> u64 {
     //
     // 0 表示 helper 在当前 program type 上不可用,或 sock 指针为空。调用方必须把 0
     // 当 "本次跳过" 处理,而不是当合法 key,否则多个不相关的 sock 会在 cookie==0 上互撞。
+    //
+    // 此 helper 只在 BPF_PROG_TYPE_TRACING/BPF_PROG_TYPE_CGROUP_SOCK 等几类 program 上注册;
+    // 这就是为什么 sendmsg/recvmsg 必须改成 fentry、inet_sock_set_state 必须改成 tp_btf
+    // ——legacy kprobe / tracepoint program 类型走不通这条 helper。
     unsafe { bpf_get_socket_cookie(skaddr as *mut core::ffi::c_void) }
+}
+
+#[inline(always)]
+fn read_sock_field<T: Copy>(sk: u64, byte_off: u32) -> Option<T> {
+    if sk == 0 {
+        return None;
+    }
+    let src = (sk + byte_off as u64) as *const T;
+    unsafe { bpf_probe_read_kernel(src) }.ok()
 }
 
 #[inline(always)]
 fn mark_connection_closed(cookie: u64) {
     // close 路径必须复用 open 路径写下的那把 key——直接从 tuple/role 现拼一把
-    // 可能落空，pid 等字段在 close 时未必和 open 时一致。
+    // 可能落空,pid 等字段在 close 时未必和 open 时一致。
     if let Some(key) = unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
         let key = *key;
         if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
@@ -177,27 +178,11 @@ fn mark_connection_closed(cookie: u64) {
     let _ = SOCK_TO_CONNECTION.remove(&cookie);
 }
 
-fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
-    // Offsets are discovered in userspace from tracefs format and written to TRACEPOINT_OFFSETS map.
-    let offsets_key = 0u32;
-    let offsets = match unsafe { TRACEPOINT_OFFSETS.get(&offsets_key) } {
-        Some(v) => *v,
-        None => return Ok(()),
-    };
-
-    let skaddr = ctx_u64(ctx, offsets.skaddr_off as usize)?;
-    let newstate = ctx_i32(ctx, offsets.newstate_off as usize)?;
-    let sport_raw = ctx_u16(ctx, offsets.sport_off as usize)?;
-    let dport_raw = ctx_u16(ctx, offsets.dport_off as usize)?;
-    let src_ip = u32::from_be(ctx_u32(ctx, offsets.saddr_off as usize)?);
-    let dst_ip = u32::from_be(ctx_u32(ctx, offsets.daddr_off as usize)?);
-
-    let tuple = ConnectionTuple {
-        src_ip,
-        dst_ip,
-        src_port: u16::from_be(sport_raw),
-        dst_port: u16::from_be(dport_raw),
-    };
+fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
+    // tp_btf 的 args 顺序固定:(sk, oldstate, newstate, family, protocol, ...)。
+    let sk: *const core::ffi::c_void = ctx.arg(0);
+    let newstate: i32 = ctx.arg(2);
+    let sk_addr = sk as u64;
 
     let role = match newstate {
         state if state == BPF_TCP_SYN_SENT as i32 => CONNECTION_ROLE_CLIENT,
@@ -211,7 +196,7 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
         // 不必再用 tuple+role 现拼,避免拼错。
         // cookie 不会在 sock free/realloc 之间存活,所以即便 close 事件比 sock 复用慢一拍,
         // 拿到的 cookie 也已经属于新 sock,不会污染上一代的连接条目。
-        let cookie = sock_cookie(skaddr);
+        let cookie = sock_cookie(sk_addr);
         if cookie == 0 {
             return Ok(());
         }
@@ -223,12 +208,37 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
         return Ok(());
     }
 
-    let cookie = sock_cookie(skaddr);
+    let cookie = sock_cookie(sk_addr);
     if cookie == 0 {
         // 没有稳定身份就没法把后续 sendmsg/recvmsg 安全归到这条连接,直接跳过,
         // 避免不同 sock 一起在 cookie==0 上撞 key。
         return Ok(());
     }
+
+    // 用户态启动期写入,此后只读;cookie==0 之外,SOCK_OFFSETS 缺失视为内核 BTF 解析未完成,
+    // 直接跳过本条事件。
+    let offsets_key = 0u32;
+    let offsets = match unsafe { SOCK_OFFSETS.get(&offsets_key) } {
+        Some(v) => *v,
+        None => return Ok(()),
+    };
+
+    // sock_common 几个字段:
+    //   skc_rcv_saddr (__be32) → 本端 IP,作为 src_ip
+    //   skc_daddr     (__be32) → 对端 IP,作为 dst_ip
+    //   skc_num       (u16,host order)   → 本端 port,作为 src_port
+    //   skc_dport     (__be16,network order) → 对端 port,作为 dst_port
+    let saddr_be: u32 = read_sock_field(sk_addr, offsets.skc_rcv_saddr_off).ok_or(1)?;
+    let daddr_be: u32 = read_sock_field(sk_addr, offsets.skc_daddr_off).ok_or(1)?;
+    let dport_be: u16 = read_sock_field(sk_addr, offsets.skc_dport_off).ok_or(1)?;
+    let num: u16 = read_sock_field(sk_addr, offsets.skc_num_off).ok_or(1)?;
+
+    let tuple = ConnectionTuple {
+        src_ip: u32::from_be(saddr_be),
+        dst_ip: u32::from_be(daddr_be),
+        src_port: num,
+        dst_port: u16::from_be(dport_be),
+    };
 
     let key = ConnectionIdentifier {
         id: connection_id(&tuple, role),
@@ -255,9 +265,10 @@ fn try_handle_sock_set_state(ctx: &TracePointContext) -> Result<(), i32> {
     Ok(())
 }
 
-fn try_handle_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), i32> {
-    let sk: *const core::ffi::c_void = ctx.arg(0).ok_or(1)?;
-    let size: usize = ctx.arg(2).ok_or(1)?;
+fn try_handle_tcp_sendmsg(ctx: &FEntryContext) -> Result<(), i32> {
+    // fentry args 与内核函数原型一一对应:(sk, msg, size)。
+    let sk: *const core::ffi::c_void = ctx.arg(0);
+    let size: usize = ctx.arg(2);
     let cookie = sock_cookie(sk as u64);
     if cookie == 0 {
         return Ok(());
@@ -288,9 +299,10 @@ fn try_handle_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), i32> {
     Ok(())
 }
 
-fn try_handle_tcp_cleanup_rbuf(ctx: &ProbeContext) -> Result<(), i32> {
-    let sk: *const core::ffi::c_void = ctx.arg(0).ok_or(1)?;
-    let copied: i32 = ctx.arg(1).ok_or(1)?;
+fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
+    // fentry args:(sk, copied)。
+    let sk: *const core::ffi::c_void = ctx.arg(0);
+    let copied: i32 = ctx.arg(1);
     if copied <= 0 {
         return Ok(());
     }

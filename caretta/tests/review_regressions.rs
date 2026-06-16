@@ -103,6 +103,102 @@ fn should_not_mutate_byte_counters_when_processing_state_transition() {
     );
 }
 
+// ---- review #6 修复后:程序类型迁移到 BPF_PROG_TYPE_TRACING ----
+//
+// `bpf_get_socket_cookie()` helper 在 verifier 里按 program type 白名单注册,只有
+// BPF_PROG_TYPE_TRACING 系(fentry / fexit / tp_btf)能用。要让 cookie 修复落地,三个
+// 程序都必须迁到 TRACING:
+//   - tcp_sendmsg / tcp_cleanup_rbuf 走 fentry
+//   - inet_sock_set_state 走 tp_btf(同一个内核 hook,程序类型从 legacy tracepoint
+//     升级到 TRACING)
+// 这组守卫确保未来 cleanup / refactor 不会把它们悄悄退回 legacy 类型——退一步就让
+// cookie 修复整体失效,但表面看不到任何错(verifier 直接拒载入而不是运行时漂移)。
+
+#[test]
+fn should_use_fentry_for_byte_accounting_probes() {
+    let src = read_repo_file("caretta-ebpf/src/main.rs");
+
+    assert!(
+        src.contains("#[fentry(function = \"tcp_sendmsg\")]"),
+        "tcp_sendmsg accounting must run on fentry (BPF_PROG_TYPE_TRACING) for cookie helper"
+    );
+    assert!(
+        src.contains("#[fentry(function = \"tcp_cleanup_rbuf\")]"),
+        "tcp_cleanup_rbuf accounting must run on fentry for cookie helper"
+    );
+    // 守住 legacy kprobe 攻击面——cleanup 时手贱误改回 #[kprobe] 会让 cookie helper
+    // verifier 直接拒载入。
+    assert!(
+        !src.contains("#[kprobe]"),
+        "byte accounting must not run on legacy kprobe — cookie helper would fail verifier"
+    );
+}
+
+#[test]
+fn should_use_btf_tracepoint_for_state_transitions() {
+    let src = read_repo_file("caretta-ebpf/src/main.rs");
+
+    assert!(
+        src.contains("#[btf_tracepoint(function = \"inet_sock_set_state\")]"),
+        "inet_sock_set_state must use tp_btf (BPF_PROG_TYPE_TRACING) for cookie helper"
+    );
+    assert!(
+        !src.contains("#[tracepoint]"),
+        "state transition probe must not use legacy tracepoint — cookie helper would fail verifier"
+    );
+}
+
+#[test]
+fn should_load_programs_via_fentry_and_btf_tracepoint_in_userspace() {
+    let src = read_repo_file("caretta/src/main.rs");
+
+    // 用户态加载侧:必须走 FEntry / BtfTracePoint 而不是 KProbe / TracePoint。
+    assert!(
+        src.contains("FEntry") && src.contains("BtfTracePoint"),
+        "userspace must load FEntry + BtfTracePoint to match the new program types"
+    );
+    assert!(
+        src.contains("Btf::from_sys_fs"),
+        "userspace must read kernel BTF from /sys/kernel/btf for fentry/tp_btf attach"
+    );
+    // 防御:legacy 加载 API 不该再出现在 main.rs。出现就意味着新程序类型回退了。
+    assert!(
+        !src.contains("KProbe") && !src.contains("TracePoint;"),
+        "userspace must not still reference KProbe / TracePoint loaders"
+    );
+    // 旧 tracefs format 解析路径整体下线。
+    assert!(
+        !src.contains("parse_tracepoint_offsets"),
+        "tracefs format parsing must be removed; sock_common offsets come from BTF now"
+    );
+}
+
+#[test]
+fn should_resolve_sock_field_offsets_from_vmlinux_btf() {
+    let main_src = read_repo_file("caretta/src/main.rs");
+    let types_src = read_repo_file("caretta/src/types.rs");
+    let ebpf_src = read_repo_file("caretta-ebpf/src/main.rs");
+
+    // sock_common 偏移走 BTF 解析,推到 eBPF 端的 SOCK_OFFSETS 这张 map。
+    assert!(
+        main_src.contains("parse_sock_offsets") && main_src.contains("SOCK_OFFSETS"),
+        "main.rs must parse sock_common offsets and push them via SOCK_OFFSETS map"
+    );
+    assert!(
+        types_src.contains("pub fn parse_sock_offsets"),
+        "types.rs must expose parse_sock_offsets backed by the BTF parser"
+    );
+    assert!(
+        ebpf_src.contains("static SOCK_OFFSETS"),
+        "ebpf side must declare SOCK_OFFSETS map for sock_common offsets"
+    );
+    // 旧的 TRACEPOINT_OFFSETS / TRACEPOINT_FORMAT_PATH 必须整体下线。
+    assert!(
+        !main_src.contains("TRACEPOINT_OFFSETS") && !main_src.contains("TRACEPOINT_FORMAT_PATH"),
+        "tracepoint offset path must be fully removed; SOCK_OFFSETS replaces it"
+    );
+}
+
 // Ensures resolver refresh signaling remains bounded under watch-event bursts.
 #[test]
 fn should_coalesce_refresh_signals_when_watch_events_burst() {
