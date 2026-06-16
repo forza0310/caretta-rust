@@ -458,13 +458,13 @@ data:
           {
             "current": {
               "selected": false,
-              "text": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})",
-              "value": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})"
+              "text": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})",
+              "value": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})"
             },
             "hide": 2,
             "label": "links base",
             "name": "links_base",
-            "query": "(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"})",
+            "query": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})",
             "skipUrlSync": true,
             "type": "constant"
           },
