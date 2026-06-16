@@ -211,40 +211,107 @@ pub fn fnv_hash(s: &str) -> u32 {
     hash
 }
 
+/// 解析 `/sys/kernel/tracing/events/.../format` 文件，提取 caretta eBPF 程序需要的
+/// 字段偏移。同一份 eBPF 字节码靠运行时读取这些偏移来适配不同内核版本——format
+/// 文件就是内核暴露的"自描述"接口。
+///
+/// 解析做了两层防御（修 review 问题 5）：
+///   1. **精确字段名匹配**：原实现用 `line.contains("saddr")`，会同时匹配 `saddr_v6`。
+///      只是因为内核源码里 saddr 行恰好排在 saddr_v6 之前，substring + 第一行命中
+///      取胜——这是巧合不是 ABI 保证。任何把 IPv6 字段提前的内核版本（出于对齐或
+///      cache locality 优化）都会让 caretta 把 saddr_v6 高 4 字节当成 IPv4 saddr 读，
+///      eBPF 抓到的 IP 全是垃圾、所有连接被归为 external。这种错误不会 crash，只会
+///      让识别准确率悄悄垮掉。
+///   2. **size 校验**：调用方传入预期 size，解析时同时核对。如果未来内核把 saddr
+///      改成 16 字节联合字段、或者 sport 从 __u16 升级成 __u32 这种 ABI 变更，启动
+///      就 bail——清晰失败 > 静默错误。
 pub fn parse_tracepoint_offsets(path: &str) -> anyhow::Result<TraceOffsets> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read tracepoint format: {path}"))?;
 
-    fn find_offset(content: &str, field_name: &str) -> anyhow::Result<u32> {
-        for line in content.lines() {
-            if !line.contains("field:") || !line.contains(field_name) || !line.contains("offset:") {
-                continue;
-            }
-            if let Some(pos) = line.find("offset:") {
-                let rest = &line[(pos + "offset:".len())..];
-                let digits: String = rest
-                    .chars()
-                    .skip_while(|c| c.is_ascii_whitespace())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if !digits.is_empty() {
-                    return digits
-                        .parse::<u32>()
-                        .with_context(|| format!("invalid offset for field {field_name}"));
-                }
-            }
-        }
-        anyhow::bail!("field offset not found in tracepoint format: {field_name}")
+    Ok(TraceOffsets {
+        // skaddr 是指针，64-bit 内核上 8 字节、32-bit 上 4 字节。caretta 几乎只跑
+        // 在 64-bit 上，但代码层面用 size_of::<*const u8>() 兜住极少数 32-bit 场景，
+        // 让解析器在那种环境下也是"对的"而不是误报。
+        skaddr_off: find_offset(&content, "skaddr", std::mem::size_of::<*const u8>() as u32)?,
+        // newstate / oldstate 是 int —— Linux 上 sizeof(int) 在所有支持架构都是 4。
+        newstate_off: find_offset(&content, "newstate", 4)?,
+        // sport / dport 是 __u16，固定 2 字节。
+        sport_off: find_offset(&content, "sport", 2)?,
+        dport_off: find_offset(&content, "dport", 2)?,
+        // saddr / daddr 是 __u8[4]，IPv4 地址固定 4 字节。这条 size 约束正是用来挡住
+        // "saddr substring 匹配到 saddr_v6 (size=16)" 的核心防线——即使匹配真的漂到了
+        // saddr_v6 行，size 校验也会立刻 bail。
+        saddr_off: find_offset(&content, "saddr", 4)?,
+        daddr_off: find_offset(&content, "daddr", 4)?,
+    })
+}
+
+/// 从 format 文件的一行里提取 (字段名, offset, size)，按精确字段名匹配过滤。
+///
+/// format 文件每行结构（示例）：
+/// ```text
+///         field:__u8 saddr[4];    offset:32;      size:4; signed:0;
+/// ```
+/// 拆解：以 `field:` 开头，紧跟 C 类型 + 字段名 + 可选 `[N]`（数组维度），以 `;`
+/// 终止；之后按 `key:value;` 排列 offset / size / signed。
+fn parse_field_line(line: &str) -> Option<(&str, u32, u32)> {
+    // 必须包含 field:/offset:/size: 三段，缺一不可——避免误吃 print fmt 行或空行。
+    if !line.contains("field:") || !line.contains("offset:") || !line.contains("size:") {
+        return None;
     }
 
-    Ok(TraceOffsets {
-        skaddr_off: find_offset(&content, "skaddr")?,
-        newstate_off: find_offset(&content, "newstate")?,
-        sport_off: find_offset(&content, "sport")?,
-        dport_off: find_offset(&content, "dport")?,
-        saddr_off: find_offset(&content, "saddr")?,
-        daddr_off: find_offset(&content, "daddr")?,
-    })
+    // 字段名在 "field:" 与第一个 ";" 之间。
+    let after_field = line.split("field:").nth(1)?;
+    let decl = after_field.split(';').next()?.trim();
+    // decl 形如 "__u8 saddr[4]" / "const void * skaddr" / "int common_pid"。
+    // 字段名是声明里"最后一个 identifier"——按空白和 `*` 拆完拿最后非空段，再剥
+    // 掉数组维度 `[N]` 即可。
+    let last_token = decl
+        .rsplit(|c: char| c.is_ascii_whitespace() || c == '*')
+        .find(|s| !s.is_empty())?;
+    let field_name = match last_token.find('[') {
+        Some(pos) => &last_token[..pos],
+        None => last_token,
+    };
+
+    let offset = extract_uint_after(line, "offset:")?;
+    let size = extract_uint_after(line, "size:")?;
+    Some((field_name, offset, size))
+}
+
+/// 从 line 里找第一处 `key`，跳过空白后取连续数字解析为 u32。
+fn extract_uint_after(line: &str, key: &str) -> Option<u32> {
+    let pos = line.find(key)?;
+    let rest = &line[pos + key.len()..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_ascii_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok()
+}
+
+/// 在 format 文件里精确匹配字段名，校验 size，返回 offset。
+fn find_offset(content: &str, field_name: &str, expected_size: u32) -> anyhow::Result<u32> {
+    for line in content.lines() {
+        let Some((name, offset, size)) = parse_field_line(line) else {
+            continue;
+        };
+        if name != field_name {
+            continue;
+        }
+        // size 不符 = 内核把这个字段的语义改了。继续按旧 offset 读会拿到垃圾值，
+        // 不如启动就 bail，让运维一眼看到具体哪里不兼容。
+        if size != expected_size {
+            anyhow::bail!(
+                "tracepoint field {field_name} has unexpected size {size} \
+                 (expected {expected_size}); kernel layout may have changed"
+            );
+        }
+        return Ok(offset);
+    }
+    anyhow::bail!("field offset not found in tracepoint format: {field_name}")
 }
 
 #[cfg(test)]
@@ -358,5 +425,132 @@ mod tests {
             .await
             .expect("tcp reduction should succeed");
         assert_eq!(tcp.state, TCP_CONNECTION_CLOSED_STATE);
+    }
+
+    // ---- review 问题 5：tracepoint 字段解析的精确性 ----
+    //
+    // 这一组 fixture 测试覆盖 parse_tracepoint_offsets 的边界。format 文件就是字符
+    // 串，写 fixture 零成本——测试性价比最高的地方。
+
+    /// 当前内核（cbw 这台 ecm-1280）实际抓到的 inet_sock_set_state layout。
+    /// 把它当 baseline：日常 happy path 必须能解析出已知 offset/size 组合。
+    /// 未来某天升级内核如果偏移变了，本测试不会失败（因为它只验当前 layout 是否被
+    /// 正确解析），但 reverse_layout 那条会保护反序场景。
+    const FIXTURE_CURRENT_KERNEL: &str = "\
+name: inet_sock_set_state
+ID: 1603
+format:
+        field:unsigned short common_type;       offset:0;       size:2; signed:0;
+        field:unsigned char common_flags;       offset:2;       size:1; signed:0;
+        field:unsigned char common_preempt_count;       offset:3;       size:1; signed:0;
+        field:int common_pid;   offset:4;       size:4; signed:1;
+
+        field:const void * skaddr;      offset:8;       size:8; signed:0;
+        field:int oldstate;     offset:16;      size:4; signed:1;
+        field:int newstate;     offset:20;      size:4; signed:1;
+        field:__u16 sport;      offset:24;      size:2; signed:0;
+        field:__u16 dport;      offset:26;      size:2; signed:0;
+        field:__u16 family;     offset:28;      size:2; signed:0;
+        field:__u16 protocol;   offset:30;      size:2; signed:0;
+        field:__u8 saddr[4];    offset:32;      size:4; signed:0;
+        field:__u8 daddr[4];    offset:36;      size:4; signed:0;
+        field:__u8 saddr_v6[16];        offset:40;      size:16;        signed:0;
+        field:__u8 daddr_v6[16];        offset:56;      size:16;        signed:0;
+";
+
+    // happy path：已知 layout 必须解出已知偏移。这是 regression baseline——升级内核
+    // 后如果哪个 caretta 关心的字段被悄悄移走，下面任一断言都会响。
+    #[test]
+    fn should_parse_offsets_from_current_kernel_layout() {
+        let off = find_offset(FIXTURE_CURRENT_KERNEL, "saddr", 4)
+            .expect("saddr should resolve");
+        assert_eq!(off, 32);
+        let off = find_offset(FIXTURE_CURRENT_KERNEL, "daddr", 4)
+            .expect("daddr should resolve");
+        assert_eq!(off, 36);
+        let off = find_offset(FIXTURE_CURRENT_KERNEL, "sport", 2)
+            .expect("sport should resolve");
+        assert_eq!(off, 24);
+        let off = find_offset(FIXTURE_CURRENT_KERNEL, "newstate", 4)
+            .expect("newstate should resolve");
+        assert_eq!(off, 20);
+    }
+
+    // 反序 layout：假设未来某个内核版本（或 distro patch）把 saddr_v6 排到 saddr
+    // 之前。原实现 substring 匹配会返回 saddr_v6 的偏移，eBPF 把 IPv6 高 4 字节当
+    // IPv4 saddr 读——caretta 表面看就是"识别不出集群内 IP"。修复后必须挑出真正的
+    // saddr 那一行。
+    //
+    // 这是 review 问题 5 的核心场景。如果不修，下面的断言会拿到 47 而不是 51。
+    #[test]
+    fn should_pick_saddr_when_v6_field_appears_first() {
+        const REVERSED: &str = "\
+        field:__u8 saddr_v6[16];        offset:31;      size:16; signed:0;
+        field:__u8 daddr_v6[16];        offset:47;      size:16; signed:0;
+        field:__u8 saddr[4];            offset:63;      size:4;  signed:0;
+        field:__u8 daddr[4];            offset:67;      size:4;  signed:0;
+";
+        let off =
+            find_offset(REVERSED, "saddr", 4).expect("saddr should resolve to its own line");
+        assert_eq!(off, 63, "must skip saddr_v6 and find the real saddr");
+        let off =
+            find_offset(REVERSED, "daddr", 4).expect("daddr should resolve to its own line");
+        assert_eq!(off, 67, "must skip daddr_v6 and find the real daddr");
+    }
+
+    // size 校验：如果某天内核把 saddr 改成 16 字节联合字段（IPv4/IPv6 复用）或者
+    // sport 升宽到 __u32，size 不再匹配。这种情况启动就 bail，比静默读垃圾好。
+    #[test]
+    fn should_bail_when_field_size_changed() {
+        const HYPOTHETICAL: &str = "\
+        field:__u8 saddr[16];   offset:32;      size:16; signed:0;
+";
+        let err = find_offset(HYPOTHETICAL, "saddr", 4)
+            .expect_err("size mismatch must bail, not silently return offset");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unexpected size"),
+            "error message should explain the size mismatch, got: {msg}"
+        );
+    }
+
+    // 字段彻底缺失：format 文件里压根没有期望的字段。比 substring 模式更严格——
+    // 原实现可能在某些前缀冲突场景 substring 命中错的字段；新实现命中不了任何字段
+    // 就如实 bail。
+    #[test]
+    fn should_bail_when_field_is_absent() {
+        const WITHOUT_SADDR: &str = "\
+        field:__u16 sport;      offset:24;      size:2; signed:0;
+";
+        assert!(find_offset(WITHOUT_SADDR, "saddr", 4).is_err());
+    }
+
+    // 防止前缀污染：保证带 saddr 子串的其它字段（real_world 无此例，但属于通用
+    // robustness）不会被错认成 saddr。这条直接钉住 parse_field_line 用的是精确名
+    // 匹配而不是 substring。
+    #[test]
+    fn should_not_match_field_with_saddr_substring() {
+        const WITH_LOOKALIKE: &str = "\
+        field:__u8 not_saddr_really[4];   offset:32;      size:4;  signed:0;
+        field:__u8 saddr[4];              offset:48;      size:4;  signed:0;
+";
+        let off =
+            find_offset(WITH_LOOKALIKE, "saddr", 4).expect("real saddr should still resolve");
+        assert_eq!(
+            off, 48,
+            "must skip lookalike field name and find the exact saddr"
+        );
+    }
+
+    // print fmt 行里也含 saddr 字样（"saddr=%pI4 ..."），但没有 field:/offset:/size:
+    // 三件套，必须被 parse_field_line 过滤掉，不能误当成字段行解析。
+    #[test]
+    fn should_ignore_print_fmt_line_with_field_name_substring() {
+        const WITH_PRINT_FMT: &str = "\
+        field:__u8 saddr[4];    offset:32;      size:4; signed:0;
+print fmt: \"saddr=%pI4 daddr=%pI4\", REC->saddr, REC->daddr
+";
+        let off = find_offset(WITH_PRINT_FMT, "saddr", 4).expect("saddr should resolve");
+        assert_eq!(off, 32);
     }
 }
