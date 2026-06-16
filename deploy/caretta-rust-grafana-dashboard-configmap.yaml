@@ -82,13 +82,22 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "round(\n  increase(\n    (\n      (\n        sum by (id, source, target, mainStat, secondaryStat) (\n          label_join(label_join(label_join(label_join(label_join(${links_base}, \"source\", \"\", \"client_id\"), \"target\", \"\", \"server_id\"), \"id\", \"\", \"link_id\"), \"mainStat\", \"\", \"client_ip\"), \"secondaryStat\", \":\", \"server_ip\", \"server_port\")\n        )\n      )\n      and on(source)\n      sum by (source) (label_join(${links_base}, \"source\", \"\", \"client_id\"))\n      and on(target)\n      sum by (target) (label_join(${links_base}, \"target\", \"\", \"server_id\"))\n    )[$__range:$__interval]\n  )\n) > 0",
+              "expr": "(\n  rate(\n    (\n      (\n        sum by (id, source, target, detail__client_ip, detail__server_endpoint) (\n          label_join(label_join(label_join(label_join(label_join(${links_base}, \"source\", \"\", \"client_id\"), \"target\", \"\", \"server_id\"), \"id\", \"\", \"link_id\"), \"detail__client_ip\", \"\", \"client_ip\"), \"detail__server_endpoint\", \":\", \"server_ip\", \"server_port\")\n        )\n      )\n      and on(source)\n      sum by (source) (label_join(${links_base}, \"source\", \"\", \"client_id\"))\n      and on(target)\n      sum by (target) (label_join(${links_base}, \"target\", \"\", \"server_id\"))\n    )[$__range:$__interval]\n  )\n) > 0",
               "format": "table",
               "hide": false,
               "instant": true,
               "legendFormat": "__auto",
               "range": false,
               "refId": "edges"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "renameByRegex",
+              "options": {
+                "regex": "Value #edges",
+                "renamePattern": "detail__rate_Bps"
+              }
             }
           ],
           "title": "Service Map",
