@@ -365,3 +365,29 @@ fn should_refresh_link_last_active_only_for_freshly_observed_links() {
         "poll loop should gate last_active refresh on link_seen_this_tick"
     );
 }
+
+// 守卫 ClusterIP 上卷:Service 必须先尝试通过 spec.selector 反查同 namespace 的
+// Pod, 复用 Pod 已经过完 owner 上卷的 Workload, 否则 biz 的 CLIENT 视角会把
+// ClusterIP 打成 kind=Service, 与 user 的 SERVER 视角(kind=Deployment)在
+// prometheus 上产生双 series, grafana 拓扑面板会闪。
+#[test]
+fn should_resolve_clusterip_to_pod_workload_when_service_has_selector() {
+    let src = read_repo_file("caretta/src/resolver.rs");
+
+    // 必须有 selector 反查 helper。
+    assert!(
+        src.contains("fn selector_matches("),
+        "Service path must expose selector_matches helper for ClusterIP→Pod backing resolution"
+    );
+    // Service 循环必须真的调用 selector_matches —— 不能再无脑直接打 kind=Service。
+    assert!(
+        src.contains("selector_matches(selector,"),
+        "Service iteration must consult Pod labels via selector_matches before falling back to kind=Service"
+    );
+    // 必须有 fallback helper, 保留 ExternalName / 无 selector / Pod 还没 ready 等
+    // corner case 的退化路径(不引入新 bug)。
+    assert!(
+        src.contains("fn service_fallback_workload("),
+        "Service fallback for selectorless services (ExternalName etc.) must be preserved"
+    );
+}

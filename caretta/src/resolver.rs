@@ -14,7 +14,7 @@ use kube::{Api, Client};
 use log::warn;
 use lru::LruCache;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -549,9 +549,15 @@ impl K8sResolver {
         }
 
         let pods: Api<Pod> = Api::all(self.client.clone());
+        // pods_by_ns 留住每个 Pod 已经过完 owner 上卷的 Workload + 其 labels,
+        // 让接下来的 Service 循环按 namespace 反查 selector 命中的 Pod, 直接复用
+        // 同一份 Workload, 避免 ClusterIP 与 Pod IP 在 prometheus 上产生
+        // {kind=Service} / {kind=Deployment} 双 series。
+        let mut pods_by_ns: HashMap<String, Vec<PodSummary>> = HashMap::new();
         for pod in pods.list(&ListParams::default()).await?.items {
             let namespace = pod.metadata.namespace.clone().unwrap_or_default();
             let pod_name = pod.metadata.name.clone().unwrap_or_default();
+            let labels = pod.metadata.labels.clone().unwrap_or_default();
             let owner_ref = Self::first_owner_target(&pod);
             let (resolved_kind, resolved_name, immediate_owner) =
                 self.trace_owner_hierarchy(&namespace, owner_ref, &owners_index);
@@ -562,10 +568,15 @@ impl K8sResolver {
                 } else {
                     resolved_name
                 },
-                namespace,
+                namespace: namespace.clone(),
                 kind: resolved_kind,
                 owner: immediate_owner,
             };
+
+            pods_by_ns.entry(namespace).or_default().push(PodSummary {
+                labels,
+                workload: workload.clone(),
+            });
 
             if let Some(status) = pod.status {
                 if let Some(pod_ips) = status.pod_ips {
@@ -585,25 +596,34 @@ impl K8sResolver {
         let services: Api<Service> = Api::all(self.client.clone());
         for svc in services.list(&ListParams::default()).await?.items {
             let namespace = svc.metadata.namespace.clone().unwrap_or_default();
-            let name = svc.metadata.name.clone().unwrap_or_default();
-            let workload = Workload {
-                name,
-                namespace,
-                kind: "Service".to_string(),
-                owner: String::new(),
+            let svc_name = svc.metadata.name.clone().unwrap_or_default();
+
+            let Some(spec) = svc.spec else { continue };
+
+            // ClusterIP 上卷: 有 selector + 在本 namespace 下能找到匹配的 Pod →
+            // 直接复用 Pod 已经过完 owner 上卷的 Workload (两端视角同 key,
+            // prometheus 单 series); 否则 (ExternalName / 无 selector / selector
+            // 暂时选不到 Pod) 退回 caretta-go 行为的 kind=Service workload。
+            let workload = match spec.selector.as_ref() {
+                Some(selector) if !selector.is_empty() => pods_by_ns
+                    .get(&namespace)
+                    .and_then(|pods| {
+                        pods.iter().find(|p| selector_matches(selector, &p.labels))
+                    })
+                    .map(|p| p.workload.clone())
+                    .unwrap_or_else(|| service_fallback_workload(&svc_name, &namespace)),
+                _ => service_fallback_workload(&svc_name, &namespace),
             };
 
-            if let Some(spec) = svc.spec {
-                if let Some(cluster_ip) = spec.cluster_ip {
-                    if let Some(parsed) = parse_ipv4_to_u32(&cluster_ip) {
-                        next.insert(parsed, workload.clone());
-                    }
+            if let Some(cluster_ip) = spec.cluster_ip {
+                if let Some(parsed) = parse_ipv4_to_u32(&cluster_ip) {
+                    next.insert(parsed, workload.clone());
                 }
-                if let Some(cluster_ips) = spec.cluster_ips {
-                    for ip in cluster_ips {
-                        if let Some(parsed) = parse_ipv4_to_u32(&ip) {
-                            next.insert(parsed, workload.clone());
-                        }
+            }
+            if let Some(cluster_ips) = spec.cluster_ips {
+                for ip in cluster_ips {
+                    if let Some(parsed) = parse_ipv4_to_u32(&ip) {
+                        next.insert(parsed, workload.clone());
                     }
                 }
             }
@@ -686,6 +706,35 @@ fn parse_ipv4_to_u32(ip: &str) -> Option<u32> {
     ip.parse::<Ipv4Addr>().ok().map(u32::from)
 }
 
+/// Snapshot of a Pod 内 refresh_snapshot 周期里需要的两个事实:它的 labels (用来
+/// 给 Service.spec.selector 反查命中) 与它已经 owner 上卷过的 Workload。
+struct PodSummary {
+    labels: BTreeMap<String, String>,
+    workload: Workload,
+}
+
+/// k8s Service selector 是 equality-based (AND 语义): selector 中每一对 (k, v)
+/// 都必须在 pod labels 中存在且值相等。Pod 多出来的 label 不破坏匹配。
+/// 调用方已过滤掉 empty selector,这里不再特判。
+fn selector_matches(
+    selector: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+/// 当 Service 没有 selector 或 selector 选不到任何 Pod 时,保留 caretta-go 行为:
+/// 把 ClusterIP 标成 kind=Service。覆盖 ExternalName / 手动 Endpoints / Pod 还没
+/// ready 等 corner case,**不引入新 bug**——退化路径与现有 caretta-go 完全一致。
+fn service_fallback_workload(name: &str, namespace: &str) -> Workload {
+    Workload {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        kind: "Service".to_string(),
+        owner: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +769,68 @@ mod tests {
 
         // The constructor should normalize invalid zero sizes instead of panicking.
         assert_eq!(cache.resolve_name(ip).await, "127.0.0.1");
+    }
+
+    // selector AND-semantics: 所有 (k, v) 都需要在 pod labels 中存在且值相等。
+    #[test]
+    fn selector_should_match_when_all_keys_present_with_equal_values() {
+        let mut selector = BTreeMap::new();
+        selector.insert("app".to_string(), "user".to_string());
+        selector.insert("tier".to_string(), "backend".to_string());
+
+        let mut labels = BTreeMap::new();
+        labels.insert("app".to_string(), "user".to_string());
+        labels.insert("tier".to_string(), "backend".to_string());
+
+        assert!(selector_matches(&selector, &labels));
+    }
+
+    // 任何一个 key 的 value 不一致就不算匹配。
+    #[test]
+    fn selector_should_not_match_when_value_differs() {
+        let mut selector = BTreeMap::new();
+        selector.insert("app".to_string(), "user".to_string());
+
+        let mut labels = BTreeMap::new();
+        labels.insert("app".to_string(), "biz".to_string());
+
+        assert!(!selector_matches(&selector, &labels));
+    }
+
+    // selector 要求的 key 在 pod 上不存在,直接 fail。
+    #[test]
+    fn selector_should_not_match_when_pod_missing_required_key() {
+        let mut selector = BTreeMap::new();
+        selector.insert("app".to_string(), "user".to_string());
+
+        let labels = BTreeMap::new();
+        assert!(!selector_matches(&selector, &labels));
+    }
+
+    // selector 是 AND 语义,Pod 多出来的 label 不应破坏匹配——这是真实集群里
+    // 最常见的情形(K8s 自动注入 pod-template-hash 等)。
+    #[test]
+    fn selector_should_match_when_pod_has_extra_labels() {
+        let mut selector = BTreeMap::new();
+        selector.insert("app".to_string(), "user".to_string());
+
+        let mut labels = BTreeMap::new();
+        labels.insert("app".to_string(), "user".to_string());
+        labels.insert("pod-template-hash".to_string(), "abc123".to_string());
+        labels.insert("version".to_string(), "v2".to_string());
+
+        assert!(selector_matches(&selector, &labels));
+    }
+
+    // 退化路径:无 selector / selector 选不到 Pod 时,fallback 仍然要产出
+    // kind=Service 的 workload, 保留 caretta-go 行为, ExternalName / 手动
+    // Endpoints / Pod 还没 ready 都走这条。
+    #[test]
+    fn fallback_workload_should_have_service_kind_for_external_name_pattern() {
+        let workload = service_fallback_workload("external-svc", "ns-a");
+        assert_eq!(workload.name, "external-svc");
+        assert_eq!(workload.namespace, "ns-a");
+        assert_eq!(workload.kind, "Service");
+        assert_eq!(workload.owner, "");
     }
 }
