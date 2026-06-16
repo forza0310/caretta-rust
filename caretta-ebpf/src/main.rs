@@ -4,7 +4,7 @@
 use aya_ebpf::bindings::{BPF_TCP_CLOSE, BPF_TCP_SYN_RECV, BPF_TCP_SYN_SENT};
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_probe_read_kernel};
 use aya_ebpf::macros::{btf_tracepoint, fentry, map};
-use aya_ebpf::maps::HashMap;
+use aya_ebpf::maps::{HashMap, PerCpuHashMap};
 use aya_ebpf::programs::{BtfTracePointContext, FEntryContext};
 use aya_log_ebpf::{info, warn};
 
@@ -17,7 +17,7 @@ const CONNECTION_ROLE_SERVER: u32 = 2;
 // `struct sock_common` 关键字段在该内核 vmlinux BTF 里的 byte offset。
 // 用户态在启动期解析 /sys/kernel/btf/vmlinux 写入,eBPF 端 bpf_probe_read_kernel
 // 时按这些 offset 从 sock 指针读字段——这样不依赖任何 kernel-version-specific
-// 硬编码,内核改 ABI 时启动就 fail,而不是默默读垃圾。
+// 硬编码,内核改 ABI 时启动就 fail。
 //
 // 字段语义:
 //   skc_daddr_off      —— __be32,对端 IP(对 sk_common 而言是 "destination")
@@ -55,12 +55,9 @@ pub struct ConnectionIdentifier {
 #[repr(C)]
 #[derive(Copy, Clone)]
 // Per-connection counters tracked in eBPF maps.
-// bytes_sent comes from tcp_sendmsg, bytes_received comes from tcp_cleanup_rbuf,
-// and is_active tracks whether the socket is still open.
 pub struct ConnectionThroughputStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    pub is_active: u64,
 }
 
 #[cfg(not(test))]
@@ -70,17 +67,23 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 #[map]
-// Primary per-connection store. Userspace iterates this map to read throughput and liveness
+// Primary per-connection store. Userspace iterates this map to read throughput
 // for each observed TCP connection.
-static CONNECTIONS: HashMap<ConnectionIdentifier, ConnectionThroughputStats> =
-    HashMap::<ConnectionIdentifier, ConnectionThroughputStats>::with_max_entries(131072, 0);
+//
+// PerCpuHashMap 给每个 CPU 一份独立的 ConnectionThroughputStats 实例:每条 sendmsg 调用
+// 永远只写当前 CPU 的那份副本,写者之间物理上不重叠,无锁、无 race。
+static CONNECTIONS: PerCpuHashMap<ConnectionIdentifier, ConnectionThroughputStats> =
+    PerCpuHashMap::<ConnectionIdentifier, ConnectionThroughputStats>::with_max_entries(131072, 0);
+
+#[map]
+// 用普通 HashMap 而不是 PerCpuHashMap:状态字段是"全局事实"(socket 关了就是关了),
+// 没有 per-CPU 维护副本的语义。
+static CONNECTION_STATES: HashMap<ConnectionIdentifier, u64> =
+    HashMap::<ConnectionIdentifier, u64>::with_max_entries(131072, 0);
 
 #[map]
 // sock cookie → 活跃连接 key 的反查表。
-// cookie 在 sock 生命周期内分配一次、sock free 后不会复用,
-// 所以即使新分配的 sock 恰好落在刚刚释放的那块内存上,
-// 它一定拿到不同的 cookie。这条不变量把 sendmsg/recvmsg 计费路径和 close 路径,
-// 从 "sock-slab 复用 race" 中保护出来。
+// cookie 在 sock 生命周期内分配一次、sock free 后不会复用
 static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
@@ -91,8 +94,6 @@ static SOCK_OFFSETS: HashMap<u32, SockOffsets> =
     HashMap::<u32, SockOffsets>::with_max_entries(1, 0);
 
 // fentry on tcp_sendmsg captures TCP write-side payload size.
-// fentry 类型签名按 vmlinux BTF 决定,内核函数原型 (struct sock *sk, struct msghdr *msg, size_t size)。
-// fentry 是 BPF_PROG_TYPE_TRACING,bpf_get_socket_cookie() helper 在这个 program type 下可用。
 #[fentry(function = "tcp_sendmsg")]
 pub fn handle_tcp_sendmsg(ctx: FEntryContext) -> u32 {
     match try_handle_tcp_sendmsg(&ctx) {
@@ -102,7 +103,6 @@ pub fn handle_tcp_sendmsg(ctx: FEntryContext) -> u32 {
 }
 
 // fentry on tcp_cleanup_rbuf captures TCP read-side accounting.
-// 内核函数原型 (struct sock *sk, int copied)。
 #[fentry(function = "tcp_cleanup_rbuf")]
 pub fn handle_tcp_cleanup_rbuf(ctx: FEntryContext) -> u32 {
     match try_handle_tcp_cleanup_rbuf(&ctx) {
@@ -146,11 +146,7 @@ fn sock_cookie(skaddr: u64) -> u64 {
     // (即使下一次 alloc 拿到同一个 `struct sock *` 地址,cookie 也会是新值)。
     //
     // 0 表示 helper 在当前 program type 上不可用,或 sock 指针为空。调用方必须把 0
-    // 当 "本次跳过" 处理,而不是当合法 key,否则多个不相关的 sock 会在 cookie==0 上互撞。
-    //
-    // 此 helper 只在 BPF_PROG_TYPE_TRACING/BPF_PROG_TYPE_CGROUP_SOCK 等几类 program 上注册;
-    // 这就是为什么 sendmsg/recvmsg 必须改成 fentry、inet_sock_set_state 必须改成 tp_btf
-    // ——legacy kprobe / tracepoint program 类型走不通这条 helper。
+    // 当 "本次跳过" 处理,而不是当合法 key。
     unsafe { bpf_get_socket_cookie(skaddr as *mut core::ffi::c_void) }
 }
 
@@ -169,11 +165,10 @@ fn mark_connection_closed(cookie: u64) {
     // 可能落空,pid 等字段在 close 时未必和 open 时一致。
     if let Some(key) = unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
         let key = *key;
-        if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
-            let mut updated = *existing;
-            updated.is_active = 0;
-            let _ = CONNECTIONS.insert(&key, &updated, 0);
-        }
+        // 只动 CONNECTION_STATES。CONNECTIONS 是 PerCpuHashMap、专给字节累加用,
+        // 状态字段不在那张表里,close 路径对它一字不动——这是 RMW race 修复的关键
+        // 不变量,不能回退。
+        let _ = CONNECTION_STATES.insert(&key, &0u64, 0);
     }
 
     let _ = SOCK_TO_CONNECTION.remove(&cookie);
@@ -253,28 +248,22 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
         role,
     };
 
-    let mut throughput = ConnectionThroughputStats {
-        bytes_sent: 0,
-        bytes_received: 0,
-        is_active: 1,
-    };
-
-    if let Some(existing) = unsafe { CONNECTIONS.get(&key) } {
-        throughput = *existing;
-        // State transitions should not mutate byte counters.
-        // Bytes are only accounted in tcp_sendmsg/tcp_cleanup_rbuf probes.
-        throughput.is_active = 1;
-    }
-
-    if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
+    // sock_set_state 路径只写 CONNECTION_STATES + SOCK_TO_CONNECTION,绝不动 CONNECTIONS。
+    // 字节计数交给 sendmsg/recvmsg 路径在 PerCpuHashMap 上 lazy-init,这样 state 路径与
+    // 字节累加路径写的 map 完全不交叠——RMW 跨 CPU 撞车从根上消掉。
+    if let Err(e) = CONNECTION_STATES.insert(&key, &1u64, 0) {
         // 边界事件:131072 entries 撑爆,通常是 close 路径漏 cleanup 或者短连接风暴。
         // 用户态 GC 兜底,但出现这条说明 cleanup 跟不上、视图会丢新 link。
-        info!(ctx, "CONNECTIONS map insert failed: err={}", e);
+        info!(ctx, "CONNECTION_STATES map insert failed: err={}", e);
         return Err(e);
     }
     if let Err(e) = SOCK_TO_CONNECTION.insert(&cookie, &key, 0) {
         // 同上,反查表撑爆——后续 sendmsg/cleanup_rbuf/close 都没法落到这条 sock 上。
+        // 这里同时把刚刚写入的 CONNECTION_STATES 条目回滚,避免留下永远没人 close 的
+        // 孤儿状态(否则 mark_connection_closed 因 cookie→key 反查不到,is_active 永远停
+        // 在 1,用户态再也不会推这条进 to_delete,两张 map 一起雪崩)。
         info!(ctx, "SOCK_TO_CONNECTION map insert failed: err={}", e);
+        let _ = CONNECTION_STATES.remove(&key);
         return Err(e);
     }
     Ok(())
@@ -294,21 +283,19 @@ fn try_handle_tcp_sendmsg(ctx: &FEntryContext) -> Result<(), i32> {
         None => return Ok(()),
     };
 
+    // CONNECTIONS 是 PerCpuHashMap:get/insert 在 BPF 端语义都是"当前 CPU 的那份副本",
+    // 写者只动自己 CPU 的实例,跨 CPU 永不冲突。这里因此可以放心做 read-modify-write:
+    // 它在并发安全意义上等价于 single-threaded RMW。用户态收割时再把所有 CPU 的副本
+    // 求和聚合。
     let mut throughput = match unsafe { CONNECTIONS.get(&key) } {
         Some(t) => *t,
-        None => {
-            let init = ConnectionThroughputStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-                is_active: 1,
-            };
-            CONNECTIONS.insert(&key, &init, 0)?;
-            init
-        }
+        None => ConnectionThroughputStats {
+            bytes_sent: 0,
+            bytes_received: 0,
+        },
     };
 
     throughput.bytes_sent = throughput.bytes_sent.saturating_add(size as u64);
-    throughput.is_active = 1;
     CONNECTIONS.insert(&key, &throughput, 0)?;
 
     Ok(())
@@ -331,21 +318,16 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
         None => return Ok(()),
     };
 
+    // 同 sendmsg:在 PerCpuHashMap 当前 CPU 的副本上做 RMW,跨 CPU 不冲突。
     let mut throughput = match unsafe { CONNECTIONS.get(&key) } {
         Some(t) => *t,
-        None => {
-            let init = ConnectionThroughputStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-                is_active: 1,
-            };
-            CONNECTIONS.insert(&key, &init, 0)?;
-            init
-        }
+        None => ConnectionThroughputStats {
+            bytes_sent: 0,
+            bytes_received: 0,
+        },
     };
 
     throughput.bytes_received = throughput.bytes_received.saturating_add(copied as u64);
-    throughput.is_active = 1;
     CONNECTIONS.insert(&key, &throughput, 0)?;
 
     Ok(())

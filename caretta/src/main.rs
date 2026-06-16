@@ -7,12 +7,13 @@ mod btf;
 mod config;
 mod http_server;
 mod metrics;
+mod per_cpu;
 mod resolver;
 mod types;
 
 use anyhow::Context as _;
 use aya::Btf;
-use aya::maps::HashMap as BpfHashMap;
+use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
 use aya::programs::{BtfTracePoint, FEntry};
 use config::Opt;
 use log::{info, warn};
@@ -26,8 +27,8 @@ use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    TcpConnectionKey, is_loopback, parse_sock_offsets, reduce_connection_to_link,
-    reduce_connection_to_tcp,
+    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, parse_sock_offsets,
+    reduce_connection_to_link, reduce_connection_to_tcp,
 };
 
 /// 一条 link 在最后一次观测到流量后多久没活动就 GC 掉对应的 prometheus series + 用户态记账。
@@ -72,10 +73,6 @@ struct TcpState {
 fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
     // 加载内核暴露的 vmlinux BTF。fentry / tp_btf 程序在 verifier attach 时需要 kernel
     // BTF 做 type 检查;同一份 BTF 我们启动期也用来解 sock_common 字段偏移。
-    //
-    // 失败原因常见两类,合并写在 hint 里方便容器化部署排查:
-    //   - 内核 < 5.5 或编译时未启用 CONFIG_DEBUG_INFO_BTF=y
-    //   - 容器没把 host 的 /sys/kernel/btf 挂进来
     Btf::from_sys_fs().with_context(|| {
         "vmlinux BTF not available; kernel must be built with CONFIG_DEBUG_INFO_BTF=y \
          (linux ≥ 5.5). K8s hint: mount host /sys/kernel/btf into the container at \
@@ -137,10 +134,7 @@ async fn main() -> anyhow::Result<()> {
         "eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + tp_btf inet_sock_set_state"
     );
 
-    // EbpfLogger::init 必须放在所有 program.load() 之后:它内部会 take_map("AYA_LOGS")
-    // 把 ebpf.maps 里的 AYA_LOGS 摘出去,如果在 program.load() 之前就 take,后续 prog
-    // 加载阶段做 map reloc 时回头找 AYA_LOGS 会拿到无效 fd,内核 verifier 抛
-    // "fd N is not pointing to valid bpf_map"。
+    // EbpfLogger::init 必须放在所有 program.load() 之后
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
         warn!("failed to initialize eBPF logger: {e}");
     }
@@ -148,8 +142,17 @@ async fn main() -> anyhow::Result<()> {
     let connections_map = ebpf
         .take_map("CONNECTIONS")
         .context("CONNECTIONS map not found")?;
-    let mut connections: BpfHashMap<_, ConnectionIdentifier, ConnectionThroughputStats> =
-        BpfHashMap::try_from(connections_map)?;
+    //每个 CPU 一份独立的 ConnectionThroughputStats 实例
+    let mut connections: BpfPerCpuHashMap<_, ConnectionIdentifier, ConnectionThroughputStats> =
+        BpfPerCpuHashMap::try_from(connections_map)?;
+
+    let states_map = ebpf
+        .take_map("CONNECTION_STATES")
+        .context("CONNECTION_STATES map not found")?;
+    // 与 CONNECTIONS 解耦的状态表:0=closed,非 0=active。只有 sock_set_state 路径写它,
+    // 用户态把它当一张普通 HashMap 读即可。
+    let mut connection_states: BpfHashMap<_, ConnectionIdentifier, u64> =
+        BpfHashMap::try_from(states_map)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], opt.prometheus_port));
@@ -209,9 +212,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("metrics server listening on {}{}", metrics_addr, endpoint);
-    // 用户态 link 记账 + GC 状态。把原来的 past_links: HashMap<NetworkLink, u64> 升级
-    // 成持有 LinkState（cumulative + last_active）。
-    //
     // 为什么这张表必须存在（即使 prometheus 自己也是个 KV 存储）：
     //   - caretta_links_observed 是 Counter，对外语义"自启动以来累计字节"，单调不减。
     //   - 字节的真源头在 eBPF CONNECTIONS map 里：每条 4-tuple 对应一份 bytes_sent
@@ -219,24 +219,16 @@ async fn main() -> anyhow::Result<()> {
     //     —— 那一瞬间，该 link 在 eBPF 视角"消失"。
     //   - 如果不在用户态把已死连接的字节数记住，下一个 tick 上报时这条 link 的累计
     //     字节数会跌到 0，prometheus 看到 Counter 倒退会触发 reset 处理，PromQL 的
-    //     rate()/increase() 全部失真。所以必须在用户态另开一张表把死连接的字节累加
-    //     进来，每次 poll 把"活的（来自 eBPF map）" + "死的（来自这张表）"合并出
-    //     真正的累计值，再交给 metrics::handle_link_metric。
-    //   - 另一个更朴素的方案是改 prometheus metric 类型：用 GaugeVec 直接 set 绝对值，
-    //     然后让 PromQL 里用 `last_over_time + topk` 拼出"累计字节"——但这会把
-    //     rate()/increase() 这类 Counter 专属算子全部废掉，dashboard 全要重写。所以
-    //     维持 Counter 语义、用户态自己持有累计状态是更小的改动面。
+    //     rate()/increase() 全部失真。
     //
-    // 为什么需要 GC（之前的 past_links 没做的事）：原实现一旦写入永不回收。短连接
-    // 抖动、滚动更新换 IP、外部 IP 大量进出，都会让表无界膨胀——同时同步泄漏
-    // LAST_LINK_TOTALS 和 LINKS_METRICS 的 prometheus series（review 问题 3）。GC 用
+    // 为什么需要 GC：
+    // 短连接抖动、滚动更新换 IP、外部 IP 大量进出，都会让表无界膨胀——同时同步泄漏
+    // LAST_LINK_TOTALS 和 LINKS_METRICS 的 prometheus series。GC 用
     // LINK_GC_TTL 给一条 link 没活动后 N 分钟的宽限，过期后调 metrics::forget_link
     // 一并清掉所有相关状态。
     let mut links: HashMap<NetworkLink, LinkState> = HashMap::new();
 
-    // TCP series 生命周期跟踪——修 review 问题 4：handle_tcp_metric 把已关闭连接
-    // 写成 state=CLOSED 只是把 gauge 值改了，series 本身永远活着。我们在用户态另开
-    // 一张表记"每条连接最近 N 个 tick 的可见性"，连续 missed_ticks > 阈值就调
+    // TCP series 生命周期跟踪：记录"每条连接最近 N 个 tick 的可见性"，连续 missed_ticks > 阈值就调
     // metrics::forget_tcp 把 series 真正从注册表里抠掉。
     let mut tcp_states: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
 
@@ -267,9 +259,13 @@ async fn main() -> anyhow::Result<()> {
                 let mut loopback_counter = 0u64;
                 let mut items_counter = 0u64;
 
-                let mut entries = connections.iter();
+                let mut entries = connection_states.iter();
+                // 主循环以 CONNECTION_STATES 为权威连接清单——它在 sock_set_state 路径上
+                // open 时写 1、close 时写 0,精确反映每条连接的活跃事实。CONNECTIONS 是
+                // PerCpuHashMap、字节累加路径懒初始化,一条新连接在传第一个字节之前在那张
+                // 表里根本不存在,如果用 CONNECTIONS 当主循环源会漏掉这部分。
                 while let Some(entry) = entries.next() {
-                    let (conn, throughput) = match entry {
+                    let (conn, is_active) = match entry {
                         Ok(v) => v,
                         Err(e) => {
                             warn!("failed to iterate map entry: {e}");
@@ -278,7 +274,18 @@ async fn main() -> anyhow::Result<()> {
                     };
                     items_counter += 1;
 
-                    if throughput.is_active == 0 {
+                    // PerCpuHashMap.get 返回所有 CPU 副本的 vec,把每个 CPU 上累加的
+                    // bytes_sent / bytes_received 各自求和才是这条连接的真实累计。
+                    // KeyNotFound 是合法的——open 之后还没传过字节就走这条路径,按零计。
+                    let throughput = match connections.get(&conn, 0) {
+                        Ok(per_cpu) => aggregate_per_cpu_throughput(per_cpu.iter().copied()),
+                        Err(_) => ConnectionThroughputStats {
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                        },
+                    };
+
+                    if is_active == 0 {
                         to_delete.push(conn);
                     }
 
@@ -292,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
                         Err(_) => continue,
                     };
 
-                    let tcp = match reduce_connection_to_tcp(resolver.as_ref(), conn, throughput).await {
+                    let tcp = match reduce_connection_to_tcp(resolver.as_ref(), conn, throughput, is_active).await {
                         Ok(tcp) => tcp,
                         Err(_) => continue,
                     };
@@ -317,17 +324,26 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 for conn in to_delete {
+                    // PerCpuHashMap.get 返回 N 个 CPU 副本,这里把它们 fold 成一份累计快照,
+                    // 用于把 dying link 的最后一段字节合并进 links 表。
+                    // 若 connections 里压根没这条 entry(open 之后 close 之前一字节没传),
+                    // 走零吞吐分支,但 connection_states 里仍然必须删掉这条 entry,
+                    // 否则下个 tick 又会被列回 to_delete,死循环占位。
                     let throughput = match connections.get(&conn, 0) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("Error retrieving connection to delete, skipping it: {e}");
-                            metrics::mark_failed_connection_deletion();
-                            continue;
-                        }
+                        Ok(per_cpu) => aggregate_per_cpu_throughput(per_cpu.iter().copied()),
+                        Err(_) => ConnectionThroughputStats {
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                        },
                     };
 
-                    if let Err(e) = connections.remove(&conn) {
-                        warn!("Error deleting connection from map: {e}");
+                    // CONNECTIONS 表的 remove 失败只是 best-effort 清理——可能本来就没 entry。
+                    // CONNECTION_STATES 的 remove 才是关键路径,删失败下个 tick 会把它重新
+                    // 列回 to_delete,需要 mark 一条失败计数。
+                    let _ = connections.remove(&conn);
+
+                    if let Err(e) = connection_states.remove(&conn) {
+                        warn!("Error deleting connection state from map: {e}");
                         metrics::mark_failed_connection_deletion();
                         continue;
                     }
@@ -378,9 +394,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // ---- GC: link series ----
                 // 把 last_active 早于 (now - LINK_GC_TTL) 的 link 全部清掉，并同步删除
-                // 它们在 prometheus 注册表 + LAST_LINK_TOTALS 里的状态。这是修 review
-                // 问题 3 的关键步骤——前面 links.entry(...) 和 cumulative 写入只是让表
-                // 单调增长，没有这一步表会变成无界的内存 + cardinality 黑洞。
+                // 它们在 prometheus 注册表 + LAST_LINK_TOTALS 里的状态。
                 let ttl = LINK_GC_TTL;
                 links.retain(|link, state| {
                     if now.duration_since(state.last_active) > ttl {
@@ -393,7 +407,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // ---- GC: tcp series ----
                 // 本 tick 没看到的连接 missed_ticks +1；超过阈值的 forget 并从表里抹去。
-                // 修 review 问题 4：connection 被 ebpf map 删除后仍保留 series。
+                // 修问题：connection 被 ebpf map 删除后仍保留 series。
                 tcp_states.retain(|key, state| {
                     if tcp_seen_this_tick.contains(key) {
                         // 在本 tick 已被上面的 entry().and_modify() 重置过 missed_ticks

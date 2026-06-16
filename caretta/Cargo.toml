@@ -53,6 +53,14 @@ cargo_metadata = { workspace = true }
 # features.
 caretta-ebpf = { path = "../caretta-ebpf" }
 
+# 显式声明 lib 目标:caretta 主交付物是 bin,但需要把"可独立测试的纯逻辑"暴露给
+# integration tests(`tests/` 下的文件需要 `use caretta::...`)。lib + bin 双产物
+# 在同一个 crate 里共存,bin 通过 `mod` 直接吃 src 下的同名文件,lib 通过 `pub mod`
+# 选择性 re-export,二者不冲突。
+[lib]
+name = "caretta"
+path = "src/lib.rs"
+
 [[bin]]
 name = "caretta"
 path = "src/main.rs"

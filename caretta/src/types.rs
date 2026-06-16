@@ -4,6 +4,7 @@ use crate::btf::{DEFAULT_VMLINUX_BTF_PATH, read_struct_field_offsets};
 use crate::resolver::IpResolver;
 use std::fmt;
 use std::net::Ipv4Addr;
+pub use crate::per_cpu::{ConnectionThroughputStats, aggregate_per_cpu_throughput};
 
 pub const ROLE_CLIENT: u32 = 1;
 pub const ROLE_SERVER: u32 = 2;
@@ -28,14 +29,6 @@ pub struct ConnectionIdentifier {
     pub pid: u32,
     pub tuple: ConnectionTuple,
     pub role: u32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct ConnectionThroughputStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub is_active: u64,
 }
 
 /// 与 caretta-ebpf `SockOffsets` 一一对应:eBPF 端按这些 byte offset 从 `struct sock *`
@@ -173,6 +166,7 @@ pub async fn reduce_connection_to_tcp(
     resolver: &dyn IpResolver,
     conn: ConnectionIdentifier,
     throughput: ConnectionThroughputStats,
+    is_active: u64,
 ) -> anyhow::Result<TcpConnection> {
     let (src, dst) = tokio::join!(
         resolver.resolve_ip(conn.tuple.src_ip),
@@ -197,9 +191,14 @@ pub async fn reduce_connection_to_tcp(
         _ => anyhow::bail!("unknown connection role"),
     };
 
-    if throughput.is_active == 0 {
+    if is_active == 0 {
         connection.state = TCP_CONNECTION_CLOSED_STATE;
     }
+
+    // throughput 字段在这里没直接用——它对外只承担"被收割聚合后传上来"的语义。但保留
+    // 参数让上层调用点显式把"这条连接的吞吐快照"和"它的活跃状态"一起传下来,
+    // 以后需要在 TcpConnection 上加吞吐字段时不用再改签名。
+    let _ = throughput;
 
     Ok(connection)
 }
@@ -219,19 +218,13 @@ pub fn fnv_hash(s: &str) -> u32 {
 
 /// 解析 vmlinux BTF 拿 caretta eBPF 程序需要读的 sock_common 字段偏移。
 ///
-/// caretta 在 fentry/tp_btf 里通过 `bpf_probe_read_kernel` 从 `struct sock *` 读 4-tuple,
-/// 而 `struct sock_common` 的字段偏移在不同内核版本之间可能漂移(IPv6 字段位置变化、
-/// 结构体重排等)。每次启动从 vmlinux BTF 重解,内核改 ABI 时启动直接 fail——比硬编
-/// 码偏移、再静默读垃圾好得多。
 ///
-/// 用 `VMLINUX_BTF_PATH` 环境变量覆盖默认 `/sys/kernel/btf/vmlinux` 路径(主要给非
-/// 标准容器挂载场景留个口子)。
+/// 用 `VMLINUX_BTF_PATH` 环境变量覆盖默认 `/sys/kernel/btf/vmlinux` 路径
 ///
 /// 字段 size 校验:
 ///   - skc_daddr / skc_rcv_saddr 是 __be32,4 字节
 ///   - skc_dport / skc_num       是 __u16,2 字节
-/// size 不符就 bail——内核改了 sock_common 的字段尺寸时希望启动期就看见,而不是把
-/// 高字节吃进 IP 然后跑出垃圾数据。
+/// size 不符就 bail,免得 eBPF 端读错字段导致数据乱掉还不好排查。
 pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
     let path = std::env::var("VMLINUX_BTF_PATH")
         .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
@@ -360,19 +353,11 @@ mod tests {
         let throughput = ConnectionThroughputStats {
             bytes_sent: 1,
             bytes_received: 2,
-            is_active: 0,
         };
 
-        let tcp = reduce_connection_to_tcp(&resolver, conn, throughput)
+        let tcp = reduce_connection_to_tcp(&resolver, conn, throughput, 0)
             .await
             .expect("tcp reduction should succeed");
         assert_eq!(tcp.state, TCP_CONNECTION_CLOSED_STATE);
     }
-
-    // ---- review 问题 5 的 tracepoint format 解析测试已移除 ----
-    //
-    // caretta 现在走 fentry + tp_btf,sock 字段从 vmlinux BTF 而非 tracepoint format
-    // 文件解析。等价的字段名/size 防御挪到了 caretta/src/btf.rs 的合成 BTF blob 测试,
-    // 真实内核 layout 烟雾测试见 should_resolve_sock_common_against_real_vmlinux
-    // (`#[ignore]`,需要 `/sys/kernel/btf/vmlinux`)。
 }

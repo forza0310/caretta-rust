@@ -245,13 +245,19 @@ fn should_aggregate_sent_and_received_bytes_in_userspace_poll_loop() {
 fn should_mark_and_delete_inactive_entries_in_userspace_poll_loop() {
     let src = read_repo_file("caretta/src/main.rs");
 
+    // 修复 BPF map RMW race 之后,is_active 不再放在 ConnectionThroughputStats 里,
+    // 改成由独立的 CONNECTION_STATES BPF map 维护;主循环以这张表为权威清单,
+    // is_active == 0 即触发 to_delete。这条断言守住"判定 + 入队"两步都还在。
     assert!(
-        src.contains("if throughput.is_active == 0") && src.contains("to_delete.push(conn)"),
-        "poll loop should identify inactive entries for deletion"
+        src.contains("if is_active == 0") && src.contains("to_delete.push(conn)"),
+        "poll loop should identify inactive entries (is_active == 0) for deletion"
     );
+    // 删除路径必须同时清掉 CONNECTIONS(字节计数,best-effort)和 CONNECTION_STATES
+    // (活跃状态,关键路径)——两张表分家之后,只删一张会让另一张永久泄漏。
     assert!(
-        src.contains("connections.remove(&conn)"),
-        "poll loop should remove inactive entries from the eBPF map"
+        src.contains("connections.remove(&conn)")
+            && src.contains("connection_states.remove(&conn)"),
+        "poll loop should remove inactive entries from BOTH connections and connection_states maps"
     );
 }
 
