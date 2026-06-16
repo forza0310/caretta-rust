@@ -12,7 +12,7 @@
 	- 用户态链路吞吐采用 bytes_sent + bytes_received
 - Kubernetes 解析
 	- Pod/Service/Node 解析
-	- owner 层级追溯: Pod -> ReplicaSet -> Deployment 等
+	- owner 层级追溯: Service -> Pod -> ReplicaSet -> Deployment 等,可配置 allowlist + priority
 	- watch 事件模型: 资源变更触发刷新，并有周期性全量刷新兜底
 - 可观测性
 	- Prometheus 指标端点
@@ -255,7 +255,7 @@ external 回退行为:
 
 - **eBPF map 迭代/删除错误显式上报**:caretta-go 的 `for entries.Next(&conn, &throughput)` 只返回 bool,迭代失败原因被吃掉。Rust 版每条 entry 单独 `match` 错误并 `warn!` 打日志、`mark_failed_connection_deletion` 累计指标(见 [caretta/src/main.rs:259-333](caretta/src/main.rs#L259-L333)),内核内存压力或 map 损坏在 metric 上立刻可见。
 
-- **ClusterIP 上卷消重**:caretta-go 把 ClusterIP 直接打成 `kind: "Service"`,但 DNAT 只改 skb IP 头不回写 sock_common——biz 这一面 sock 永远拿到 ClusterIP,user 那一面 sock 拿到的是 user pod_ip。两端 sock 都被采到后,prometheus 上同一对 (biz Deployment) → (user Deployment) 的连接会变成两条 series:client 视角 `server_kind="Service"`、server 视角 `server_kind="Deployment"`,叠加 Rust 版的 `LINK_GC_TTL` series GC,grafana 拓扑面板上 user 节点 kind 时 Service 时 Deployment、value 来回跳。Rust 版 [resolver.rs](caretta/src/resolver.rs) `refresh_snapshot` 用 `svc.spec.selector` 反查同 namespace 已经过完 owner 上卷的 Pod,把 ClusterIP 直接 map 到 Pod 的 Workload(走完全相同的 `trace_owner_hierarchy` 链路 + 同样的 allowlist/priority 配置)——两端视角落到同一个 workload key,prometheus 单 series。无 selector / ExternalName / selector 暂时选不到 Pod 时退回 `kind=Service` 的原行为,无回归。守卫见 `should_resolve_clusterip_to_pod_workload_when_service_has_selector`。
+- **Service 上卷消重**:caretta-go 把 ClusterIP 直接打成 `kind: "Service"`,但 DNAT 只改 skb IP 头不回写 sock_common——biz 这一面 sock 永远拿到 ClusterIP,user 那一面 sock 拿到的是 user pod_ip。两端 sock 都被采到后,prometheus 上同一对 (biz Deployment) → (user Deployment) 的连接会变成两条 series:client 视角 `server_kind="Service"`、server 视角 `server_kind="Deployment"`,叠加 Rust 版的 `LINK_GC_TTL` series GC,grafana 拓扑面板上 user 节点 kind 时 Service 时 Deployment、value 来回跳。Rust 版 [resolver.rs](caretta/src/resolver.rs) `refresh_snapshot` 用 `svc.spec.selector` 反查同 namespace 已经过完 owner 上卷的 Pod,把 ClusterIP 直接 map 到 Pod 的 Workload(走完全相同的 `trace_owner_hierarchy` 链路 + 同样的 allowlist/priority 配置)——两端视角落到同一个 workload key,prometheus 单 series。无 selector / ExternalName / selector 暂时选不到 Pod 时退回 `kind=Service` 的原行为,无回归。守卫见 `should_resolve_clusterip_to_pod_workload_when_service_has_selector`。
 
 ### 可观测性
 

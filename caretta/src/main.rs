@@ -94,9 +94,6 @@ async fn main() -> anyhow::Result<()> {
         env!("OUT_DIR"),
         "/caretta"
     )))?;
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        warn!("failed to initialize eBPF logger: {e}");
-    }
 
     // 同一份 BTF 给三类 program 用:fentry/tp_btf 在 attach 时会按 BTF 校验 args,
     // 之后还要再用同一份 BTF 解 sock_common 字段偏移。
@@ -132,6 +129,21 @@ async fn main() -> anyhow::Result<()> {
         .try_into()?;
     tracepoint.load("inet_sock_set_state", &btf)?;
     tracepoint.attach()?;
+
+    // 三个 program 全部 attach 成功 ⇔ verifier 已通过、kernel 侧 hook 已挂上、
+    // 之后任何 tcp_sendmsg / tcp_cleanup_rbuf / inet_sock_set_state 都会触发我们的
+    // ebpf 程序。把这条日志放在最后一次 attach() 之后,出现即代表 ebpf 侧上线。
+    info!(
+        "eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + tp_btf inet_sock_set_state"
+    );
+
+    // EbpfLogger::init 必须放在所有 program.load() 之后:它内部会 take_map("AYA_LOGS")
+    // 把 ebpf.maps 里的 AYA_LOGS 摘出去,如果在 program.load() 之前就 take,后续 prog
+    // 加载阶段做 map reloc 时回头找 AYA_LOGS 会拿到无效 fd,内核 verifier 抛
+    // "fd N is not pointing to valid bpf_map"。
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        warn!("failed to initialize eBPF logger: {e}");
+    }
 
     let connections_map = ebpf
         .take_map("CONNECTIONS")
