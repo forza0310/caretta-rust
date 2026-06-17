@@ -7,15 +7,36 @@ use lru::LruCache;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // PTR 反查在最坏情况下要走网络（DNS server 不响应、丢包等），因此在用户配置之外
 // 再加一层短超时上限，避免单次解析挂得太久——即使发生在 hickory 内部的网络层。
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_millis(800);
+const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DnsCacheEntry {
+    Positive(String),
+    Negative {
+        fallback: String,
+        inserted_at: Instant,
+    },
+}
+
+fn cached_name(entry: &DnsCacheEntry, now: Instant) -> Option<String> {
+    match entry {
+        DnsCacheEntry::Positive(host) => Some(host.clone()),
+        DnsCacheEntry::Negative {
+            fallback,
+            inserted_at,
+        } if now.duration_since(*inserted_at) < DNS_NEGATIVE_CACHE_TTL => Some(fallback.clone()),
+        DnsCacheEntry::Negative { .. } => None,
+    }
+}
 
 pub struct DnsCache {
     enabled: bool,
-    cache: Mutex<LruCache<u32, String>>,
+    cache: Mutex<LruCache<u32, DnsCacheEntry>>,
     // 用 hickory 的 async DNS 解析器替代 dns_lookup::lookup_addr。
     //
     // 改动动机：lookup_addr 会调 libc::getnameinfo，是同步阻塞调用——在 glibc DNS
@@ -79,23 +100,33 @@ impl DnsCache {
             return fallback;
         }
 
+        let now = Instant::now();
         if let Ok(mut cache) = self.cache.lock() {
-            if let Some(host) = cache.get(&ip) {
-                return host.clone();
+            if let Some(entry) = cache.get(&ip) {
+                if let Some(host) = cached_name(entry, now) {
+                    return host;
+                }
+                cache.pop(&ip);
             }
         }
 
-        let host = match &self.resolver {
-            Some(resolver) => Self::reverse_lookup_with_timeout(resolver, ip)
-                .await
-                .unwrap_or_else(|| fallback.clone()),
-            None => fallback.clone(),
+        let resolved = match &self.resolver {
+            Some(resolver) => Self::reverse_lookup_with_timeout(resolver, ip).await,
+            None => None,
         };
+        let host = resolved.clone().unwrap_or_else(|| fallback.clone());
 
-        // 注意：失败也写入 cache（host == fallback 时即"负缓存"），避免对不可解析
-        // 的 IP 反复发起 DNS 查询，进一步降低 DNS 抖动放大效应。
+        // 失败也短暂写入负缓存，避免不可解析 IP 每个 tick 都打 DNS；但负缓存有 TTL，
+        // DNS 恢复后最多 DNS_NEGATIVE_CACHE_TTL 后会重新尝试解析。
         if let Ok(mut cache) = self.cache.lock() {
-            cache.put(ip, host.clone());
+            let entry = match resolved {
+                Some(host) => DnsCacheEntry::Positive(host),
+                None => DnsCacheEntry::Negative {
+                    fallback: fallback.clone(),
+                    inserted_at: now,
+                },
+            };
+            cache.put(ip, entry);
         }
 
         host
@@ -129,6 +160,34 @@ mod tests {
 
         let name = cache.resolve_name(ip).await;
         assert_eq!(name, "8.8.8.8");
+    }
+
+    #[test]
+    fn should_use_fresh_negative_cache_but_expire_stale_one() {
+        let now = Instant::now();
+        let fresh = DnsCacheEntry::Negative {
+            fallback: "1.2.3.4".to_string(),
+            inserted_at: now - Duration::from_secs(59),
+        };
+        let stale = DnsCacheEntry::Negative {
+            fallback: "1.2.3.4".to_string(),
+            inserted_at: now - Duration::from_secs(60),
+        };
+
+        assert_eq!(cached_name(&fresh, now), Some("1.2.3.4".to_string()));
+        assert_eq!(cached_name(&stale, now), None);
+    }
+
+    #[test]
+    fn should_keep_positive_cache_without_negative_ttl() {
+        let now = Instant::now();
+        let entry = DnsCacheEntry::Positive("example.com".to_string());
+
+        assert_eq!(cached_name(&entry, now), Some("example.com".to_string()));
+        assert_eq!(
+            cached_name(&entry, now + Duration::from_secs(3600)),
+            Some("example.com".to_string())
+        );
     }
 
     // Prevents regressions where invalid cache size could panic at construction time.

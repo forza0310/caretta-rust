@@ -64,7 +64,7 @@
   的 `reduce_connection_to_link` / `reduce_connection_to_tcp` 一起 fan-out),最坏
   延迟从 N × DNS_timeout 收缩到单次 DNS_timeout。
 
-### [ ] 4. links HashMap 无硬上限，burst 期间 RSS 线性膨胀
+### [x] 4. links HashMap 无硬上限，burst 期间 RSS 线性膨胀
 
 - **位置**：[caretta/src/main.rs:230](caretta/src/main.rs#L230)
 - **症状**：只有 5 分钟 TTL 兜底，无 size cap。短连接风暴 / 端口扫描 / 滚动更新
@@ -73,8 +73,11 @@
   LINKS_METRICS series 各持平。GC retain 全表扫，百万级单次几百毫秒，把主循环挤掉。
 - **修法**：加 `max_links` 配置硬上限（达到上限按 last_active 升序丢最老的）；
   或砍 cardinality（src_ip/dst_ip 这种无界 label 折叠到 workload 维度）。
+- **修复实施**：新增 `MAX_LINKS` / `--max-links` 配置,默认 100000。每轮 TTL GC 后
+  调 `enforce_max_links`,超限时按 `last_active` 升序淘汰最老 link,同时调用
+  `metrics::forget_link` 清 prometheus series 和 `LAST_LINK_TOTALS` 差分基准。
 
-### [ ] 5. LINK_GC_TTL 与 prometheus staleness 完全等长，rate() 出 NaN/spike
+### [-] 5. LINK_GC_TTL 与 prometheus staleness 完全等长，rate() 出 NaN/spike
 
 - **位置**：[caretta/src/metrics.rs:271](caretta/src/metrics.rs#L271)
 - **症状**：`LINK_GC_TTL = 5 min` 与 prometheus 默认 staleness window = 5 min
@@ -89,13 +92,17 @@
 
 ## 🟡 P2 — 设计层面的脆弱点
 
-### [ ] 6. DNS 负缓存无 TTL，一次失败永久钉死
+### [x] 6. DNS 负缓存无 TTL，一次失败永久钉死
 
 - **位置**：[caretta/src/resolver/dns.rs:98](caretta/src/resolver/dns.rs#L98)
 - **症状**：DNS 抖动时某 IP resolve 失败 → fallback 写入 LRU
   `(1.2.3.4 → "1.2.3.4")`。DNS 恢复后只要 LRU 没被淘汰（cache_size 默认大），
   所有后续查询命中负缓存，永远拿到 IP 字面量而不是真实 hostname。
 - **修法**：负缓存条目加 60s TTL；或正负缓存分桶，负缓存桶尺寸严格小于正缓存桶。
+- **修复实施**：缓存值从裸 `String` 改成 `DnsCacheEntry::Positive/Negative`。
+  正缓存继续按 LRU 保留;负缓存记录 `inserted_at`,命中决策抽到 `cached_name`,超过
+  `DNS_NEGATIVE_CACHE_TTL=60s` 后删除并重新查 DNS。单测覆盖正缓存不过期、负缓存
+  60s 内命中、60s 后过期。
 
 ### [ ] 7. watch 与周期 refresh 并发跑，旧快照覆盖新快照
 
@@ -113,7 +120,7 @@
   fallback 到 external"这条爆发面堵掉之后，本条的后果从"频繁 series 泄漏"
   降级成"最长 30s 的旧数据窗口"，严重性降一档但 race 本身仍在。
 
-### [ ] 8. IPv6 流量整链路被丢弃
+### [-] 8. IPv6 流量整链路被丢弃
 
 - **位置**：[caretta/src/resolver/k8s.rs:549](caretta/src/resolver/k8s.rs#L549)
 - **症状**：`IpResolver` 整条链路 key 都是 `u32`，`parse_ipv4_to_u32` 对 v6 IP
@@ -126,7 +133,7 @@
 
 ## 🟢 P3 — 部署 / 配置面
 
-### [ ] 9. 环境变量解析失败静默 fall back
+### [x] 9. 环境变量解析失败静默 fall back
 
 - **位置**：[caretta/src/config.rs:54](caretta/src/config.rs#L54)
 - **症状**：`DEBUG_RESOLVER_ENABLED=ture`（拼错 true）这种情况下 `parse::<bool>`
@@ -134,8 +141,11 @@
   运维以为开关生效，实际没生效；安全相关开关（debug 端点）尤其危险。
 - **修法**：解析失败 `anyhow!()` 退出（fail loud），或至少 `warn!` 一条
   "env var X='v' could not be parsed, falling back to default"。
+- **修复实施**：按当前决策采用 warn 方案。所有数值/布尔环境变量解析失败时调用
+  `warn_invalid_env`,日志包含变量名、原始值、期望类型,随后继续使用默认值。守卫见
+  [caretta/tests/config_invariants.rs](caretta/tests/config_invariants.rs)。
 
-### [ ] 10. /metrics + /debug/resolver bind 0.0.0.0、无鉴权
+### [-] 10. /metrics + /debug/resolver bind 0.0.0.0、无鉴权
 
 - **位置**：[caretta/src/http_server.rs:22](caretta/src/http_server.rs#L22)、
   [caretta/src/main.rs:159](caretta/src/main.rs#L159)
@@ -147,38 +157,3 @@
 - **修法（短期）**：默认 bind `127.0.0.1`，显式配置才允许 `0.0.0.0`；debug 端点
   强制要求 token query string。
 - **修法（长期）**：把 `/debug` 拆到独立 unix socket 或加 mTLS。
-
----
-
-## 上一轮 review 已记录、尚未修的 ebpf 日志相关问题
-
-（来自上一次 commit `6eb9354` 的 review，单列在这里以免遗忘）
-
-### [ ] 11. CONNECTIONS map 满时 hot path 上 `info!/warn!` 日志风暴
-
-- **位置**：[caretta-ebpf/src/main.rs:255](caretta-ebpf/src/main.rs#L255)、
-  [caretta-ebpf/src/main.rs:262](caretta-ebpf/src/main.rs#L262)
-- **修法**：改成只 `inc` 一个 stat counter map，用户态 1Hz 拉一次再决定打不打日志。
-
-### [ ] 12. CONNECTIONS 写成功 + SOCK_TO_CONNECTION 写失败 → 孤儿条目泄漏
-
-- **位置**：[caretta-ebpf/src/main.rs:258](caretta-ebpf/src/main.rs#L258)
-- **症状**：close 路径走 cookie 反查表查不到 key，`is_active` 永远停在 1，
-  用户态永远不会推进 `to_delete`。两个 map 一起雪崩。
-- **修法**：`SOCK_TO_CONNECTION.insert` 失败时把刚刚写入的 `CONNECTIONS` 条目 remove 掉。
-
-### [ ] 13. EbpfLogger::init 排到 attach 之后，启动期日志窗口丢失
-
-- **位置**：[caretta/src/main.rs:138](caretta/src/main.rs#L138)
-- **修法**：调整顺序为 `Ebpf::load → 所有 program.load → EbpfLogger::init → program.attach`。
-
-### [ ] 14. SOCK_OFFSETS 缺失分支是死代码（用户态写入在 attach 之前）
-
-- **位置**：[caretta-ebpf/src/main.rs:222](caretta-ebpf/src/main.rs#L222)
-- **修法**：删掉 warn 留 silent skip；或让用户态显式校验 SOCK_OFFSETS 已写入再 attach。
-
-### [ ] 15. map insert 失败 vs SOCK_OFFSETS 缺失，日志级别分级反了
-
-- **位置**：[caretta-ebpf/src/main.rs:255](caretta-ebpf/src/main.rs#L255)、
-  [caretta-ebpf/src/main.rs:222](caretta-ebpf/src/main.rs#L222)
-- **修法**：map 撑爆 → `warn!`；BTF 解析未完成 → `info!`（或都 `warn!`，自洽即可）。
