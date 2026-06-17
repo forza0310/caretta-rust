@@ -150,6 +150,10 @@ scrape_configs:
 	- 可选值: 正整数
 	- 默认: 10000
 	- 作用: LRU 缓存容量(缓存 external IP 到反向解析主机名)
+- MAX_LINKS
+	- 可选值: 正整数
+	- 默认: 100000
+	- 作用: 用户态 link 状态表硬上限,超限时按 last_active 淘汰最老 link
 - TRAVERSE_UP_HIERARCHY
 	- 可选值: true 或 false
 	- 默认: true

@@ -10,6 +10,7 @@ const DEFAULT_DEBUG_RESOLVER_ENDPOINT: &str = "/debug/resolver";
 const DEFAULT_DEBUG_RESOLVER_ENABLED: bool = false;
 const DEFAULT_RESOLVE_DNS: bool = true;
 const DEFAULT_DNS_CACHE_SIZE: usize = 10000;
+const DEFAULT_MAX_LINKS: usize = 100000;
 const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
 const DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST: &str = "";
 const DEFAULT_OWNER_KIND_PRIORITY: &str = "";
@@ -30,6 +31,8 @@ pub struct Opt {
     pub resolve_dns: bool,
     #[clap(long, default_value_t = DEFAULT_DNS_CACHE_SIZE)]
     pub dns_cache_size: usize,
+    #[clap(long, default_value_t = DEFAULT_MAX_LINKS)]
+    pub max_links: usize,
     #[clap(long, default_value_t = DEFAULT_TRAVERSE_UP_HIERARCHY)]
     pub traverse_up_hierarchy: bool,
     #[clap(long, default_value = DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST)]
@@ -84,6 +87,11 @@ impl Opt {
         if let Ok(v) = std::env::var("DNS_CACHE_SIZE") {
             if let Ok(size) = v.parse::<usize>() {
                 opt.dns_cache_size = size.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_LINKS") {
+            if let Ok(size) = v.parse::<usize>() {
+                opt.max_links = size.max(1);
             }
         }
         if let Ok(v) = std::env::var("TRAVERSE_UP_HIERARCHY") {

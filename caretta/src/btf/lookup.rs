@@ -34,8 +34,8 @@ pub fn read_struct_field_offsets(
     struct_name: &str,
     fields: &[(&str, u32)],
 ) -> anyhow::Result<HashMap<String, u32>> {
-    let data = fs::read(btf_path)
-        .with_context(|| format!("failed to read BTF blob: {btf_path}"))?;
+    let data =
+        fs::read(btf_path).with_context(|| format!("failed to read BTF blob: {btf_path}"))?;
     parse_struct_field_offsets(&data, struct_name, fields)
 }
 
@@ -105,9 +105,7 @@ pub fn parse_struct_field_offsets(
         let m = flat
             .iter()
             .find(|m| m.name == *field_name)
-            .ok_or_else(|| {
-                anyhow!("field {field_name} not found in struct {struct_name}")
-            })?;
+            .ok_or_else(|| anyhow!("field {field_name} not found in struct {struct_name}"))?;
 
         // BTF member offset 默认是 bit offset。常规字段都是 8 位对齐,转 byte offset
         // 后做 size 校验。bitfield 我们这里不期待出现(sock_common 几个字段都不是)。
@@ -120,9 +118,8 @@ pub fn parse_struct_field_offsets(
         }
         let byte_offset = m.bit_offset / 8;
 
-        let actual_size = resolve_int_size(&by_id, m.type_id, 8).with_context(|| {
-            format!("failed to resolve size of {struct_name}.{field_name}")
-        })?;
+        let actual_size = resolve_int_size(&by_id, m.type_id, 8)
+            .with_context(|| format!("failed to resolve size of {struct_name}.{field_name}"))?;
         if actual_size != *expected_size {
             bail!(
                 "{struct_name}.{field_name} has size {actual_size} bytes \
@@ -146,8 +143,8 @@ pub fn parse_struct_field_offsets(
 ///   - skc_dport / skc_num       是 __u16,2 字节
 /// size 不符就 bail,免得 eBPF 端读错字段导致数据乱掉还不好排查。
 pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
-    let path = std::env::var("VMLINUX_BTF_PATH")
-        .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
+    let path =
+        std::env::var("VMLINUX_BTF_PATH").unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
 
     let offs = read_struct_field_offsets(
         &path,
@@ -240,12 +237,8 @@ mod tests {
     #[test]
     fn should_resolve_field_offsets_for_known_struct() {
         let blob = build_minimal_btf();
-        let off = parse_struct_field_offsets(
-            &blob,
-            "demo",
-            &[("a", 4), ("b", 2)],
-        )
-        .expect("offsets should resolve");
+        let off = parse_struct_field_offsets(&blob, "demo", &[("a", 4), ("b", 2)])
+            .expect("offsets should resolve");
         assert_eq!(off["a"], 0);
         assert_eq!(off["b"], 4);
     }
@@ -342,8 +335,8 @@ mod tests {
         blob.extend(types);
         blob.extend(strings);
 
-        let off = parse_struct_field_offsets(&blob, "demo", &[("x", 4)])
-            .expect("demo.x should resolve");
+        let off =
+            parse_struct_field_offsets(&blob, "demo", &[("x", 4)]).expect("demo.x should resolve");
         assert_eq!(off["x"], 4, "must pick demo.x not decoy.x");
     }
 
@@ -461,12 +454,9 @@ mod tests {
         blob.extend(types);
         blob.extend(strings);
 
-        let off = parse_struct_field_offsets(
-            &blob,
-            "outer",
-            &[("skc_daddr", 4), ("skc_rcv_saddr", 4)],
-        )
-        .expect("anon-nested fields should flatten");
+        let off =
+            parse_struct_field_offsets(&blob, "outer", &[("skc_daddr", 4), ("skc_rcv_saddr", 4)])
+                .expect("anon-nested fields should flatten");
         assert_eq!(off["skc_daddr"], 0);
         assert_eq!(off["skc_rcv_saddr"], 4);
     }

@@ -102,10 +102,7 @@ impl DnsCache {
     }
 
     /// 包一层超时，使最坏单次时延有界。返回 None 表示超时或 DNS 失败。
-    async fn reverse_lookup_with_timeout(
-        resolver: &TokioAsyncResolver,
-        ip: u32,
-    ) -> Option<String> {
+    async fn reverse_lookup_with_timeout(resolver: &TokioAsyncResolver, ip: u32) -> Option<String> {
         let addr = IpAddr::V4(Ipv4Addr::from(ip));
         let lookup = resolver.reverse_lookup(addr);
         match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup).await {

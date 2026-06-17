@@ -451,9 +451,7 @@ impl K8sResolver {
             let workload = match spec.selector.as_ref() {
                 Some(selector) if !selector.is_empty() => pods_by_ns
                     .get(&namespace)
-                    .and_then(|pods| {
-                        pods.iter().find(|p| selector_matches(selector, &p.labels))
-                    })
+                    .and_then(|pods| pods.iter().find(|p| selector_matches(selector, &p.labels)))
                     .map(|p| p.workload.clone())
                     .unwrap_or_else(|| service_fallback_workload(&svc_name, &namespace)),
                 _ => service_fallback_workload(&svc_name, &namespace),

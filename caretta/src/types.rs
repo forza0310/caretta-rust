@@ -1,9 +1,9 @@
 //! Shared data model for eBPF map values, resolved workloads, and graph entities.
 
+pub use crate::per_cpu::{ConnectionThroughputStats, aggregate_per_cpu_throughput};
 use crate::resolver::IpResolver;
 use std::fmt;
 use std::net::Ipv4Addr;
-pub use crate::per_cpu::{ConnectionThroughputStats, aggregate_per_cpu_throughput};
 
 pub const ROLE_CLIENT: u32 = 1;
 pub const ROLE_SERVER: u32 = 2;

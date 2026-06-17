@@ -186,7 +186,7 @@ pub fn mark_map_deletion() {
 // Record one watcher event for the given object and event type labels.
 pub fn mark_k8s_event(object_type: &str, event_type: &str) {
     K8S_EVENTS_COUNT
-    .with_label_values(&[object_type, event_type])
+        .with_label_values(&[object_type, event_type])
         .inc();
 }
 
@@ -207,15 +207,15 @@ fn link_label_values(link: &NetworkLink) -> [String; 14] {
             + "\x1f"
             + &link.server.namespace),
     ) ^ link.role.wrapping_mul(0x9E3779B1))
-        .to_string();
+    .to_string();
     // 注：原实现是 fnv_hash(name+ns+name+ns) + role，没有分隔符也没把 role 充分混
     // 入。这次顺手收紧:拼接时用 \x1f 防止 ("ab","cd") 与
     // ("a","bcd") 撞同一串；role 用 wrapping_mul 一个 32-bit 黄金比例常数后再 xor，
     // 让不同 role 的 link_id 在所有 bit 上充分发散，而不是只差最低位。
-    let client_id = fnv_hash(&(link.client.name.clone() + "\x1f" + &link.client.namespace))
-        .to_string();
-    let server_id = fnv_hash(&(link.server.name.clone() + "\x1f" + &link.server.namespace))
-        .to_string();
+    let client_id =
+        fnv_hash(&(link.client.name.clone() + "\x1f" + &link.client.namespace)).to_string();
+    let server_id =
+        fnv_hash(&(link.server.name.clone() + "\x1f" + &link.server.namespace)).to_string();
     [
         link_id,
         client_id,
@@ -297,7 +297,7 @@ fn tcp_label_values(key: &TcpConnectionKey) -> [String; 12] {
             + "\x1f"
             + &key.server.namespace),
     ) ^ key.role.wrapping_mul(0x9E3779B1))
-        .to_string();
+    .to_string();
     let client_id =
         fnv_hash(&(key.client.name.clone() + "\x1f" + &key.client.namespace)).to_string();
     let server_id =

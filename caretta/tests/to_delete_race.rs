@@ -54,7 +54,10 @@ fn should_filter_out_freshly_reused_key_to_avoid_deleting_active_connection() {
     // T3: 复检必须把它剔出。
     let to_purge = still_dead_keys(to_delete, is_still_dead(&states));
 
-    assert!(to_purge.is_empty(), "复用的 key 不该被列入 to_purge: {to_purge:?}");
+    assert!(
+        to_purge.is_empty(),
+        "复用的 key 不该被列入 to_purge: {to_purge:?}"
+    );
 }
 
 /// 防回归:窗口里没复用,closed key 仍要被放行 —— 否则 GC 停摆,map 永久泄漏。
@@ -98,9 +101,18 @@ fn should_decide_per_entry_when_purge_handles_mixed_reuse_pattern() {
 
     let to_purge = still_dead_keys(to_delete, is_still_dead(&states));
 
-    assert!(to_purge.contains(&truly_dead), "未复用的 closed key 应放行: {to_purge:?}");
-    assert!(!to_purge.contains(&reused), "复用的 key 不该列入: {to_purge:?}");
-    assert!(!to_purge.contains(&always_active), "iter 阶段就活着的 key 与候选无关");
+    assert!(
+        to_purge.contains(&truly_dead),
+        "未复用的 closed key 应放行: {to_purge:?}"
+    );
+    assert!(
+        !to_purge.contains(&reused),
+        "复用的 key 不该列入: {to_purge:?}"
+    );
+    assert!(
+        !to_purge.contains(&always_active),
+        "iter 阶段就活着的 key 与候选无关"
+    );
 }
 
 /// Wiring 守卫:防 main.rs 把 `still_dead_keys` 调用点删了 / 改回直接遍历 `to_delete`。

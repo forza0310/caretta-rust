@@ -4,6 +4,7 @@
 //! cardinality 双向泄漏。修复后必须保住:
 //!   - 非零 GC 常量(零 TTL 等于"立刻过期"或"永不过期",都还原成 bug);
 //!   - poll loop 真的调 forget_link / forget_tcp + retain 兜底;
+//!   - links 表有可配置硬上限,超限按 last_active 淘汰最老 entry;
 //!   - forget_* 同时清 series 和差分基准 LAST_LINK_TOTALS(只清一边等于没清);
 //!   - produce 路径和 forget 路径用同一个 label 构造 helper(防漂移);
 //!   - last_active 只刷新本 tick 真见到的 link,不能刷 cumulative 合并视图里的死 link。
@@ -14,7 +15,10 @@ use std::fs;
 use std::path::PathBuf;
 
 fn read(rel: &str) -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(rel);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join(rel);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -53,6 +57,31 @@ fn should_invoke_forget_helpers_during_poll_loop_gc() {
     assert!(
         src.contains("links.retain(") && src.contains("tcp_states.retain("),
         "poll loop must run retain-based GC on both state tables"
+    );
+}
+
+#[test]
+fn should_cap_link_state_table_by_configured_max_links() {
+    let main_src = read("caretta/src/main.rs");
+    let config_src = read("caretta/src/config.rs");
+
+    assert!(
+        config_src.contains("DEFAULT_MAX_LINKS")
+            && config_src.contains("pub max_links: usize")
+            && config_src.contains("MAX_LINKS"),
+        "config should expose MAX_LINKS as a positive env/CLI setting"
+    );
+    assert!(
+        main_src.contains("fn enforce_max_links(")
+            && main_src.contains("sort_unstable_by_key")
+            && main_src.contains("state.last_active")
+            && main_src.contains("metrics::forget_link(&link)")
+            && main_src.contains("links.remove(&link)"),
+        "poll loop should evict oldest links and clear prometheus state when max_links is exceeded"
+    );
+    assert!(
+        main_src.contains("enforce_max_links(&mut links, opt.max_links)"),
+        "poll loop should apply max_links after normal TTL GC"
     );
 }
 

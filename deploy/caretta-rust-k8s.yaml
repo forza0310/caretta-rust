@@ -71,6 +71,8 @@ spec:
               value: "true"
             - name: DNS_CACHE_SIZE
               value: "10000"
+            - name: MAX_LINKS
+              value: "100000"
             - name: DEBUG_RESOLVER_ENABLED
               value: "false"
             - name: DEBUG_RESOLVER_ENDPOINT

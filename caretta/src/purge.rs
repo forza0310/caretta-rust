@@ -9,9 +9,9 @@
 /// `is_still_dead(k)` 返回 `true` 表示 k 仍然 closed、可以删;`false` 表示
 /// 已被复用 / 不在 map 里 / 任何应当跳过的状态。典型实现:再读一次
 /// `CONNECTION_STATES` 匹配 `Ok(0u64)`。
-pub fn still_dead_keys<K: Copy>(
-    candidates: Vec<K>,
-    is_still_dead: impl Fn(&K) -> bool,
-) -> Vec<K> {
-    candidates.into_iter().filter(|k| is_still_dead(k)).collect()
+pub fn still_dead_keys<K: Copy>(candidates: Vec<K>, is_still_dead: impl Fn(&K) -> bool) -> Vec<K> {
+    candidates
+        .into_iter()
+        .filter(|k| is_still_dead(k))
+        .collect()
 }

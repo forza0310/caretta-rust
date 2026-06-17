@@ -29,8 +29,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback,
-    reduce_connection_to_link, reduce_connection_to_tcp,
+    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
+    reduce_connection_to_tcp,
 };
 
 /// 一条 link 在最后一次观测到流量后多久没活动就 GC 掉对应的 prometheus series + 用户态记账。
@@ -70,6 +70,23 @@ struct TcpState {
     last_seen_conn: TcpConnection,
     /// 自上次出现以来连续没出现的 tick 数；超过 TCP_GC_MISSED_TICKS 就 forget。
     missed_ticks: u32,
+}
+
+fn enforce_max_links(links: &mut HashMap<NetworkLink, LinkState>, max_links: usize) {
+    if links.len() <= max_links {
+        return;
+    }
+
+    let mut by_age: Vec<(NetworkLink, Instant)> = links
+        .iter()
+        .map(|(link, state)| (link.clone(), state.last_active))
+        .collect();
+    by_age.sort_unstable_by_key(|(_, last_active)| *last_active);
+
+    for (link, _) in by_age.into_iter().take(links.len() - max_links) {
+        metrics::forget_link(&link);
+        links.remove(&link);
+    }
 }
 
 fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
@@ -189,7 +206,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if opt.debug_resolver_enabled {
-        info!("debug resolver endpoint enabled at {}", debug_resolver_endpoint);
+        info!(
+            "debug resolver endpoint enabled at {}",
+            debug_resolver_endpoint
+        );
     }
 
     let (metrics_startup_tx, metrics_startup_rx) = oneshot::channel();
@@ -422,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
                         true
                     }
                 });
+                enforce_max_links(&mut links, opt.max_links);
 
                 // ---- GC: tcp series ----
                 // 本 tick 没看到的连接 missed_ticks +1；超过阈值的 forget 并从表里抹去。

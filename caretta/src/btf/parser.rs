@@ -103,8 +103,7 @@ pub(super) fn read_type_at(types: &[u8], cursor: usize) -> anyhow::Result<(TypeI
     }
     let name_off = u32::from_le_bytes(types[cursor..cursor + 4].try_into().unwrap());
     let info = u32::from_le_bytes(types[cursor + 4..cursor + 8].try_into().unwrap());
-    let size_or_type =
-        u32::from_le_bytes(types[cursor + 8..cursor + 12].try_into().unwrap());
+    let size_or_type = u32::from_le_bytes(types[cursor + 8..cursor + 12].try_into().unwrap());
 
     let vlen = info & 0xffff;
     let kind = (info >> 24) & 0x1f;
@@ -113,15 +112,8 @@ pub(super) fn read_type_at(types: &[u8], cursor: usize) -> anyhow::Result<(TypeI
     let trailing = match kind {
         KIND_VOID => 0,
         KIND_INT => BTF_INT_SIZE,
-        KIND_PTR
-        | KIND_FWD
-        | KIND_TYPEDEF
-        | KIND_VOLATILE
-        | KIND_CONST
-        | KIND_RESTRICT
-        | KIND_FUNC
-        | KIND_FLOAT
-        | KIND_TYPE_TAG => 0,
+        KIND_PTR | KIND_FWD | KIND_TYPEDEF | KIND_VOLATILE | KIND_CONST | KIND_RESTRICT
+        | KIND_FUNC | KIND_FLOAT | KIND_TYPE_TAG => 0,
         KIND_ARRAY => BTF_ARRAY_SIZE,
         KIND_STRUCT | KIND_UNION => (vlen as usize) * BTF_MEMBER_SIZE,
         KIND_ENUM => (vlen as usize) * BTF_ENUM_RECORD_SIZE,
@@ -219,14 +211,8 @@ pub(super) fn flatten_named_members(
                 .get(&m.type_id)
                 .ok_or_else(|| anyhow!("BTF anonymous member references unknown type id"))?;
             if inner.kind == KIND_STRUCT || inner.kind == KIND_UNION {
-                let mut nested = flatten_named_members(
-                    types,
-                    strings,
-                    by_id,
-                    inner,
-                    abs_off,
-                    max_depth - 1,
-                )?;
+                let mut nested =
+                    flatten_named_members(types, strings, by_id, inner, abs_off, max_depth - 1)?;
                 out.append(&mut nested);
             }
             // 匿名但既不是 struct 也不是 union 的成员理论上不存在——直接跳过。
