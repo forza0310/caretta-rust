@@ -28,7 +28,7 @@
   内核 `tcp_sock->bytes_sent/bytes_received` 累计计数器,不在 BPF 端做 RMW,
   天然规避了字段级原子问题。
 
-### [ ] 2. to_delete 延迟删除 + 同 key 复用 → 新连接被一并删掉
+### [x] 2. to_delete 延迟删除 + 同 key 复用 → 新连接被一并删掉
 
 - **位置**：[caretta/src/main.rs:327](caretta/src/main.rs#L327)
 - **症状**：`to_delete` 在 `iter()` 阶段先收集后批量 remove，中间窗口里 ebpf 端
@@ -38,12 +38,17 @@
   把刚建立的新 entry 一起删了，prometheus 看到 Counter 倒退。
 - **修法**：用 `lookup_and_delete` 原子删除；或 remove 前再 get 一次校验
   `is_active` 仍为 0。
+- **修复实施**：决策抽到 [caretta/src/purge.rs](caretta/src/purge.rs) 的
+  `still_dead_keys`,main.rs 在批量 remove 前用 `connection_states.get(conn,0)`
+  匹配 `Ok(0u64)` 复检,被复用回 `is_active=1` 的 entry 自动剔出 `to_purge`。
+  [caretta/tests/to_delete_race.rs](caretta/tests/to_delete_race.rs) 在 lib 暴露
+  的 `purge` 模块上钉死单 entry / 混合 entry / 无复用三种时序,防回归。
 
 ---
 
 ## 🟠 P1 — 一上量就出问题
 
-### [ ] 3. 1Hz 主循环里串行 await resolver，DNS 抖动直接拖垮
+### [x] 3. 1Hz 主循环里串行 await resolver，DNS 抖动直接拖垮
 
 - **位置**：[caretta/src/main.rs:298](caretta/src/main.rs#L298)
 - **症状**：`CONNECTIONS` 上限 131072，对每条 entry 串行 `.await` 两次
@@ -52,6 +57,12 @@
 - **后果**：主循环背靠背跑、reactor 长时间不归还 → HTTP `/metrics` scrape 超时、
   K8s watch / DNS resolve 任务饿死。
 - **修法**：`MissedTickBehavior::Skip`；resolver 调用换成 `join_all` 批量并发。
+- **修复实施**：两条都做了。`ticker.set_missed_tick_behavior(MissedTickBehavior::Skip)`
+  把漂超的 tick 直接丢、回到下一个正常节拍——单轮跑超不再触发背靠背雪崩。主循环
+  拆成 Pass 1(同步 drain `connection_states`,顺手处理 to_delete / loopback /
+  items_counter,无 await)+ Pass 2(`futures_util::future::join_all` 把所有 entry
+  的 `reduce_connection_to_link` / `reduce_connection_to_tcp` 一起 fan-out),最坏
+  延迟从 N × DNS_timeout 收缩到单次 DNS_timeout。
 
 ### [ ] 4. links HashMap 无硬上限，burst 期间 RSS 线性膨胀
 

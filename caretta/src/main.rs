@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
+use tokio::time::MissedTickBehavior;
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
     TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback,
@@ -234,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tcp_states: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
 
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip); // 不在压力大时堆积过多 tick，反正每个 tick 都是全量扫描。
 
     loop {
         tokio::select! {
@@ -261,10 +263,12 @@ async fn main() -> anyhow::Result<()> {
                 let mut items_counter = 0u64;
 
                 let mut entries = connection_states.iter();
+                // Pass 1:同步收集所有 entry,顺手处理 to_delete / loopback / items_counter。
+                // resolver 调用全推到 Pass 2 走并发
                 // 主循环以 CONNECTION_STATES 为权威连接清单——它在 sock_set_state 路径上
-                // open 时写 1、close 时写 0,精确反映每条连接的活跃事实。CONNECTIONS 是
-                // PerCpuHashMap、字节累加路径懒初始化,一条新连接在传第一个字节之前在那张
-                // 表里根本不存在,如果用 CONNECTIONS 当主循环源会漏掉这部分。
+                // open 时写 1、close 时写 0
+                let mut pending: Vec<(ConnectionIdentifier, u64, ConnectionThroughputStats)> =
+                    Vec::new();
                 while let Some(entry) = entries.next() {
                     let (conn, is_active) = match entry {
                         Ok(v) => v,
@@ -275,9 +279,8 @@ async fn main() -> anyhow::Result<()> {
                     };
                     items_counter += 1;
 
-                    // PerCpuHashMap.get 返回所有 CPU 副本的 vec,把每个 CPU 上累加的
-                    // bytes_sent / bytes_received 各自求和才是这条连接的真实累计。
-                    // KeyNotFound 是合法的——open 之后还没传过字节就走这条路径,按零计。
+                    // 把每个 CPU 上累加的 bytes_sent / bytes_received 各自求和才是这条连接的真实累计。
+                    // KeyNotFound 是合法的——open 之后还没传过字节,按零计。
                     let throughput = match connections.get(&conn, 0) {
                         Ok(per_cpu) => aggregate_per_cpu_throughput(per_cpu.iter().copied()),
                         Err(_) => ConnectionThroughputStats {
@@ -295,16 +298,24 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let link = match reduce_connection_to_link(resolver.as_ref(), conn).await {
-                        Ok(link) => link,
-                        Err(_) => continue,
-                    };
+                    pending.push((conn, is_active, throughput));
+                }
 
-                    let tcp = match reduce_connection_to_tcp(resolver.as_ref(), conn, throughput, is_active).await {
-                        Ok(tcp) => tcp,
-                        Err(_) => continue,
-                    };
+                // Pass 2:resolver 调用并发 fan-out。
+                let resolver_ref = resolver.as_ref();
+                let resolved = futures_util::future::join_all(pending.into_iter().map(
+                    |(conn, is_active, throughput)| async move {
+                        let link = reduce_connection_to_link(resolver_ref, conn).await.ok()?;
+                        let tcp =
+                            reduce_connection_to_tcp(resolver_ref, conn, throughput, is_active)
+                                .await
+                                .ok()?;
+                        Some((link, tcp, throughput))
+                    },
+                ))
+                .await;
 
+                for (link, tcp, throughput) in resolved.into_iter().flatten() {
                     let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     *current_links.entry(link.clone()).or_insert(0) += bytes;
                     link_seen_this_tick.insert(link);
@@ -332,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
 
                 for conn in to_purge {
                     // PerCpuHashMap.get 返回 N 个 CPU 副本,这里把它们 fold 成一份累计快照,
-                    // 用于把 dying link 的最后一段字节合并进 links 表。
+                    // 用于把 dying link 的最后一段字节合并进 links。
                     // 若 connections 里压根没这条 entry(open 之后 close 之前一字节没传),
                     // 走零吞吐分支,但 connection_states 里仍然必须删掉这条 entry,
                     // 否则下个 tick 又会被列回 to_delete,死循环占位。
