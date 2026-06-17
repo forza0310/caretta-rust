@@ -1,89 +1,23 @@
-//! 最小 BTF 二进制 parser。
+//! BTF 高层查询:在解析后的 type 段里按 struct 名 + 字段名定位 byte offset。
 //!
-//! 这是 caretta 用户态读取 vmlinux BTF 拿 `struct sock_common` 字段偏移的专用工具。
+//! 调用方:
+//!   - `parse_sock_offsets`(本文件):caretta 启动时把 sock_common 几个字段的偏移
+//!     推到 eBPF 端的 SOCK_OFFSETS map。
+//!   - 测试 fixture(本文件 #[cfg(test)] 模块):用合成 BTF blob 验证查询语义。
 //!
-//! ## 为什么不用 aya 自带的 Btf?
-//!
-//! aya 的 `aya::Btf` 把核心 API(`type_by_id`、`members()`、`string_at()` 等)全部留作
-//! `pub(crate)`,外部 crate 拿不到 struct member 偏移。我们也不想把整个 aya-obj 内部
-//! 通路暴露出来当依赖,所以这里只手写解 sock_common 一个 path,有限可控。
-//!
-//! ## 范围(只覆盖必要场景):
-//!   - 读取 `/sys/kernel/btf/vmlinux`(linux 5.5+ + `CONFIG_DEBUG_INFO_BTF=y`,主流发行版默认开)
-//!   - 解析 BTF 二进制,定位 `BTF_KIND_STRUCT` 类型记录
-//!   - 列举 struct 的 members,对调用方关心的字段做 size 校验、返回 byte offset
-//!
-//! 不做 CO-RE 重定位、不处理 split BTF、不解析 line info——只够 caretta 用。
-//!
-//! ## BTF 二进制布局参考
-//!
-//! ```text
-//! [btf_header (24 bytes)]
-//! [type section]          // 一连串 btf_type record,每条头部 12 bytes
-//! [string section]        // 字段名都是这里的偏移
-//!
-//! struct btf_header {
-//!     __u16 magic;       // 0xeB9F (LE)
-//!     __u8  version;     // 通常 1
-//!     __u8  flags;
-//!     __u32 hdr_len;     // 24
-//!     __u32 type_off;    // type 段相对 hdr_len 的偏移
-//!     __u32 type_len;    // type 段长度
-//!     __u32 str_off;     // string 段相对 hdr_len 的偏移
-//!     __u32 str_len;     // string 段长度
-//! };
-//!
-//! struct btf_type {
-//!     __u32 name_off;
-//!     __u32 info;          // bits 0-15: vlen, bits 24-28: kind
-//!     union { __u32 size; __u32 type; };
-//! };
-//!
-//! struct btf_member {      // STRUCT/UNION 后面 vlen 个
-//!     __u32 name_off;
-//!     __u32 type;
-//!     __u32 offset;        // 默认是 bit offset
-//! };
-//! ```
+//! 与 `parser.rs` 的边界:本文件不直接 byte-decode,只调 parser 暴露的
+//! `parse_header` / `read_type_at` / `flatten_named_members` / `resolve_int_size` /
+//! `read_string` 等原语。
 
 use anyhow::{Context as _, anyhow, bail};
 use std::collections::HashMap;
 use std::fs;
 
-const BTF_MAGIC_LE: u16 = 0xeB9F;
-const BTF_HEADER_SIZE: usize = 24;
-const BTF_TYPE_HEADER_SIZE: usize = 12;
-const BTF_MEMBER_SIZE: usize = 12;
-const BTF_ENUM_RECORD_SIZE: usize = 8;
-const BTF_ENUM64_RECORD_SIZE: usize = 12;
-const BTF_PARAM_SIZE: usize = 8;
-const BTF_VAR_SIZE: usize = 4;
-const BTF_VAR_SECINFO_SIZE: usize = 12;
-const BTF_DECL_TAG_SIZE: usize = 4;
-const BTF_INT_SIZE: usize = 4;
-const BTF_ARRAY_SIZE: usize = 12;
-
-// BTF_KIND_* 编码,直接对照 include/uapi/linux/btf.h。
-const KIND_VOID: u32 = 0;
-const KIND_INT: u32 = 1;
-const KIND_PTR: u32 = 2;
-const KIND_ARRAY: u32 = 3;
-const KIND_STRUCT: u32 = 4;
-const KIND_UNION: u32 = 5;
-const KIND_ENUM: u32 = 6;
-const KIND_FWD: u32 = 7;
-const KIND_TYPEDEF: u32 = 8;
-const KIND_VOLATILE: u32 = 9;
-const KIND_CONST: u32 = 10;
-const KIND_RESTRICT: u32 = 11;
-const KIND_FUNC: u32 = 12;
-const KIND_FUNC_PROTO: u32 = 13;
-const KIND_VAR: u32 = 14;
-const KIND_DATASEC: u32 = 15;
-const KIND_FLOAT: u32 = 16;
-const KIND_DECL_TAG: u32 = 17;
-const KIND_TYPE_TAG: u32 = 18;
-const KIND_ENUM64: u32 = 19;
+use super::parser::{
+    KIND_STRUCT, TypeInfo, flatten_named_members, parse_header, read_string, read_type_at,
+    resolve_int_size,
+};
+use crate::types::SockOffsets;
 
 /// 默认 vmlinux BTF 路径——所有支持 BTF 的内核(5.5+)都会在这里挂出 BTF blob。
 pub const DEFAULT_VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
@@ -202,246 +136,44 @@ pub fn parse_struct_field_offsets(
     Ok(result)
 }
 
-#[derive(Debug)]
-struct BtfHeader {
-    hdr_len: u32,
-    type_off: u32,
-    type_len: u32,
-    str_off: u32,
-    str_len: u32,
-}
-
-fn parse_header(data: &[u8]) -> anyhow::Result<BtfHeader> {
-    if data.len() < BTF_HEADER_SIZE {
-        bail!("BTF blob too small for header");
-    }
-    let magic = u16::from_le_bytes([data[0], data[1]]);
-    if magic != BTF_MAGIC_LE {
-        bail!(
-            "unexpected BTF magic 0x{magic:04x}; expected 0x{BTF_MAGIC_LE:04x} \
-             (only little-endian BTF supported)"
-        );
-    }
-    // version + flags 各 1 byte,我们不解读。
-    let hdr_len = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    if hdr_len < BTF_HEADER_SIZE as u32 {
-        bail!("BTF hdr_len {hdr_len} smaller than minimum {BTF_HEADER_SIZE}");
-    }
-    let type_off = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    let type_len = u32::from_le_bytes(data[12..16].try_into().unwrap());
-    let str_off = u32::from_le_bytes(data[16..20].try_into().unwrap());
-    let str_len = u32::from_le_bytes(data[20..24].try_into().unwrap());
-    Ok(BtfHeader {
-        hdr_len,
-        type_off,
-        type_len,
-        str_off,
-        str_len,
-    })
-}
-
-#[derive(Clone, Debug)]
-struct TypeInfo {
-    /// type record 头之后 trailing 数据在 type 段里的起始 byte offset(用于解 STRUCT 的
-    /// members)。
-    body_offset: usize,
-    name_off: u32,
-    kind: u32,
-    vlen: u32,
-    /// 对 INT/ENUM/STRUCT/UNION/DATASEC: size,以 byte 计。
-    /// 对 PTR/TYPEDEF/CONST/VOLATILE/RESTRICT/FUNC/FUNC_PROTO: type id。
-    size_or_type: u32,
-}
-
-/// 读 cursor 处的 btf_type record 头与 trailing,返回 TypeInfo 与该 record 的总长度。
-fn read_type_at(types: &[u8], cursor: usize) -> anyhow::Result<(TypeInfo, usize)> {
-    if cursor + BTF_TYPE_HEADER_SIZE > types.len() {
-        bail!("BTF type record header exceeds section");
-    }
-    let name_off = u32::from_le_bytes(types[cursor..cursor + 4].try_into().unwrap());
-    let info = u32::from_le_bytes(types[cursor + 4..cursor + 8].try_into().unwrap());
-    let size_or_type =
-        u32::from_le_bytes(types[cursor + 8..cursor + 12].try_into().unwrap());
-
-    let vlen = info & 0xffff;
-    let kind = (info >> 24) & 0x1f;
-
-    let body_offset = cursor + BTF_TYPE_HEADER_SIZE;
-    let trailing = match kind {
-        KIND_VOID => 0,
-        KIND_INT => BTF_INT_SIZE,
-        KIND_PTR
-        | KIND_FWD
-        | KIND_TYPEDEF
-        | KIND_VOLATILE
-        | KIND_CONST
-        | KIND_RESTRICT
-        | KIND_FUNC
-        | KIND_FLOAT
-        | KIND_TYPE_TAG => 0,
-        KIND_ARRAY => BTF_ARRAY_SIZE,
-        KIND_STRUCT | KIND_UNION => (vlen as usize) * BTF_MEMBER_SIZE,
-        KIND_ENUM => (vlen as usize) * BTF_ENUM_RECORD_SIZE,
-        KIND_ENUM64 => (vlen as usize) * BTF_ENUM64_RECORD_SIZE,
-        KIND_FUNC_PROTO => (vlen as usize) * BTF_PARAM_SIZE,
-        KIND_VAR => BTF_VAR_SIZE,
-        KIND_DATASEC => (vlen as usize) * BTF_VAR_SECINFO_SIZE,
-        KIND_DECL_TAG => BTF_DECL_TAG_SIZE,
-        // 未知 kind:可能是 BTF 规范向前扩展。我们不知道 trailing 多长,无法续读后续
-        // type record——只能 bail。这种情况通常意味着 caretta 编译时跟跑时内核 BTF 规
-        // 范分叉,值得运维一眼看到。
-        other => bail!("unsupported BTF kind {other}"),
-    };
-
-    if body_offset + trailing > types.len() {
-        bail!("BTF type record body exceeds section");
-    }
-
-    Ok((
-        TypeInfo {
-            body_offset,
-            name_off,
-            kind,
-            vlen,
-            size_or_type,
-        },
-        BTF_TYPE_HEADER_SIZE + trailing,
-    ))
-}
-
-#[derive(Debug)]
-struct Member {
-    name_off: u32,
-    type_id: u32,
-    bit_offset: u32,
-}
-
-fn parse_members(types: &[u8], info: &TypeInfo) -> anyhow::Result<Vec<Member>> {
-    let mut out = Vec::with_capacity(info.vlen as usize);
-    for i in 0..info.vlen as usize {
-        let off = info.body_offset + i * BTF_MEMBER_SIZE;
-        if off + BTF_MEMBER_SIZE > types.len() {
-            bail!("BTF member record exceeds type section");
-        }
-        let name_off = u32::from_le_bytes(types[off..off + 4].try_into().unwrap());
-        let type_id = u32::from_le_bytes(types[off + 4..off + 8].try_into().unwrap());
-        // KFLAG=1 时 offset 高 8 位是 bitfield size,但 sock_common 我们关心的字段都不是
-        // bitfield;为了防御万一,这里也只取低 24 位作为 bit offset。
-        let raw_offset = u32::from_le_bytes(types[off + 8..off + 12].try_into().unwrap());
-        let bit_offset = raw_offset & 0x00ff_ffff;
-        out.push(Member {
-            name_off,
-            type_id,
-            bit_offset,
-        });
-    }
-    Ok(out)
-}
-
-/// 平展开后的 named field——name 是已解出的字符串,bit_offset 已经累加到外层 struct
-/// 的坐标系。匿名 union/struct 自身不出现在结果里,只贡献它们带名的子字段。
-#[derive(Debug)]
-struct FlatMember {
-    name: String,
-    type_id: u32,
-    bit_offset: u32,
-}
-
-/// 沿 anonymous struct/union 递归把所有 named 字段拍平。anonymous 成员的 bit_offset
-/// 会作为 base 累加给它的子字段——这是 C 标准里 anonymous member 字段对外可见的
-/// 那个语义。
+/// 解析 vmlinux BTF 拿 caretta eBPF 程序需要读的 sock_common 字段偏移。
 ///
-/// `max_depth` 防御 BTF 异常;sock_common 实际嵌套深度不超过 3。
-fn flatten_named_members(
-    types: &[u8],
-    strings: &[u8],
-    by_id: &HashMap<u32, TypeInfo>,
-    info: &TypeInfo,
-    base_bit_offset: u32,
-    max_depth: u32,
-) -> anyhow::Result<Vec<FlatMember>> {
-    if max_depth == 0 {
-        bail!("BTF anonymous member nesting too deep");
-    }
-    let mut out = Vec::new();
-    let raw = parse_members(types, info)?;
-    for m in raw {
-        let abs_off = base_bit_offset
-            .checked_add(m.bit_offset)
-            .ok_or_else(|| anyhow!("BTF member offset overflow"))?;
-        let name = read_string(strings, m.name_off)?;
-        if name.is_empty() {
-            // 匿名 member——递归进它指向的 STRUCT/UNION,base 累加。
-            let inner = by_id
-                .get(&m.type_id)
-                .ok_or_else(|| anyhow!("BTF anonymous member references unknown type id"))?;
-            if inner.kind == KIND_STRUCT || inner.kind == KIND_UNION {
-                let mut nested = flatten_named_members(
-                    types,
-                    strings,
-                    by_id,
-                    inner,
-                    abs_off,
-                    max_depth - 1,
-                )?;
-                out.append(&mut nested);
-            }
-            // 匿名但既不是 struct 也不是 union 的成员理论上不存在——直接跳过。
-        } else {
-            out.push(FlatMember {
-                name: name.to_string(),
-                type_id: m.type_id,
-                bit_offset: abs_off,
-            });
-        }
-    }
-    Ok(out)
-}
+///
+/// 用 `VMLINUX_BTF_PATH` 环境变量覆盖默认 `/sys/kernel/btf/vmlinux` 路径
+///
+/// 字段 size 校验:
+///   - skc_daddr / skc_rcv_saddr 是 __be32,4 字节
+///   - skc_dport / skc_num       是 __u16,2 字节
+/// size 不符就 bail,免得 eBPF 端读错字段导致数据乱掉还不好排查。
+pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
+    let path = std::env::var("VMLINUX_BTF_PATH")
+        .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
 
-/// follow typedef / const / volatile / restrict 链路直到落到 INT / FLOAT,返回那一层
-/// 的 size。`max_depth` 防御循环 typedef(BTF 实际上保证无环,但 defensive 一些)。
-fn resolve_int_size(
-    by_id: &HashMap<u32, TypeInfo>,
-    mut type_id: u32,
-    max_depth: u32,
-) -> anyhow::Result<u32> {
-    for _ in 0..max_depth {
-        let ty = by_id
-            .get(&type_id)
-            .ok_or_else(|| anyhow!("dangling BTF type id {type_id}"))?;
-        match ty.kind {
-            KIND_INT | KIND_FLOAT | KIND_ENUM | KIND_ENUM64 | KIND_STRUCT | KIND_UNION => {
-                return Ok(ty.size_or_type);
-            }
-            KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT | KIND_TYPE_TAG => {
-                type_id = ty.size_or_type;
-            }
-            // 指针字段在 sock_common 里不是我们关心的字段,但若被传进来给个明确 size:
-            // x86_64 / aarch64 都是 8。这里写死 8 满足 caretta 的目标平台,32-bit 平台
-            // 永远不会跑到这条 caretta 路径。
-            KIND_PTR => return Ok(8),
-            other => bail!("cannot resolve size for BTF kind {other}"),
-        }
-    }
-    bail!("BTF typedef chain too deep at type id {type_id}")
-}
+    let offs = read_struct_field_offsets(
+        &path,
+        "sock_common",
+        &[
+            ("skc_daddr", 4),
+            ("skc_rcv_saddr", 4),
+            ("skc_dport", 2),
+            ("skc_num", 2),
+        ],
+    )?;
 
-/// 读 string 段里 NUL 终止的字符串。BTF 字符串都是 ASCII,直接当 utf-8 解。
-fn read_string(strings: &[u8], offset: u32) -> anyhow::Result<&str> {
-    let off = offset as usize;
-    if off >= strings.len() {
-        bail!("BTF string offset {off} out of range");
-    }
-    let end = strings[off..]
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or_else(|| anyhow!("BTF string at offset {off} not nul-terminated"))?;
-    std::str::from_utf8(&strings[off..off + end])
-        .map_err(|e| anyhow!("BTF string at offset {off} not utf-8: {e}"))
+    // unwrap 安全:read_struct_field_offsets 在缺字段时已经 bail,走到这里所有 key 必在。
+    Ok(SockOffsets {
+        skc_daddr_off: offs["skc_daddr"],
+        skc_rcv_saddr_off: offs["skc_rcv_saddr"],
+        skc_dport_off: offs["skc_dport"],
+        skc_num_off: offs["skc_num"],
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::parser::{
+        BTF_HEADER_SIZE, BTF_MAGIC_LE, KIND_INT, KIND_STRUCT, KIND_TYPEDEF, KIND_UNION,
+    };
     use super::*;
 
     /// 合成一份最小 BTF blob,内含两个 INT(`__u32`/`__u16`)+ 一个 STRUCT 把它们当

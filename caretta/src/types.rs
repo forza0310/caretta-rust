@@ -1,6 +1,5 @@
 //! Shared data model for eBPF map values, resolved workloads, and graph entities.
 
-use crate::btf::{DEFAULT_VMLINUX_BTF_PATH, read_struct_field_offsets};
 use crate::resolver::IpResolver;
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -214,39 +213,6 @@ pub fn fnv_hash(s: &str) -> u32 {
         hash = hash.wrapping_mul(0x01000193);
     }
     hash
-}
-
-/// 解析 vmlinux BTF 拿 caretta eBPF 程序需要读的 sock_common 字段偏移。
-///
-///
-/// 用 `VMLINUX_BTF_PATH` 环境变量覆盖默认 `/sys/kernel/btf/vmlinux` 路径
-///
-/// 字段 size 校验:
-///   - skc_daddr / skc_rcv_saddr 是 __be32,4 字节
-///   - skc_dport / skc_num       是 __u16,2 字节
-/// size 不符就 bail,免得 eBPF 端读错字段导致数据乱掉还不好排查。
-pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
-    let path = std::env::var("VMLINUX_BTF_PATH")
-        .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
-
-    let offs = read_struct_field_offsets(
-        &path,
-        "sock_common",
-        &[
-            ("skc_daddr", 4),
-            ("skc_rcv_saddr", 4),
-            ("skc_dport", 2),
-            ("skc_num", 2),
-        ],
-    )?;
-
-    // unwrap 安全:read_struct_field_offsets 在缺字段时已经 bail,走到这里所有 key 必在。
-    Ok(SockOffsets {
-        skc_daddr_off: offs["skc_daddr"],
-        skc_rcv_saddr_off: offs["skc_rcv_saddr"],
-        skc_dport_off: offs["skc_dport"],
-        skc_num_off: offs["skc_num"],
-    })
 }
 
 #[cfg(test)]

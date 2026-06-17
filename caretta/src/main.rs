@@ -15,6 +15,7 @@ use anyhow::Context as _;
 use aya::Btf;
 use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
 use aya::programs::{BtfTracePoint, FEntry};
+use btf::parse_sock_offsets;
 use config::Opt;
 use log::{info, warn};
 use resolver::{IpResolver, K8sResolver, StaticResolver};
@@ -27,7 +28,7 @@ use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, parse_sock_offsets,
+    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback,
     reduce_connection_to_link, reduce_connection_to_tcp,
 };
 

@@ -249,8 +249,6 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
     };
 
     // sock_set_state 路径只写 CONNECTION_STATES + SOCK_TO_CONNECTION,绝不动 CONNECTIONS。
-    // 字节计数交给 sendmsg/recvmsg 路径在 PerCpuHashMap 上 lazy-init,这样 state 路径与
-    // 字节累加路径写的 map 完全不交叠——RMW 跨 CPU 撞车从根上消掉。
     if let Err(e) = CONNECTION_STATES.insert(&key, &1u64, 0) {
         // 边界事件:131072 entries 撑爆,通常是 close 路径漏 cleanup 或者短连接风暴。
         // 用户态 GC 兜底,但出现这条说明 cleanup 跟不上、视图会丢新 link。
@@ -260,8 +258,7 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
     if let Err(e) = SOCK_TO_CONNECTION.insert(&cookie, &key, 0) {
         // 同上,反查表撑爆——后续 sendmsg/cleanup_rbuf/close 都没法落到这条 sock 上。
         // 这里同时把刚刚写入的 CONNECTION_STATES 条目回滚,避免留下永远没人 close 的
-        // 孤儿状态(否则 mark_connection_closed 因 cookie→key 反查不到,is_active 永远停
-        // 在 1,用户态再也不会推这条进 to_delete,两张 map 一起雪崩)。
+        // 孤儿状态。
         info!(ctx, "SOCK_TO_CONNECTION map insert failed: err={}", e);
         let _ = CONNECTION_STATES.remove(&key);
         return Err(e);

@@ -176,7 +176,9 @@ fn should_load_programs_via_fentry_and_btf_tracepoint_in_userspace() {
 #[test]
 fn should_resolve_sock_field_offsets_from_vmlinux_btf() {
     let main_src = read_repo_file("caretta/src/main.rs");
-    let types_src = read_repo_file("caretta/src/types.rs");
+    // parse_sock_offsets 已从 types.rs 挪到 btf 模块——它本质是"用 BTF 解 sock_common
+    // 字段偏移",和 types(纯数据模型)耦合度低。函数定义现在放在 btf/lookup.rs。
+    let btf_src = read_repo_file("caretta/src/btf/lookup.rs");
     let ebpf_src = read_repo_file("caretta-ebpf/src/main.rs");
 
     // sock_common 偏移走 BTF 解析,推到 eBPF 端的 SOCK_OFFSETS 这张 map。
@@ -185,8 +187,8 @@ fn should_resolve_sock_field_offsets_from_vmlinux_btf() {
         "main.rs must parse sock_common offsets and push them via SOCK_OFFSETS map"
     );
     assert!(
-        types_src.contains("pub fn parse_sock_offsets"),
-        "types.rs must expose parse_sock_offsets backed by the BTF parser"
+        btf_src.contains("pub fn parse_sock_offsets"),
+        "btf/lookup.rs must expose parse_sock_offsets backed by the BTF parser"
     );
     assert!(
         ebpf_src.contains("static SOCK_OFFSETS"),
@@ -202,7 +204,9 @@ fn should_resolve_sock_field_offsets_from_vmlinux_btf() {
 // Ensures resolver refresh signaling remains bounded under watch-event bursts.
 #[test]
 fn should_coalesce_refresh_signals_when_watch_events_burst() {
-    let src = read_repo_file("caretta/src/resolver.rs");
+    // resolver.rs 已拆成 resolver/ 目录,K8s 侧的 watch / mpsc 信号合流逻辑现在落在
+    // resolver/k8s.rs。
+    let src = read_repo_file("caretta/src/resolver/k8s.rs");
 
     assert!(
         src.contains("mpsc::channel::<()>(1)"),
@@ -378,7 +382,8 @@ fn should_refresh_link_last_active_only_for_freshly_observed_links() {
 // prometheus 上产生双 series, grafana 拓扑面板会闪。
 #[test]
 fn should_resolve_clusterip_to_pod_workload_when_service_has_selector() {
-    let src = read_repo_file("caretta/src/resolver.rs");
+    // selector 反查 + Service fallback 现在在 resolver/k8s.rs 里。
+    let src = read_repo_file("caretta/src/resolver/k8s.rs");
 
     // 必须有 selector 反查 helper。
     assert!(
