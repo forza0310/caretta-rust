@@ -1,6 +1,7 @@
 //! Runtime configuration parsing and defaults for the Caretta userspace binary.
 
 use clap::Parser;
+use log::warn;
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_PROMETHEUS_ENDPOINT: &str = "/metrics";
@@ -42,6 +43,12 @@ pub struct Opt {
 }
 
 impl Opt {
+    fn warn_invalid_env(name: &str, value: &str, expected: &str) {
+        warn!(
+            "env var {name}={value:?} could not be parsed as {expected}; falling back to default"
+        );
+    }
+
     fn parse_csv_values(raw: &str) -> Vec<String> {
         raw.split(',')
             .map(str::trim)
@@ -55,8 +62,9 @@ impl Opt {
         let mut opt = Self::parse();
 
         if let Ok(v) = std::env::var("PROMETHEUS_PORT") {
-            if let Ok(p) = v.parse::<u16>() {
-                opt.prometheus_port = p;
+            match v.parse::<u16>() {
+                Ok(p) => opt.prometheus_port = p,
+                Err(_) => Self::warn_invalid_env("PROMETHEUS_PORT", &v, "u16"),
             }
         }
         if let Ok(v) = std::env::var("PROMETHEUS_ENDPOINT") {
@@ -65,13 +73,15 @@ impl Opt {
             }
         }
         if let Ok(v) = std::env::var("POLL_INTERVAL") {
-            if let Ok(i) = v.parse::<u64>() {
-                opt.poll_interval = i.max(1);
+            match v.parse::<u64>() {
+                Ok(i) => opt.poll_interval = i.max(1),
+                Err(_) => Self::warn_invalid_env("POLL_INTERVAL", &v, "u64"),
             }
         }
         if let Ok(v) = std::env::var("DEBUG_RESOLVER_ENABLED") {
-            if let Ok(enabled) = v.parse::<bool>() {
-                opt.debug_resolver_enabled = enabled;
+            match v.parse::<bool>() {
+                Ok(enabled) => opt.debug_resolver_enabled = enabled,
+                Err(_) => Self::warn_invalid_env("DEBUG_RESOLVER_ENABLED", &v, "bool"),
             }
         }
         if let Ok(v) = std::env::var("DEBUG_RESOLVER_ENDPOINT") {
@@ -80,23 +90,27 @@ impl Opt {
             }
         }
         if let Ok(v) = std::env::var("RESOLVE_DNS") {
-            if let Ok(enabled) = v.parse::<bool>() {
-                opt.resolve_dns = enabled;
+            match v.parse::<bool>() {
+                Ok(enabled) => opt.resolve_dns = enabled,
+                Err(_) => Self::warn_invalid_env("RESOLVE_DNS", &v, "bool"),
             }
         }
         if let Ok(v) = std::env::var("DNS_CACHE_SIZE") {
-            if let Ok(size) = v.parse::<usize>() {
-                opt.dns_cache_size = size.max(1);
+            match v.parse::<usize>() {
+                Ok(size) => opt.dns_cache_size = size.max(1),
+                Err(_) => Self::warn_invalid_env("DNS_CACHE_SIZE", &v, "usize"),
             }
         }
         if let Ok(v) = std::env::var("MAX_LINKS") {
-            if let Ok(size) = v.parse::<usize>() {
-                opt.max_links = size.max(1);
+            match v.parse::<usize>() {
+                Ok(size) => opt.max_links = size.max(1),
+                Err(_) => Self::warn_invalid_env("MAX_LINKS", &v, "usize"),
             }
         }
         if let Ok(v) = std::env::var("TRAVERSE_UP_HIERARCHY") {
-            if let Ok(enabled) = v.parse::<bool>() {
-                opt.traverse_up_hierarchy = enabled;
+            match v.parse::<bool>() {
+                Ok(enabled) => opt.traverse_up_hierarchy = enabled,
+                Err(_) => Self::warn_invalid_env("TRAVERSE_UP_HIERARCHY", &v, "bool"),
             }
         }
         if let Ok(v) = std::env::var("OWNER_RESOLVE_KIND_ALLOWLIST") {
