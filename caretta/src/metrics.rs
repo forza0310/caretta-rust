@@ -209,7 +209,7 @@ fn link_label_values(link: &NetworkLink) -> [String; 14] {
     ) ^ link.role.wrapping_mul(0x9E3779B1))
         .to_string();
     // 注：原实现是 fnv_hash(name+ns+name+ns) + role，没有分隔符也没把 role 充分混
-    // 入。这次顺手收紧（review 问题 9）：拼接时用 \x1f 防止 ("ab","cd") 与
+    // 入。这次顺手收紧:拼接时用 \x1f 防止 ("ab","cd") 与
     // ("a","bcd") 撞同一串；role 用 wrapping_mul 一个 32-bit 黄金比例常数后再 xor，
     // 让不同 role 的 link_id 在所有 bit 上充分发散，而不是只差最低位。
     let client_id = fnv_hash(&(link.client.name.clone() + "\x1f" + &link.client.namespace))
@@ -331,7 +331,7 @@ pub fn handle_tcp_metric(connection: &TcpConnection) {
 /// 清理一条 TCP series。GC 端调用，删除条件由 main.rs 维护：
 /// 连续 N 个 tick 在 eBPF map 里没看到这条连接 + 已经处于 CLOSED 状态。
 ///
-/// 否则 review 问题 4 描述的场景仍会泄漏：handle_tcp_metric 把 state 写成
+/// 否则 TCP series 仍会泄漏：handle_tcp_metric 把 state 写成
 /// CLOSED_STATE=3 是把 gauge 值改了，**series 本身依旧存活**，cardinality 一路涨。
 pub fn forget_tcp(key: &TcpConnectionKey) {
     let label_values = tcp_label_values(key);
@@ -341,7 +341,8 @@ pub fn forget_tcp(key: &TcpConnectionKey) {
 
 #[cfg(test)]
 mod tests {
-    //! 这一组测试聚焦 review 问题 3/4 修复的边界条件，不重复测 happy-path 数值正确性
+    //! 这一组测试聚焦"用户态状态表无界增长 → 进程内存 + Prometheus cardinality 泄漏"
+    //! 修复的边界条件，不重复测 happy-path 数值正确性
     //! ——那部分由 review_regressions.rs 的源码守卫 + 集成路径覆盖。
     //!
     //! 关键不变量（修复必须保住的）：
@@ -350,7 +351,7 @@ mod tests {
     //!       会把"复活后的绝对值"全量灌入 Counter，造成毛刺。
     //!   I3. forget 对从未注册过的 series 必须无副作用（GC 在边界条件下可能重复调）。
     //!   I4. link_id 的 FNV 拼接要使用分隔符，且 role 要被充分混入——否则
-    //!       ("ab","cd") vs ("a","bcd") 或不同 role 会撞 link_id（review 问题 9/10）。
+    //!       ("ab","cd") vs ("a","bcd") 或不同 role 会撞 link_id。
 
     use super::*;
     use crate::types::{ROLE_CLIENT, ROLE_SERVER, Workload};
@@ -412,7 +413,7 @@ mod tests {
         forget_link(&link);
     }
 
-    // I4: 验证拼 link_id 时 ("ab","cd") 与 ("a","bcd") 不会撞——这是 review 问题 9。
+    // I4: 验证拼 link_id 时 ("ab","cd") 与 ("a","bcd") 不会撞——分隔符防撞守卫。
     #[test]
     fn link_label_should_disambiguate_concatenated_names() {
         let link_a = NetworkLink {
@@ -439,8 +440,8 @@ mod tests {
         );
     }
 
-    // I4 续: 同 4-tuple 不同 role 的 link_id 必须在 hash 高位也分开，而不是只差最低位
-    // —— review 问题 10。我们不能直接断言"差很多 bit"，但可以验证 ROLE_CLIENT/SERVER
+    // I4 续: 同 4-tuple 不同 role 的 link_id 必须在 hash 高位也分开，而不是只差最低位。
+    // 我们不能直接断言"差很多 bit"，但可以验证 ROLE_CLIENT/SERVER
     // 之间的 id 完全不同。
     #[test]
     fn link_id_should_diverge_across_roles() {

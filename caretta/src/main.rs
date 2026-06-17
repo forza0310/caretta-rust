@@ -324,7 +324,13 @@ async fn main() -> anyhow::Result<()> {
                         past_state.cumulative_bytes;
                 }
 
-                for conn in to_delete {
+                // remove 前对候选再查一次 CONNECTION_STATES,只放行仍 is_active==0 的。
+                // 防同 4-tuple+pid 在 iter 与 remove 窗口里被 eBPF 复用,错误移除新连接。
+                let to_purge = caretta::purge::still_dead_keys(to_delete, |conn| {
+                    matches!(connection_states.get(conn, 0), Ok(0u64))
+                });
+
+                for conn in to_purge {
                     // PerCpuHashMap.get 返回 N 个 CPU 副本,这里把它们 fold 成一份累计快照,
                     // 用于把 dying link 的最后一段字节合并进 links 表。
                     // 若 connections 里压根没这条 entry(open 之后 close 之前一字节没传),
