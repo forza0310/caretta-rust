@@ -31,6 +31,22 @@ fn should_coalesce_refresh_signals_when_watch_events_burst() {
     );
 }
 
+/// watch refresh 和 30s 周期 refresh 都是全量重建快照,必须串行化。
+/// 否则旧 list 更晚 store 会覆盖新 list 的 watch 刷新结果。
+#[test]
+fn should_serialize_k8s_snapshot_refreshes() {
+    let src = read_k8s();
+
+    assert!(
+        src.contains("refresh_lock: Mutex<()>") && src.contains("refresh_lock: Mutex::new(())"),
+        "K8sResolver should own a refresh mutex"
+    );
+    assert!(
+        src.contains("let _refresh_guard = self.refresh_lock.lock().await"),
+        "refresh_snapshot should hold the mutex before listing and storing snapshots"
+    );
+}
+
 /// ClusterIP 必须先按 spec.selector 反查同 ns 的 Pod,复用 Pod 已经过完 owner
 /// 上卷的 Workload。否则 CLIENT 视角打 kind=Service、SERVER 视角打 kind=Deployment,
 /// prometheus 上同一逻辑链路双 series,grafana 拓扑面板抖。

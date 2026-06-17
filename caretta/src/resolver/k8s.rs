@@ -18,7 +18,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use super::IpResolver;
 use super::dns::DnsCache;
@@ -81,6 +81,7 @@ pub struct K8sResolver {
     traverse_up_hierarchy: bool,
     owner_kind_allowlist: HashSet<String>,
     owner_kind_priority: HashMap<String, usize>,
+    refresh_lock: Mutex<()>,
     watch_events: AtomicU64,
 }
 
@@ -104,6 +105,7 @@ impl K8sResolver {
             traverse_up_hierarchy,
             owner_kind_allowlist,
             owner_kind_priority,
+            refresh_lock: Mutex::new(()),
             watch_events: AtomicU64::new(0),
         });
 
@@ -323,6 +325,10 @@ impl K8sResolver {
 
     /// Rebuild in-memory IP mapping from current Kubernetes snapshot.
     async fn refresh_snapshot(&self) -> anyhow::Result<()> {
+        // Watch 触发和 30s 兜底是两个后台 task。refresh 是全量重建,必须串行化；
+        // 否则更早开始但更晚完成的旧快照会覆盖较新的 watch 刷新结果。
+        let _refresh_guard = self.refresh_lock.lock().await;
+
         let mut next = HashMap::new();
         let mut owners_index: HashMap<OwnerKey, OwnerTarget> = HashMap::new();
 
