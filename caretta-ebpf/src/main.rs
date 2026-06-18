@@ -6,7 +6,7 @@ use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_pro
 use aya_ebpf::macros::{btf_tracepoint, fentry, map};
 use aya_ebpf::maps::{HashMap, PerCpuHashMap};
 use aya_ebpf::programs::{BtfTracePointContext, FEntryContext};
-use aya_log_ebpf::{info, warn};
+use aya_log_ebpf::warn;
 
 const CONNECTION_ROLE_UNKNOWN: u32 = 0;
 const CONNECTION_ROLE_CLIENT: u32 = 1;
@@ -252,14 +252,14 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
     if let Err(e) = CONNECTION_STATES.insert(&key, &1u64, 0) {
         // 边界事件:131072 entries 撑爆,通常是 close 路径漏 cleanup 或者短连接风暴。
         // 用户态 GC 兜底,但出现这条说明 cleanup 跟不上、视图会丢新 link。
-        info!(ctx, "CONNECTION_STATES map insert failed: err={}", e);
+        warn!(ctx, "CONNECTION_STATES map insert failed: err={}", e);
         return Err(e);
     }
     if let Err(e) = SOCK_TO_CONNECTION.insert(&cookie, &key, 0) {
         // 同上,反查表撑爆——后续 sendmsg/cleanup_rbuf/close 都没法落到这条 sock 上。
         // 这里同时把刚刚写入的 CONNECTION_STATES 条目回滚,避免留下永远没人 close 的
         // 孤儿状态。
-        info!(ctx, "SOCK_TO_CONNECTION map insert failed: err={}", e);
+        warn!(ctx, "SOCK_TO_CONNECTION map insert failed: err={}", e);
         let _ = CONNECTION_STATES.remove(&key);
         return Err(e);
     }
@@ -293,7 +293,10 @@ fn try_handle_tcp_sendmsg(ctx: &FEntryContext) -> Result<(), i32> {
     };
 
     throughput.bytes_sent = throughput.bytes_sent.saturating_add(size as u64);
-    CONNECTIONS.insert(&key, &throughput, 0)?;
+    if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
+        warn!(ctx, "CONNECTIONS map insert failed in tcp_sendmsg: err={}", e);
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -325,7 +328,10 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
     };
 
     throughput.bytes_received = throughput.bytes_received.saturating_add(copied as u64);
-    CONNECTIONS.insert(&key, &throughput, 0)?;
+    if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
+        warn!(ctx, "CONNECTIONS map insert failed in tcp_cleanup_rbuf: err={}", e);
+        return Err(e);
+    }
 
     Ok(())
 }
