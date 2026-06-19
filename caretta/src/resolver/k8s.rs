@@ -5,16 +5,18 @@
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Node, Pod, Service};
 use kube::api::{ListParams, WatchEvent, WatchParams};
 use kube::{Api, Client};
-use log::warn;
+use log::{error, warn};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -123,27 +125,40 @@ impl K8sResolver {
         // Coalesce bursty watch events into a small bounded queue.
         // If a refresh signal is already pending, dropping extra signals is acceptable because
         // refresh_snapshot is a full rebuild of current cluster state.
-        let (tx, mut rx) = mpsc::channel::<()>(1);
+        let (tx, rx) = mpsc::channel::<()>(1);
 
+        // refresh consumer 持有 mpsc::Receiver——它没法 clone,所以放进 Arc<Mutex<_>>。
+        // panic 时 MutexGuard 跟着 future 一起 drop,锁释放,supervise 下一轮重新 lock,
+        // 接着消费同一个 rx 队列;不需要重建 channel(否则 9 个 watch 持有的 tx 就指空了)。
+        let rx = Arc::new(Mutex::new(rx));
         let refresh_resolver = Arc::clone(self);
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {
-                if let Err(err) = refresh_resolver.refresh_snapshot().await {
-                    warn!("failed to refresh Kubernetes snapshot from watch event: {err}");
+        let rx_for_supervise = Arc::clone(&rx);
+        tokio::spawn(supervise("k8s:refresh-on-event", move || {
+            let resolver = Arc::clone(&refresh_resolver);
+            let rx = Arc::clone(&rx_for_supervise);
+            async move {
+                let mut rx = rx.lock().await;
+                while rx.recv().await.is_some() {
+                    if let Err(err) = resolver.refresh_snapshot().await {
+                        warn!("failed to refresh Kubernetes snapshot from watch event: {err}");
+                    }
                 }
             }
-        });
+        }));
 
         let periodic_resolver = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if let Err(err) = periodic_resolver.refresh_snapshot().await {
-                    warn!("failed to refresh Kubernetes snapshot on periodic tick: {err}");
+        tokio::spawn(supervise("k8s:refresh-periodic", move || {
+            let resolver = Arc::clone(&periodic_resolver);
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    ticker.tick().await;
+                    if let Err(err) = resolver.refresh_snapshot().await {
+                        warn!("failed to refresh Kubernetes snapshot on periodic tick: {err}");
+                    }
                 }
             }
-        });
+        }));
 
         Self::spawn_watch::<Pod>(Arc::clone(self), tx.clone(), "pods");
         Self::spawn_watch::<Service>(Arc::clone(self), tx.clone(), "services");
@@ -166,101 +181,108 @@ impl K8sResolver {
             + Sync
             + 'static,
     {
-        tokio::spawn(async move {
-            let api: Api<K> = Api::all(resolver.client.clone());
-            // 当前 watch 锚定的 RV。空串等价于 "0",让 API server 用 cache 最新 RV 起手。
-            // 410 GONE 触发时清空回 "0",相当于一次 re-list。
-            let mut rv = String::new();
-            // 指数退避 1s..30s。成功消费过任何事件就重置,反映 API server 已恢复。
-            let mut backoff = Duration::from_secs(1);
-            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        // 形如 "k8s:watch:pods",方便 prometheus 按 task label 区分各 watch 的重启率。
+        let task_label: &'static str =
+            Box::leak(format!("k8s:watch:{watch_name}").into_boxed_str());
+        tokio::spawn(supervise(task_label, move || {
+            let resolver = Arc::clone(&resolver);
+            let tx = tx.clone();
+            async move {
+                let api: Api<K> = Api::all(resolver.client.clone());
+                // 当前 watch 锚定的 RV。空串等价于 "0",让 API server 用 cache 最新 RV 起手。
+                // 410 GONE 触发时清空回 "0",相当于一次 re-list。
+                let mut rv = String::new();
+                // 指数退避 1s..30s。成功消费过任何事件就重置,反映 API server 已恢复。
+                let mut backoff = Duration::from_secs(1);
+                const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-            loop {
-                let watch_rv = if rv.is_empty() { "0" } else { rv.as_str() };
-                let mut stream = match api.watch(&WatchParams::default(), watch_rv).await {
-                    Ok(stream) => stream.boxed(),
-                    Err(err) => {
-                        warn!("failed to start watch for {watch_name}: {err}");
-                        sleep_with_jitter(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                };
-
-                // 本轮 watch 是否消费过事件,用于决定 backoff 是重置还是继续累加。
-                let mut got_event = false;
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(WatchEvent::Added(o)) => {
-                            if let Some(v) = o.meta().resource_version.as_ref() {
-                                rv.clone_from(v);
-                            }
-                            metrics::mark_k8s_event(watch_name, "added");
-                            metrics::mark_k8s_watch_alive(watch_name);
-                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.try_send(());
-                            got_event = true;
-                        }
-                        Ok(WatchEvent::Modified(o)) => {
-                            if let Some(v) = o.meta().resource_version.as_ref() {
-                                rv.clone_from(v);
-                            }
-                            metrics::mark_k8s_event(watch_name, "modified");
-                            metrics::mark_k8s_watch_alive(watch_name);
-                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.try_send(());
-                            got_event = true;
-                        }
-                        Ok(WatchEvent::Deleted(o)) => {
-                            if let Some(v) = o.meta().resource_version.as_ref() {
-                                rv.clone_from(v);
-                            }
-                            metrics::mark_k8s_event(watch_name, "deleted");
-                            metrics::mark_k8s_watch_alive(watch_name);
-                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.try_send(());
-                            got_event = true;
-                        }
-                        Ok(WatchEvent::Bookmark(b)) => {
-                            // Bookmark 是 RV 心跳:冷资源也定期推一次,防止 etcd
-                            // compaction 把当前 RV 抛弃造成下次重连 410。
-                            // 不进 caretta_k8s_events_count(它只统计业务事件),
-                            // 但要刷新 watch_alive 心跳——bookmark 在场就证明链路活着。
-                            // 也不触发 refresh_snapshot,避免空跑。
-                            rv.clone_from(&b.metadata.resource_version);
-                            metrics::mark_k8s_watch_alive(watch_name);
-                            resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            got_event = true;
-                        }
-                        Ok(WatchEvent::Error(e)) => {
-                            // 410 GONE: RV 太旧,丢了走 re-list 起手;其余错误保留 RV
-                            // 让下一轮带着已有 RV 重连。
-                            if e.code == 410 || e.reason == "Expired" {
-                                warn!(
-                                    "watch {watch_name} got 410 GONE (rv={}), restarting from 0",
-                                    rv
-                                );
-                                rv.clear();
-                            } else {
-                                warn!("watch error event for {watch_name}: {:?}", e);
-                            }
-                            break;
-                        }
+                loop {
+                    let watch_rv = if rv.is_empty() { "0" } else { rv.as_str() };
+                    let mut stream = match api.watch(&WatchParams::default(), watch_rv).await {
+                        Ok(stream) => stream.boxed(),
                         Err(err) => {
-                            warn!("watch stream error for {watch_name}: {err}");
-                            break;
+                            warn!("failed to start watch for {watch_name}: {err}");
+                            sleep_with_jitter(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+
+                    // 本轮 watch 是否消费过事件,用于决定 backoff 是重置还是继续累加。
+                    let mut got_event = false;
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(WatchEvent::Added(o)) => {
+                                if let Some(v) = o.meta().resource_version.as_ref() {
+                                    rv.clone_from(v);
+                                }
+                                metrics::mark_k8s_event(watch_name, "added");
+                                metrics::mark_k8s_watch_alive(watch_name);
+                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                                let _ = tx.try_send(());
+                                got_event = true;
+                            }
+                            Ok(WatchEvent::Modified(o)) => {
+                                if let Some(v) = o.meta().resource_version.as_ref() {
+                                    rv.clone_from(v);
+                                }
+                                metrics::mark_k8s_event(watch_name, "modified");
+                                metrics::mark_k8s_watch_alive(watch_name);
+                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                                let _ = tx.try_send(());
+                                got_event = true;
+                            }
+                            Ok(WatchEvent::Deleted(o)) => {
+                                if let Some(v) = o.meta().resource_version.as_ref() {
+                                    rv.clone_from(v);
+                                }
+                                metrics::mark_k8s_event(watch_name, "deleted");
+                                metrics::mark_k8s_watch_alive(watch_name);
+                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                                let _ = tx.try_send(());
+                                got_event = true;
+                            }
+                            Ok(WatchEvent::Bookmark(b)) => {
+                                // Bookmark 是 RV 心跳:冷资源也定期推一次,防止 etcd
+                                // compaction 把当前 RV 抛弃造成下次重连 410。
+                                // 不进 caretta_k8s_events_count(它只统计业务事件),
+                                // 但要刷新 watch_alive 心跳——bookmark 在场就证明链路活着。
+                                // 也不触发 refresh_snapshot,避免空跑。
+                                rv.clone_from(&b.metadata.resource_version);
+                                metrics::mark_k8s_watch_alive(watch_name);
+                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+                                got_event = true;
+                            }
+                            Ok(WatchEvent::Error(e)) => {
+                                // 410 GONE: RV 太旧,丢了走 re-list 起手;其余错误保留 RV
+                                // 让下一轮带着已有 RV 重连。
+                                if e.code == 410 || e.reason == "Expired" {
+                                    warn!(
+                                        "watch {watch_name} got 410 GONE (rv={}), restarting from 0",
+                                        rv
+                                    );
+                                    rv.clear();
+                                } else {
+                                    warn!("watch error event for {watch_name}: {:?}", e);
+                                }
+                                break;
+                            }
+                            Err(err) => {
+                                warn!("watch stream error for {watch_name}: {err}");
+                                break;
+                            }
                         }
                     }
-                }
 
-                if got_event {
-                    backoff = Duration::from_secs(1);
-                } else {
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    if got_event {
+                        backoff = Duration::from_secs(1);
+                    } else {
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                    sleep_with_jitter(backoff).await;
                 }
-                sleep_with_jitter(backoff).await;
             }
-        });
+        }));
     }
 
     fn first_owner_target<T>(obj: &T) -> Option<OwnerTarget>
@@ -644,6 +666,29 @@ async fn sleep_with_jitter(base: Duration) {
     // 0.5..=1.5,精度 1/1000
     let ratio = 0.5 + (nanos as f64 % 1000.0) / 1000.0;
     tokio::time::sleep(base.mul_f64(ratio)).await;
+}
+
+// task supervisor:把"detached spawn 后 panic 静默死亡"变成"panic → 计数 → 退避重启"。
+async fn supervise<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    loop {
+        let fut = AssertUnwindSafe(factory()).catch_unwind();
+        match fut.await {
+            Ok(()) => {
+                warn!("supervised task {name} returned cleanly, restarting");
+            }
+            Err(panic) => {
+                error!("supervised task {name} panicked: {panic:?}, restarting");
+            }
+        }
+        sleep_with_jitter(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 #[cfg(test)]
