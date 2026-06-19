@@ -236,4 +236,4 @@ external 回退行为:
 
 | 维度 | caretta-go 行为 | Rust 版改进 |
 |---|---|---|
-| 运行时观测口子 | 无 IP→Workload 解析快照的查询接口,排"为什么被打成 external"靠 grep 日志;`watchEventsCounter` 只有 `object_type` 一个 label,分不清 add/modify/delete | `DEBUG_RESOLVER_ENABLED` env 开 `/debug/resolver` 返回 IP→Workload 快照 + watch 事件计数 + 总条目数 JSON;`K8S_EVENTS_COUNT` 加 `event_type` 维度(added / modified / deleted / bookmark) |
+| 运行时观测口子 | 无 IP→Workload 解析快照的查询接口,排"为什么被打成 external"靠 grep 日志;`watchEventsCounter` 只有 `object_type` 一个 label | `DEBUG_RESOLVER_ENABLED` env 开 `/debug/resolver` 返回 IP→Workload 快照 + watch 事件计数 + 总条目数 JSON;`caretta_k8s_watch_last_active_unix_seconds{object_type}` Gauge 给每条 watch 做存活探测(time() - 它 > 阈值即告警) |

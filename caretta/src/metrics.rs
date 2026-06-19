@@ -3,7 +3,7 @@
 use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash};
 use log::warn;
 use once_cell::sync::Lazy;
-use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
+use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, Opts};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,37 +130,20 @@ static MAP_DELETIONS: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
-
-// 量化事件压力 event_type ∈ {added, modified, deleted}
-static K8S_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "caretta_k8s_events_count",
-            "total number of Kubernetes watch events processed by object and event type",
-        ),
-        &["object_type", "event_type"],
-    )
-    .expect("create caretta_k8s_events_count");
-    prometheus::default_registry()
-        .register(Box::new(c.clone()))
-        .expect("register caretta_k8s_events_count");
-    c
-});
-
-// Watch 心跳:每条 watch 上次收到任意事件(Added/Modified/Deleted/Bookmark 都算)的
+// Watch 心跳:每条 watch 上次收到任意流量(Added/Modified/Deleted/Bookmark 都算)的
 // unix 时间戳。
-static K8S_WATCH_LAST_EVENT_UNIX_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+static K8S_WATCH_LAST_ACTIVE_UNIX_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
     let g = GaugeVec::new(
         Opts::new(
-            "caretta_k8s_watch_last_event_unix_seconds",
-            "unix timestamp of the most recent watch event (any type) per Kubernetes object type",
+            "caretta_k8s_watch_last_active_unix_seconds",
+            "unix timestamp of the most recent watch-stream activity (any kind) per Kubernetes object type",
         ),
         &["object_type"],
     )
-    .expect("create caretta_k8s_watch_last_event_unix_seconds");
+    .expect("create caretta_k8s_watch_last_active_unix_seconds");
     prometheus::default_registry()
         .register(Box::new(g.clone()))
-        .expect("register caretta_k8s_watch_last_event_unix_seconds");
+        .expect("register caretta_k8s_watch_last_active_unix_seconds");
     g
 });
 
@@ -184,20 +167,14 @@ pub fn mark_map_deletion() {
     MAP_DELETIONS.inc();
 }
 
-// Record one watcher event for the given object and event type labels.
-pub fn mark_k8s_event(object_type: &str, event_type: &str) {
-    K8S_EVENTS_COUNT
-        .with_label_values(&[object_type, event_type])
-        .inc();
-}
-
-/// 刷新某条 watch 的"上次任意事件"时间戳,用于存活监控。
+/// 刷新某条 watch 的"上次任意活动"时间戳,用于存活监控。bookmark / Added / Modified /
+/// Deleted 都会触发刷新。
 pub fn mark_k8s_watch_alive(object_type: &str) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    K8S_WATCH_LAST_EVENT_UNIX_SECONDS
+    K8S_WATCH_LAST_ACTIVE_UNIX_SECONDS
         .with_label_values(&[object_type])
         .set(now_secs);
 }
