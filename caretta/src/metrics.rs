@@ -1,6 +1,7 @@
 //! Prometheus metric definitions and update helpers for links and TCP states.
 
 use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash};
+use log::warn;
 use once_cell::sync::Lazy;
 use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
 use std::collections::HashMap;
@@ -279,9 +280,12 @@ pub fn forget_link(link: &NetworkLink) {
     }
 
     let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-    // remove_label_values 找不到对应 series 时返回 Err；GC 端可能在 series 从未
-    // 真正注册过（delta 一直是 0、从未 inc_by）的边界情况下进来，所以忽略错误。
-    let _ = LINKS_METRICS.remove_label_values(&refs);
+    // remove_label_values 失败一律 warn:大部分会是"GC 端在 series 从未注册过的
+    // 边界条件下进来"(delta 一直是 0、从未 inc_by → not-found),不算 bug 但也是
+    // 信号;真正要警惕的是 cardinality drift 这类开发期 bug——同一条日志路径处理。
+    if let Err(e) = LINKS_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_links_observed series failed: {e} (labels: {refs:?})");
+    }
 }
 
 /// 构造 `caretta_tcp_states` 这条 series 的全部 label values。
@@ -338,7 +342,9 @@ pub fn handle_tcp_metric(connection: &TcpConnection) {
 pub fn forget_tcp(key: &TcpConnectionKey) {
     let label_values = tcp_label_values(key);
     let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-    let _ = TCP_STATE_METRICS.remove_label_values(&refs);
+    if let Err(e) = TCP_STATE_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_tcp_states series failed: {e} (labels: {refs:?})");
+    }
 }
 
 #[cfg(test)]
@@ -378,7 +384,7 @@ mod tests {
         }
     }
 
-    // I1 + I2: forget 后再 produce 同样字节数，差分基准应为 0 → delta = throughput
+    // forget 后再 produce 同样字节数，差分基准应为 0 → delta = throughput
     // 全量重新上报。如果 forget 没清 LAST_LINK_TOTALS，这里 delta 会是 0。
     #[test]
     fn forget_link_should_reset_delta_baseline() {
@@ -406,7 +412,7 @@ mod tests {
         );
     }
 
-    // I3: forget 对从未存在的 link 是 no-op，不应 panic / 不应污染状态。
+    // forget 对从未存在的 link 是 no-op，不应 panic / 不应污染状态。
     #[test]
     fn forget_link_should_be_noop_for_never_seen_link() {
         let link = mk_link("never-existed-x", "never-existed-y", ROLE_CLIENT);
@@ -415,7 +421,7 @@ mod tests {
         forget_link(&link);
     }
 
-    // I4: 验证拼 link_id 时 ("ab","cd") 与 ("a","bcd") 不会撞——分隔符防撞守卫。
+    // 验证拼 link_id 时 ("ab","cd") 与 ("a","bcd") 不会撞——分隔符防撞守卫。
     #[test]
     fn link_label_should_disambiguate_concatenated_names() {
         let link_a = NetworkLink {
@@ -442,7 +448,7 @@ mod tests {
         );
     }
 
-    // I4 续: 同 4-tuple 不同 role 的 link_id 必须在 hash 高位也分开，而不是只差最低位。
+    // 同 4-tuple 不同 role 的 link_id 必须在 hash 高位也分开，而不是只差最低位。
     // 我们不能直接断言"差很多 bit"，但可以验证 ROLE_CLIENT/SERVER
     // 之间的 id 完全不同。
     #[test]
@@ -454,7 +460,7 @@ mod tests {
         assert_ne!(id_c, id_s, "different role must produce different link_id");
     }
 
-    // I3 for TCP: forget_tcp 对从未存在的 series 应 no-op。
+    // forget_tcp 对从未存在的 series 应 no-op。
     #[test]
     fn forget_tcp_should_be_noop_for_never_seen_key() {
         let key = TcpConnectionKey {
@@ -467,7 +473,7 @@ mod tests {
         forget_tcp(&key);
     }
 
-    // I1 for TCP: TcpConnectionKey 不依赖 state，同一连接的 OPEN/CLOSED 写法应映射
+    // TcpConnectionKey 不依赖 state，同一连接的 OPEN/CLOSED 写法应映射
     // 到同一组 label —— 否则 GC 会按 state 分裂出多条 series。
     #[test]
     fn tcp_key_should_be_state_independent() {
