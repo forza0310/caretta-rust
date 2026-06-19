@@ -24,7 +24,6 @@ pub struct ConnectionTuple {
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub struct ConnectionIdentifier {
-    pub id: u32,
     pub pid: u32,
     pub tuple: ConnectionTuple,
     pub role: u32,
@@ -240,7 +239,6 @@ mod tests {
     async fn should_map_src_to_client_when_role_is_client() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
-            id: 1,
             pid: 10,
             tuple: ConnectionTuple {
                 src_ip: 1,
@@ -266,7 +264,6 @@ mod tests {
     async fn should_map_dst_to_client_when_role_is_server() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
-            id: 2,
             pid: 20,
             tuple: ConnectionTuple {
                 src_ip: 1,
@@ -292,7 +289,6 @@ mod tests {
     async fn should_return_error_when_role_is_unknown() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
-            id: 3,
             pid: 30,
             tuple: ConnectionTuple::default(),
             role: 999,
@@ -306,7 +302,6 @@ mod tests {
     async fn should_mark_tcp_state_closed_when_entry_is_inactive() {
         let resolver = MockResolver;
         let conn = ConnectionIdentifier {
-            id: 4,
             pid: 40,
             tuple: ConnectionTuple {
                 src_ip: 10,

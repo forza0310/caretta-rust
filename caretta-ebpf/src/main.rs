@@ -44,9 +44,9 @@ pub struct ConnectionTuple {
 #[repr(C)]
 #[derive(Copy, Clone)]
 // Connection identity used as the userspace-visible map key.
-// It combines the raw socket tuple, role, and current process id.
+// (tuple, role, pid) 已唯一标识一条连接 —— tuple 由 TCP 协议保证同时只有一条活跃,
+// role 区分 loopback 同 host 通信时同 4-tuple 上的两个方向,pid 携带"哪个进程"语义。
 pub struct ConnectionIdentifier {
-    pub id: u32,
     pub pid: u32,
     pub tuple: ConnectionTuple,
     pub role: u32,
@@ -121,22 +121,6 @@ pub fn handle_sock_set_state(ctx: BtfTracePointContext) -> u32 {
         Ok(()) => 0,
         Err(_) => 1,
     }
-}
-
-// FNV-1a hash of the 4-tuple and role, used as a key for identifying connections in maps.
-#[inline(always)]
-fn connection_id(tuple: &ConnectionTuple, role: u32) -> u32 {
-    let mut hash = 0x811C9DC5u32;
-    hash ^= tuple.src_ip;
-    hash = hash.wrapping_mul(0x01000193);
-    hash ^= tuple.dst_ip;
-    hash = hash.wrapping_mul(0x01000193);
-    hash ^= tuple.src_port as u32;
-    hash = hash.wrapping_mul(0x01000193);
-    hash ^= tuple.dst_port as u32;
-    hash = hash.wrapping_mul(0x01000193);
-    hash ^= role;
-    hash
 }
 
 #[inline(always)]
@@ -242,7 +226,6 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
     };
 
     let key = ConnectionIdentifier {
-        id: connection_id(&tuple, role),
         pid: (bpf_get_current_pid_tgid() >> 32) as u32,
         tuple,
         role,
