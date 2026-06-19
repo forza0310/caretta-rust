@@ -1,18 +1,26 @@
 //! 反向 DNS 缓存:把 IPv4 → hostname 的解析挪到 LRU + 单次时延上限的异步路径上。
 
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use log::warn;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // PTR 反查在最坏情况下要走网络（DNS server 不响应、丢包等），因此在用户配置之外
 // 再加一层短超时上限，避免单次解析挂得太久——即使发生在 hickory 内部的网络层。
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_millis(800);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+// 单飞 future 的别名:Shared 让多个 awaiter 共享同一个 PTR 反查的结果。
+// `BoxFuture<'static, _>` 是因为 Shared 要求被包裹的 future 是 'static + Clone-output——
+// 通过 Arc<TokioAsyncResolver> 移交所有权满足 'static; Output 是 Option<String> 满足 Clone。
+type LookupFuture = Shared<BoxFuture<'static, Option<String>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DnsCacheEntry {
@@ -37,14 +45,17 @@ fn cached_name(entry: &DnsCacheEntry, now: Instant) -> Option<String> {
 pub struct DnsCache {
     enabled: bool,
     cache: Mutex<LruCache<u32, DnsCacheEntry>>,
-    // 用 hickory 的 async DNS 解析器替代 dns_lookup::lookup_addr。
+    // 单飞表:同一 IP 在飞行期最多挂 1 个 PTR 查询;并发到来的 resolve_name
+    // 直接 clone 同一个 Shared future 等同一份结果
+    inflight: Mutex<HashMap<u32, LookupFuture>>,
+
+    // 用 hickory 的 async DNS 解析器替代 dns_lookup::lookup_addr,避免线程刮起。
     //
-    // 改动动机：lookup_addr 会调 libc::getnameinfo，是同步阻塞调用——在 glibc DNS
-    // 不响应的情况下，单次最多卡 ~15s（5s × 3 次重试），这段时间整个调用它的 OS
-    // 线程被挂起。
+    // 用 Arc 包是为了能被 clone 进 'static 的 Shared future——TokioAsyncResolver
+    // 内部已经是 Arc-of-state,这层多一次 Arc::clone 只是 refcount inc,不复制状态。
     //
     // 在系统配置（resolv.conf 等）不可用时退化为 None，调用方走 IP 字符串 fallback。
-    resolver: Option<TokioAsyncResolver>,
+    resolver: Option<Arc<TokioAsyncResolver>>,
 }
 
 impl DnsCache {
@@ -52,7 +63,7 @@ impl DnsCache {
         let cache_size = NonZeroUsize::new(cache_size.max(1)).expect("non-zero dns cache size");
         let resolver = if enabled {
             match Self::build_resolver() {
-                Ok(r) => Some(r),
+                Ok(r) => Some(Arc::new(r)),
                 Err(err) => {
                     warn!("hickory resolver init failed, falling back to IP literals: {err}");
                     None
@@ -64,6 +75,7 @@ impl DnsCache {
         Self {
             enabled,
             cache: Mutex::new(LruCache::new(cache_size)),
+            inflight: Mutex::new(HashMap::new()),
             resolver,
         }
     }
@@ -110,8 +122,39 @@ impl DnsCache {
             }
         }
 
+        // 单飞:LRU miss 之后,先看 inflight 表——
+        //   - 命中 → clone 同一个 Shared future,await 同一份结果
+        //   - 未命中 → 自己造一个 Shared future 放进表,自己也拿一份 await
+        // 真正打 DNS 的最多只有"首发 task",其余 awaiter 是零成本的等待。
         let resolved = match &self.resolver {
-            Some(resolver) => Self::reverse_lookup_with_timeout(resolver, ip).await,
+            Some(resolver) => {
+                let fut = {
+                    // Mutex 毒化时直接复用 PoisonError 里的 guard:inflight 表语义本就
+                    // 是"尽力去重",HashMap 状态最多让某个 IP 多打一次 DNS,无害。
+                    // 用 unwrap_or_else 是为了避免 `match`/`if let Err` 在 await 前隐式
+                    // 持有 PoisonError(里面包着 MutexGuard),把整个外层 future 拽成 !Send。
+                    let mut inflight = self
+                        .inflight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if let Some(existing) = inflight.get(&ip) {
+                        existing.clone()
+                    } else {
+                        let new = Self::lookup_owned(resolver.clone(), ip).boxed().shared();
+                        inflight.insert(ip, new.clone());
+                        new
+                    }
+                };
+                let result = fut.await;
+                // 完成后从 inflight 移除。多个 awaiter 都会执行到这里,remove 是幂等的——
+                // 后到的 remove 看不到 entry 直接 None,不会重复释放或 panic。
+                // 必须放在 await 之后:future ready 之前移除会让后到的并发 task 重打 DNS。
+                self.inflight
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&ip);
+                result
+            }
             None => None,
         };
         let host = resolved.clone().unwrap_or_else(|| fallback.clone());
@@ -132,11 +175,11 @@ impl DnsCache {
         host
     }
 
-    /// 包一层超时，使最坏单次时延有界。返回 None 表示超时或 DNS 失败。
-    async fn reverse_lookup_with_timeout(resolver: &TokioAsyncResolver, ip: u32) -> Option<String> {
+    /// Owned 版本的反查 + 超时:接 `Arc<TokioAsyncResolver>` 而不是 borrow,
+    /// 这样返回的 future 是 'static,可放进 `Shared`。
+    async fn lookup_owned(resolver: Arc<TokioAsyncResolver>, ip: u32) -> Option<String> {
         let addr = IpAddr::V4(Ipv4Addr::from(ip));
-        let lookup = resolver.reverse_lookup(addr);
-        match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup).await {
+        match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, resolver.reverse_lookup(addr)).await {
             Ok(Ok(response)) => response.iter().next().map(|name| {
                 // PTR 记录通常带尾随点（"example.com."），剥掉以与原 lookup_addr 行为对齐。
                 let s = name.to_utf8();
