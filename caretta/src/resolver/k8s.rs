@@ -18,6 +18,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
 
 use super::IpResolver;
@@ -167,40 +168,77 @@ impl K8sResolver {
     {
         tokio::spawn(async move {
             let api: Api<K> = Api::all(resolver.client.clone());
+            // 当前 watch 锚定的 RV。空串等价于 "0",让 API server 用 cache 最新 RV 起手。
+            // 410 GONE 触发时清空回 "0",相当于一次 re-list。
+            let mut rv = String::new();
+            // 指数退避 1s..30s。成功消费过任何事件就重置,反映 API server 已恢复。
+            let mut backoff = Duration::from_secs(1);
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
             loop {
-                let mut stream = match api.watch(&WatchParams::default(), "0").await {
+                let watch_rv = if rv.is_empty() { "0" } else { rv.as_str() };
+                let mut stream = match api.watch(&WatchParams::default(), watch_rv).await {
                     Ok(stream) => stream.boxed(),
                     Err(err) => {
                         warn!("failed to start watch for {watch_name}: {err}");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        sleep_with_jitter(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
                 };
 
+                // 本轮 watch 是否消费过事件,用于决定 backoff 是重置还是继续累加。
+                let mut got_event = false;
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(WatchEvent::Added(_)) => {
+                        Ok(WatchEvent::Added(o)) => {
+                            if let Some(v) = o.meta().resource_version.as_ref() {
+                                rv.clone_from(v);
+                            }
                             metrics::mark_k8s_event(watch_name, "added");
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
+                            got_event = true;
                         }
-                        Ok(WatchEvent::Modified(_)) => {
+                        Ok(WatchEvent::Modified(o)) => {
+                            if let Some(v) = o.meta().resource_version.as_ref() {
+                                rv.clone_from(v);
+                            }
                             metrics::mark_k8s_event(watch_name, "modified");
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
+                            got_event = true;
                         }
-                        Ok(WatchEvent::Deleted(_)) => {
+                        Ok(WatchEvent::Deleted(o)) => {
+                            if let Some(v) = o.meta().resource_version.as_ref() {
+                                rv.clone_from(v);
+                            }
                             metrics::mark_k8s_event(watch_name, "deleted");
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
+                            got_event = true;
                         }
-                        Ok(WatchEvent::Bookmark(_)) => {
+                        Ok(WatchEvent::Bookmark(b)) => {
+                            // Bookmark 是 RV 心跳:冷资源也定期推一次,防止 etcd
+                            // compaction 把当前 RV 抛弃造成下次重连 410。
+                            // 不触发 refresh_snapshot,避免空跑。
+                            rv.clone_from(&b.metadata.resource_version);
                             metrics::mark_k8s_event(watch_name, "bookmark");
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.try_send(());
+                            got_event = true;
                         }
                         Ok(WatchEvent::Error(e)) => {
-                            warn!("watch error event for {watch_name}: {:?}", e);
+                            // 410 GONE: RV 太旧,丢了走 re-list 起手;其余错误保留 RV
+                            // 让下一轮带着已有 RV 重连。
+                            if e.code == 410 || e.reason == "Expired" {
+                                warn!(
+                                    "watch {watch_name} got 410 GONE (rv={}), restarting from 0",
+                                    rv
+                                );
+                                rv.clear();
+                            } else {
+                                warn!("watch error event for {watch_name}: {:?}", e);
+                            }
                             break;
                         }
                         Err(err) => {
@@ -210,7 +248,12 @@ impl K8sResolver {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if got_event {
+                    backoff = Duration::from_secs(1);
+                } else {
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                sleep_with_jitter(backoff).await;
             }
         });
     }
@@ -581,6 +624,21 @@ fn service_fallback_workload(name: &str, namespace: &str) -> Workload {
         kind: "Service".to_string(),
         owner: String::new(),
     }
+}
+
+// 给 sleep 加 ±50% 抖动:9 个 watch × N 个节点同时反弹时,把它们打散到一个时间窗口里,
+// 避免 API server 刚恢复就被同步的 thundering herd 二次打挂。
+//
+// 不引入 rand 依赖,用 SystemTime nanos 做廉价伪随机源——这个用途下不需要密码学强度,
+// 只需要"不同任务在同一秒内得到不同尾数"。
+async fn sleep_with_jitter(base: Duration) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // 0.5..=1.5,精度 1/1000
+    let ratio = 0.5 + (nanos as f64 % 1000.0) / 1000.0;
+    tokio::time::sleep(base.mul_f64(ratio)).await;
 }
 
 #[cfg(test)]
