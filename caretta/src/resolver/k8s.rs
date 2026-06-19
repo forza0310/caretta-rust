@@ -399,11 +399,47 @@ impl K8sResolver {
         // 否则更早开始但更晚完成的旧快照会覆盖较新的 watch 刷新结果。
         let _refresh_guard = self.refresh_lock.lock().await;
 
+        let replicasets: Api<ReplicaSet> = Api::all(self.client.clone());
+        let deployments: Api<Deployment> = Api::all(self.client.clone());
+        let statefulsets: Api<StatefulSet> = Api::all(self.client.clone());
+        let daemonsets: Api<DaemonSet> = Api::all(self.client.clone());
+        let jobs: Api<Job> = Api::all(self.client.clone());
+        let cronjobs: Api<CronJob> = Api::all(self.client.clone());
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        let services: Api<Service> = Api::all(self.client.clone());
+        let nodes: Api<Node> = Api::all(self.client.clone());
+
+        // 9 个 list 一次性并发发出去——总时延 = max(单条 list),不再 sum;
+        // refresh_lock 的持锁时间也同步缩短。处理阶段(下面那段串行 for 循环)
+        // 是纯内存操作,成本可忽略,所以即便 Pod / Service 阶段在依赖上必须等
+        // owners_index / pods_by_ns 建好,这里先把数据全部抽回来再处理也不亏。
+        let lp = ListParams::default();
+        let (rs_res, dep_res, ss_res, ds_res, job_res, cj_res, pod_res, svc_res, node_res) = tokio::join!(
+            replicasets.list(&lp),
+            deployments.list(&lp),
+            statefulsets.list(&lp),
+            daemonsets.list(&lp),
+            jobs.list(&lp),
+            cronjobs.list(&lp),
+            pods.list(&lp),
+            services.list(&lp),
+            nodes.list(&lp),
+        );
+        // 任一 list 失败整体返回 Err,旧快照保持不动——这与改造前每条 `?` 的语义一致。
+        let rs_list = rs_res?;
+        let dep_list = dep_res?;
+        let ss_list = ss_res?;
+        let ds_list = ds_res?;
+        let job_list = job_res?;
+        let cj_list = cj_res?;
+        let pod_list = pod_res?;
+        let svc_list = svc_res?;
+        let node_list = node_res?;
+
         let mut next = HashMap::new();
         let mut owners_index: HashMap<OwnerKey, OwnerTarget> = HashMap::new();
 
-        let replicasets: Api<ReplicaSet> = Api::all(self.client.clone());
-        for rs in replicasets.list(&ListParams::default()).await?.items {
+        for rs in rs_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 rs.metadata.namespace.clone(),
                 rs.metadata.name.clone(),
@@ -413,8 +449,7 @@ impl K8sResolver {
             }
         }
 
-        let deployments: Api<Deployment> = Api::all(self.client.clone());
-        for d in deployments.list(&ListParams::default()).await?.items {
+        for d in dep_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 d.metadata.namespace.clone(),
                 d.metadata.name.clone(),
@@ -424,8 +459,7 @@ impl K8sResolver {
             }
         }
 
-        let statefulsets: Api<StatefulSet> = Api::all(self.client.clone());
-        for s in statefulsets.list(&ListParams::default()).await?.items {
+        for s in ss_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 s.metadata.namespace.clone(),
                 s.metadata.name.clone(),
@@ -435,8 +469,7 @@ impl K8sResolver {
             }
         }
 
-        let daemonsets: Api<DaemonSet> = Api::all(self.client.clone());
-        for d in daemonsets.list(&ListParams::default()).await?.items {
+        for d in ds_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 d.metadata.namespace.clone(),
                 d.metadata.name.clone(),
@@ -446,8 +479,7 @@ impl K8sResolver {
             }
         }
 
-        let jobs: Api<Job> = Api::all(self.client.clone());
-        for j in jobs.list(&ListParams::default()).await?.items {
+        for j in job_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 j.metadata.namespace.clone(),
                 j.metadata.name.clone(),
@@ -457,8 +489,7 @@ impl K8sResolver {
             }
         }
 
-        let cronjobs: Api<CronJob> = Api::all(self.client.clone());
-        for c in cronjobs.list(&ListParams::default()).await?.items {
+        for c in cj_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 c.metadata.namespace.clone(),
                 c.metadata.name.clone(),
@@ -468,13 +499,12 @@ impl K8sResolver {
             }
         }
 
-        let pods: Api<Pod> = Api::all(self.client.clone());
         // pods_by_ns 留住每个 Pod 已经过完 owner 上卷的 Workload + 其 labels,
         // 让接下来的 Service 循环按 namespace 反查 selector 命中的 Pod, 直接复用
         // 同一份 Workload, 避免 ClusterIP 与 Pod IP 在 prometheus 上产生
         // {kind=Service} / {kind=Deployment} 双 series。
         let mut pods_by_ns: HashMap<String, Vec<PodSummary>> = HashMap::new();
-        for pod in pods.list(&ListParams::default()).await?.items {
+        for pod in pod_list.items {
             let namespace = pod.metadata.namespace.clone().unwrap_or_default();
             let pod_name = pod.metadata.name.clone().unwrap_or_default();
             let labels = pod.metadata.labels.clone().unwrap_or_default();
@@ -513,8 +543,7 @@ impl K8sResolver {
             }
         }
 
-        let services: Api<Service> = Api::all(self.client.clone());
-        for svc in services.list(&ListParams::default()).await?.items {
+        for svc in svc_list.items {
             let namespace = svc.metadata.namespace.clone().unwrap_or_default();
             let svc_name = svc.metadata.name.clone().unwrap_or_default();
 
@@ -547,8 +576,7 @@ impl K8sResolver {
             }
         }
 
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        for node in nodes.list(&ListParams::default()).await?.items {
+        for node in node_list.items {
             let name = node.metadata.name.clone().unwrap_or_default();
             let workload = Workload {
                 name,
