@@ -479,17 +479,6 @@ data:
           "legendFormat": "deleted/{{object_type}}",
           "range": true,
           "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (object_type) (rate(caretta_k8s_events_count{event_type=\"bookmark\"}[$__rate_interval]) * 60)",
-          "legendFormat": "bookmark/{{object_type}}",
-          "range": true,
-          "refId": "D"
         }
       ],
       "title": "K8s Event Rate",

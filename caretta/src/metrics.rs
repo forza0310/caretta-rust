@@ -5,6 +5,7 @@ use once_cell::sync::Lazy;
 use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, IntCounterVec, Opts};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
     let c = CounterVec::new(
@@ -36,23 +37,7 @@ static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
     c
 });
 
-// 每条 link 上次上报到的累计字节数。存在的唯一目的是把"绝对值"翻译成"delta"。
-//
-// 上下文：caretta_links_observed 是 prometheus 的 CounterVec，对外语义是"自启动以来
-// 累计字节"。Counter 的 API 只有 inc_by(delta)，不接受 set(absolute)。但我们的数据
-// 源（main.rs poll loop 里的 current_links）拿到的是绝对值——既包含 eBPF map 当前
-// 还活着的连接的字节数，也包含已死亡 link 在 main.rs `links` 表里累计下来的字节数。
-//
-// 所以每次 handle_link_metric(link, throughput) 时：
-//   delta = throughput - LAST_LINK_TOTALS[link_key]
-//   LAST_LINK_TOTALS[link_key] = throughput
-//   LINKS_METRICS.inc_by(delta)
-//
-// 为什么不能让 main.rs 自己算 delta：因为 main.rs 那边的 `links` 表只记账已死亡部分，
-// 活着部分的字节是从 eBPF map 现读的，两者合并后才是"这条 link 当前应有的累计值"，
-// 这个合并的绝对值在 caretta 进程层面就是源头——再往上找差分基准就只能在 prometheus
-// 视角找。LAST_LINK_TOTALS 就是 caretta 自己持有的"上次上报快照"，避免依赖 prometheus
-// 状态做差分（prometheus 端 Counter reset/staleness 不可控）。
+// 每条 link 上次上报到的累计字节数。
 //
 // 生命周期管理：与 main.rs `links` 表一一对应。链路 GC 时（main.rs 的 retain）调
 // metrics::forget_link()，forget_link 会同时把这里的 entry 也抹掉，避免泄漏。
@@ -144,10 +129,8 @@ static MAP_DELETIONS: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
-// Counts all processed watch stream events by Kubernetes object type.
-// This helps quantify watcher churn and event pressure during control-plane instability.
-// 量化事件压力：当控制平面（如 API Server 或 etcd）发生故障或网络抖动时，短时间内可能触发大量资源更新。该指标的陡增能直接反映“事件风暴”。
-// 发现异常波动：如果一个平时事件量很少的控制器突然收到海量事件，可能是上游系统（如 HPA）频繁修改资源，或者集群发生了大规模驱逐。
+
+// 量化事件压力 event_type ∈ {added, modified, deleted}
 static K8S_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -161,6 +144,23 @@ static K8S_EVENTS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
         .register(Box::new(c.clone()))
         .expect("register caretta_k8s_events_count");
     c
+});
+
+// Watch 心跳:每条 watch 上次收到任意事件(Added/Modified/Deleted/Bookmark 都算)的
+// unix 时间戳。
+static K8S_WATCH_LAST_EVENT_UNIX_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    let g = GaugeVec::new(
+        Opts::new(
+            "caretta_k8s_watch_last_event_unix_seconds",
+            "unix timestamp of the most recent watch event (any type) per Kubernetes object type",
+        ),
+        &["object_type"],
+    )
+    .expect("create caretta_k8s_watch_last_event_unix_seconds");
+    prometheus::default_registry()
+        .register(Box::new(g.clone()))
+        .expect("register caretta_k8s_watch_last_event_unix_seconds");
+    g
 });
 
 pub fn mark_poll() {
@@ -190,12 +190,18 @@ pub fn mark_k8s_event(object_type: &str, event_type: &str) {
         .inc();
 }
 
+/// 刷新某条 watch 的"上次任意事件"时间戳,用于存活监控。
+pub fn mark_k8s_watch_alive(object_type: &str) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    K8S_WATCH_LAST_EVENT_UNIX_SECONDS
+        .with_label_values(&[object_type])
+        .set(now_secs);
+}
+
 /// 构造 `caretta_links_observed` 这条 series 的全部 label values。
-///
-/// 抽出来的关键动机：`handle_link_metric`（写入）和 `forget_link`（删除 series）
-/// 必须用 100% 相同的 label values，否则 forget 会漏删——prometheus 是按 label
-/// 组合定位 series 的，差一个字符就找不到。把构造逻辑收敛到一处，编译期保证一致。
-///
 /// 返回 14 元素数组，顺序与 LINKS_METRICS 注册时的 label 顺序严格一一对应。
 fn link_label_values(link: &NetworkLink) -> [String; 14] {
     let link_id = (fnv_hash(
@@ -208,8 +214,6 @@ fn link_label_values(link: &NetworkLink) -> [String; 14] {
             + &link.server.namespace),
     ) ^ link.role.wrapping_mul(0x9E3779B1))
     .to_string();
-    // 注：原实现是 fnv_hash(name+ns+name+ns) + role，没有分隔符也没把 role 充分混
-    // 入。这次顺手收紧:拼接时用 \x1f 防止 ("ab","cd") 与
     // ("a","bcd") 撞同一串；role 用 wrapping_mul 一个 32-bit 黄金比例常数后再 xor，
     // 让不同 role 的 link_id 在所有 bit 上充分发散，而不是只差最低位。
     let client_id =
@@ -262,12 +266,10 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
 }
 
 /// 清理一条 link 占用的所有用户态/Prometheus 状态。GC 必须把 LAST_LINK_TOTALS 里
-/// 的"上次值"和 LINKS_METRICS 里的 series 一起删——只删一个会出现"差分基准消失但
-/// series 还在"的诡异状态，下次同名 link 复活时会被算成"绝对值=delta"猛灌一笔。
+/// 的"上次值"和 LINKS_METRICS 里的 series 一起删
 ///
 /// 调用方需要保证：传入的 link 至少已经 N 个 tick 没有流量（main.rs 的 GC 阈值
-/// LINK_GC_TTL 控制，默认 5 分钟）。删早了会让 series 在 prometheus staleness
-/// 窗口里"消失—又出现"，有损监控连续性。
+/// LINK_GC_TTL 控制，默认 5 分钟）。
 pub fn forget_link(link: &NetworkLink) {
     let label_values = link_label_values(link);
     let link_key = link_totals_key(&label_values);

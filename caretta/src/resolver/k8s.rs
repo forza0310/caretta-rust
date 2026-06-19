@@ -196,6 +196,7 @@ impl K8sResolver {
                                 rv.clone_from(v);
                             }
                             metrics::mark_k8s_event(watch_name, "added");
+                            metrics::mark_k8s_watch_alive(watch_name);
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
                             got_event = true;
@@ -205,6 +206,7 @@ impl K8sResolver {
                                 rv.clone_from(v);
                             }
                             metrics::mark_k8s_event(watch_name, "modified");
+                            metrics::mark_k8s_watch_alive(watch_name);
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
                             got_event = true;
@@ -214,6 +216,7 @@ impl K8sResolver {
                                 rv.clone_from(v);
                             }
                             metrics::mark_k8s_event(watch_name, "deleted");
+                            metrics::mark_k8s_watch_alive(watch_name);
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.try_send(());
                             got_event = true;
@@ -221,9 +224,11 @@ impl K8sResolver {
                         Ok(WatchEvent::Bookmark(b)) => {
                             // Bookmark 是 RV 心跳:冷资源也定期推一次,防止 etcd
                             // compaction 把当前 RV 抛弃造成下次重连 410。
-                            // 不触发 refresh_snapshot,避免空跑。
+                            // 不进 caretta_k8s_events_count(它只统计业务事件),
+                            // 但要刷新 watch_alive 心跳——bookmark 在场就证明链路活着。
+                            // 也不触发 refresh_snapshot,避免空跑。
                             rv.clone_from(&b.metadata.resource_version);
-                            metrics::mark_k8s_event(watch_name, "bookmark");
+                            metrics::mark_k8s_watch_alive(watch_name);
                             resolver.watch_events.fetch_add(1, Ordering::Relaxed);
                             got_event = true;
                         }
