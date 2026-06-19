@@ -6,7 +6,7 @@
 //!   - 测试 fixture(本文件 #[cfg(test)] 模块):用合成 BTF blob 验证查询语义。
 //!
 //! 与 `parser.rs` 的边界:本文件不直接 byte-decode,只调 parser 暴露的
-//! `parse_header` / `read_type_at` / `flatten_named_members` / `resolve_int_size` /
+//! `parse_header` / `read_type_at` / `flatten_named_members` / `resolve_field_size` /
 //! `read_string` 等原语。
 
 use anyhow::{Context as _, anyhow, bail};
@@ -15,7 +15,7 @@ use std::fs;
 
 use super::parser::{
     KIND_STRUCT, TypeInfo, flatten_named_members, parse_header, read_string, read_type_at,
-    resolve_int_size,
+    resolve_field_size,
 };
 use crate::types::SockOffsets;
 
@@ -118,7 +118,7 @@ pub fn parse_struct_field_offsets(
         }
         let byte_offset = m.bit_offset / 8;
 
-        let actual_size = resolve_int_size(&by_id, m.type_id, 8)
+        let actual_size = resolve_field_size(types, &by_id, m.type_id, 8)
             .with_context(|| format!("failed to resolve size of {struct_name}.{field_name}"))?;
         if actual_size != *expected_size {
             bail!(
@@ -169,7 +169,7 @@ pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
 #[cfg(test)]
 mod tests {
     use super::super::parser::{
-        BTF_HEADER_SIZE, BTF_MAGIC_LE, KIND_INT, KIND_STRUCT, KIND_TYPEDEF, KIND_UNION,
+        BTF_HEADER_SIZE, BTF_MAGIC_LE, KIND_ARRAY, KIND_INT, KIND_STRUCT, KIND_TYPEDEF, KIND_UNION,
     };
     use super::*;
 
@@ -387,6 +387,68 @@ mod tests {
         let off = parse_struct_field_offsets(&blob, "demo", &[("a", 4)])
             .expect("size via typedef should resolve");
         assert_eq!(off["a"], 0);
+    }
+
+    /// 数组字段:模拟 `struct demo { u8 buf[16]; }`——sock_common 现在没有数组字段,
+    /// 但将来要 IPv6,`skc_v6_daddr` 是 `struct in6_addr`,内部就含 `__u8[16]` 数组,
+    /// resolve_field_size 必须能算出 elem_size × nelems = 1 × 16 = 16。
+    #[test]
+    fn should_resolve_array_field_size() {
+        let mut strings: Vec<u8> = vec![0];
+        let off_u8 = strings.len() as u32;
+        strings.extend_from_slice(b"u8\0");
+        let off_demo = strings.len() as u32;
+        strings.extend_from_slice(b"demo\0");
+        let off_buf = strings.len() as u32;
+        strings.extend_from_slice(b"buf\0");
+
+        let mut types: Vec<u8> = Vec::new();
+        // type 1: INT u8 size=1
+        types.extend_from_slice(&off_u8.to_le_bytes());
+        types.extend_from_slice(&((KIND_INT << 24) | 0u32).to_le_bytes());
+        types.extend_from_slice(&1u32.to_le_bytes());
+        types.extend_from_slice(&0u32.to_le_bytes());
+        // type 2: ARRAY (anon),vlen=0、size=0;trailing 12 字节 (elem_type=1, index_type=0, nelems=16)
+        types.extend_from_slice(&0u32.to_le_bytes());
+        types.extend_from_slice(&((KIND_ARRAY << 24) | 0u32).to_le_bytes());
+        types.extend_from_slice(&0u32.to_le_bytes());
+        types.extend_from_slice(&1u32.to_le_bytes()); // elem_type
+        types.extend_from_slice(&0u32.to_le_bytes()); // index_type(我们不读)
+        types.extend_from_slice(&16u32.to_le_bytes()); // nelems
+        // type 3: STRUCT demo vlen=1 size=16,字段 buf 指向 ARRAY(type id=2)@ bit 0
+        types.extend_from_slice(&off_demo.to_le_bytes());
+        types.extend_from_slice(&((KIND_STRUCT << 24) | 1u32).to_le_bytes());
+        types.extend_from_slice(&16u32.to_le_bytes());
+        types.extend_from_slice(&off_buf.to_le_bytes());
+        types.extend_from_slice(&2u32.to_le_bytes());
+        types.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&BTF_MAGIC_LE.to_le_bytes());
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&(BTF_HEADER_SIZE as u32).to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        blob.extend(types);
+        blob.extend(strings);
+
+        // 期望 size=16(1 byte × 16):验证应通过,offset 为 0。
+        let off = parse_struct_field_offsets(&blob, "demo", &[("buf", 16)])
+            .expect("array field size should resolve as elem_size * nelems");
+        assert_eq!(off["buf"], 0);
+
+        // 期望 size=8(故意写错):验证应 bail——证明 ARRAY 分支真的算到了 16,
+        // 而不是 fallback 到某个偶然为 8 的值。
+        let err = parse_struct_field_offsets(&blob, "demo", &[("buf", 8)])
+            .expect_err("array size mismatch must bail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("size") || msg.contains("16"),
+            "error should explain size mismatch, got: {msg}"
+        );
     }
 
     /// 匿名嵌套场景:模拟 sock_common 把 skc_daddr / skc_rcv_saddr 藏在

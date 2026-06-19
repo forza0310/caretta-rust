@@ -27,7 +27,7 @@ const BTF_ARRAY_SIZE: usize = 12;
 const KIND_VOID: u32 = 0;
 pub(super) const KIND_INT: u32 = 1;
 const KIND_PTR: u32 = 2;
-const KIND_ARRAY: u32 = 3;
+pub(super) const KIND_ARRAY: u32 = 3;
 pub(super) const KIND_STRUCT: u32 = 4;
 pub(super) const KIND_UNION: u32 = 5;
 const KIND_ENUM: u32 = 6;
@@ -227,9 +227,17 @@ pub(super) fn flatten_named_members(
     Ok(out)
 }
 
-/// follow typedef / const / volatile / restrict 链路直到落到 INT / FLOAT,返回那一层
-/// 的 size。`max_depth` 防御循环 typedef(BTF 实际上保证无环,但 defensive 一些)。
-pub(super) fn resolve_int_size(
+/// 求解一个 BTF type 的 byte size。
+///
+/// 处理:
+///   - INT / FLOAT / ENUM / ENUM64 / STRUCT / UNION  → 直接返回 `size_or_type`
+///   - TYPEDEF / CONST / VOLATILE / RESTRICT / TYPE_TAG → 跟链路到下一层
+///   - PTR  → 8(约定 64-bit 目标平台)
+///   - ARRAY → 元素 size × 元素数(递归求元素 size,支持多维数组与 array-of-typedef)
+///
+/// `max_depth` 同时约束 typedef 链深度与嵌套数组深度。BTF 实际上保证无环但仍 defensive。
+pub(super) fn resolve_field_size(
+    types: &[u8],
     by_id: &HashMap<u32, TypeInfo>,
     mut type_id: u32,
     max_depth: u32,
@@ -249,10 +257,24 @@ pub(super) fn resolve_int_size(
             // x86_64 / aarch64 都是 8。这里写死 8 满足 caretta 的目标平台,32-bit 平台
             // 永远不会跑到这条 caretta 路径。
             KIND_PTR => return Ok(8),
+            KIND_ARRAY => {
+                // ARRAY trailing 12 字节:(elem_type_id, index_type_id, nelems)。
+                // read_type_at 已经校验过 body_offset+12 <= types.len(),这里直接读。
+                // 用不到 index_type,跳过中间 4 字节。
+                let off = ty.body_offset;
+                let elem_type_id = u32::from_le_bytes(types[off..off + 4].try_into().unwrap());
+                let nelems = u32::from_le_bytes(types[off + 8..off + 12].try_into().unwrap());
+                // 元素本身可能还是 array(多维)/typedef 链/struct,统一递归求解。
+                // 防御嵌套过深。
+                let elem_size = resolve_field_size(types, by_id, elem_type_id, max_depth - 1)?;
+                return elem_size
+                    .checked_mul(nelems)
+                    .ok_or_else(|| anyhow!("BTF array size overflow: {elem_size} * {nelems}"));
+            }
             other => bail!("cannot resolve size for BTF kind {other}"),
         }
     }
-    bail!("BTF typedef chain too deep at type id {type_id}")
+    bail!("BTF type chain too deep at type id {type_id}")
 }
 
 /// 读 string 段里 NUL 终止的字符串。BTF 字符串都是 ASCII,直接当 utf-8 解。
