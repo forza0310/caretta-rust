@@ -242,8 +242,8 @@ dependencies = [
  "aya",
  "aya-build",
  "aya-log",
- "caretta-common",
  "caretta-ebpf",
+ "caretta-k8s-core",
  "cargo_metadata",
  "clap",
  "env_logger",
@@ -261,21 +261,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "caretta-common"
-version = "0.1.0"
-dependencies = [
- "aya",
-]
-
-[[package]]
 name = "caretta-ebpf"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
- "caretta-common",
  "network-types",
  "which 6.0.3",
+]
+
+[[package]]
+name = "caretta-k8s-core"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -570,17 +574,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
-name = "futures-macro"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "futures-sink"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,7 +594,6 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
- "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",

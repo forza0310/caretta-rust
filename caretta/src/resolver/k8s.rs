@@ -5,41 +5,29 @@
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use futures_util::{FutureExt, StreamExt};
+use caretta_k8s_core::owner::{
+    first_owner_target, owner_key, trace_owner_hierarchy, OwnerKey, OwnerResolveConfig, OwnerTarget,
+};
+use caretta_k8s_core::supervisor::supervise;
+use caretta_k8s_core::watch::{spawn_watch, ChangeKind, WatchObserver};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Node, Pod, Service};
-use kube::api::{ListParams, WatchEvent, WatchParams};
+use kube::api::ListParams;
 use kube::{Api, Client};
-use log::{error, warn};
+use log::warn;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
 use std::net::Ipv4Addr;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
 
 use super::IpResolver;
 use super::dns::DnsCache;
 use crate::metrics;
 use crate::types::Workload;
-
-#[derive(Clone, Eq, PartialEq, Hash)]
-struct OwnerKey {
-    namespace: String,
-    kind: String,
-    name: String,
-}
-
-#[derive(Clone)]
-struct OwnerTarget {
-    kind: String,
-    name: String,
-}
 
 #[derive(Serialize)]
 struct DebugResolverEntry {
@@ -48,6 +36,30 @@ struct DebugResolverEntry {
     namespace: String,
     kind: String,
     owner: String,
+}
+
+/// 把 存活心跳指标 + 触发 refresh 注入到 caretta-k8s-core
+/// 的 watch loop。
+///
+/// `Arc<K8sResolver>` 形成 resolver→observer→resolver 的 Arc 环,但 observer 仅存活在
+/// spawned watch task 内、与 resolver 进程级同生命周期,不构成实际泄漏。
+struct ResolverWatchObserver {
+    resolver: Arc<K8sResolver>,
+    tx: mpsc::Sender<()>,
+}
+
+impl<K> WatchObserver<K> for ResolverWatchObserver {
+    fn on_change(&self, _kind: ChangeKind, _obj: &K) {
+        // 把 watch 事件合并成一个刷新信号:refresh_snapshot 是全量重建,队列满
+        // (已有待处理信号)时丢弃多余信号是可接受的。
+        let _ = self.tx.try_send(());
+    }
+
+    fn on_active(&self, watch_name: &'static str) {
+        // 任意流量(含 Bookmark)都刷新存活心跳与计数,证明这条 watch 还活着。
+        metrics::mark_k8s_watch_alive(watch_name);
+        self.resolver.watch_events.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub struct K8sResolver {
@@ -171,6 +183,8 @@ impl K8sResolver {
         Self::spawn_watch::<CronJob>(Arc::clone(self), tx, "cronjobs");
     }
 
+    /// 起一条对 `K` 的 watch:复用 caretta-k8s-core 的通用 watch loop,把 caretta 特有的
+    /// 副作用(存活心跳 + 刷新信号)经 [`ResolverWatchObserver`] 注入。
     fn spawn_watch<K>(resolver: Arc<Self>, tx: mpsc::Sender<()>, watch_name: &'static str)
     where
         K: Clone
@@ -181,215 +195,11 @@ impl K8sResolver {
             + Sync
             + 'static,
     {
-        // 形如 "k8s:watch:pods",方便 prometheus 按 task label 区分各 watch 的重启率。
-        let task_label: &'static str =
-            Box::leak(format!("k8s:watch:{watch_name}").into_boxed_str());
-        tokio::spawn(supervise(task_label, move || {
-            let resolver = Arc::clone(&resolver);
-            let tx = tx.clone();
-            async move {
-                let api: Api<K> = Api::all(resolver.client.clone());
-                // 当前 watch 锚定的 RV。空串等价于 "0",让 API server 用 cache 最新 RV 起手。
-                // 410 GONE 触发时清空回 "0",相当于一次 re-list。
-                let mut rv = String::new();
-                // 指数退避 1s..30s。成功消费过任何事件就重置,反映 API server 已恢复。
-                let mut backoff = Duration::from_secs(1);
-                const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-                loop {
-                    let watch_rv = if rv.is_empty() { "0" } else { rv.as_str() };
-                    let mut stream = match api.watch(&WatchParams::default(), watch_rv).await {
-                        Ok(stream) => stream.boxed(),
-                        Err(err) => {
-                            warn!("failed to start watch for {watch_name}: {err}");
-                            sleep_with_jitter(backoff).await;
-                            backoff = (backoff * 2).min(MAX_BACKOFF);
-                            continue;
-                        }
-                    };
-
-                    // 本轮 watch 是否消费过事件,用于决定 backoff 是重置还是继续累加。
-                    let mut got_event = false;
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(WatchEvent::Added(o)) => {
-                                if let Some(v) = o.meta().resource_version.as_ref() {
-                                    rv.clone_from(v);
-                                }
-                                metrics::mark_k8s_watch_alive(watch_name);
-                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx.try_send(());
-                                got_event = true;
-                            }
-                            Ok(WatchEvent::Modified(o)) => {
-                                if let Some(v) = o.meta().resource_version.as_ref() {
-                                    rv.clone_from(v);
-                                }
-                                metrics::mark_k8s_watch_alive(watch_name);
-                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx.try_send(());
-                                got_event = true;
-                            }
-                            Ok(WatchEvent::Deleted(o)) => {
-                                if let Some(v) = o.meta().resource_version.as_ref() {
-                                    rv.clone_from(v);
-                                }
-                                metrics::mark_k8s_watch_alive(watch_name);
-                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx.try_send(());
-                                got_event = true;
-                            }
-                            Ok(WatchEvent::Bookmark(b)) => {
-                                // Bookmark 是 RV 心跳:冷资源也定期推一次,防止 etcd
-                                // compaction 把当前 RV 抛弃造成下次重连 410。
-                                // 刷新 watch_alive——bookmark 在场就证明链路活着。
-                                // 也不触发 refresh_snapshot,避免空跑。
-                                rv.clone_from(&b.metadata.resource_version);
-                                metrics::mark_k8s_watch_alive(watch_name);
-                                resolver.watch_events.fetch_add(1, Ordering::Relaxed);
-                                got_event = true;
-                            }
-                            Ok(WatchEvent::Error(e)) => {
-                                // 410 GONE: RV 太旧,丢了走 re-list 起手;其余错误保留 RV
-                                // 让下一轮带着已有 RV 重连。
-                                if e.code == 410 || e.reason == "Expired" {
-                                    warn!(
-                                        "watch {watch_name} got 410 GONE (rv={}), restarting from 0",
-                                        rv
-                                    );
-                                    rv.clear();
-                                } else {
-                                    warn!("watch error event for {watch_name}: {:?}", e);
-                                }
-                                break;
-                            }
-                            Err(err) => {
-                                warn!("watch stream error for {watch_name}: {err}");
-                                break;
-                            }
-                        }
-                    }
-
-                    if got_event {
-                        backoff = Duration::from_secs(1);
-                    } else {
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                    sleep_with_jitter(backoff).await;
-                }
-            }
-        }));
+        let client = resolver.client.clone();
+        let observer = Arc::new(ResolverWatchObserver { resolver, tx });
+        spawn_watch::<K, _>(client, watch_name, observer);
     }
 
-    fn first_owner_target<T>(obj: &T) -> Option<OwnerTarget>
-    where
-        T: kube::Resource,
-    {
-        obj.meta()
-            .owner_references
-            .as_ref()
-            .and_then(|refs| refs.first())
-            .map(|r| OwnerTarget {
-                kind: r.kind.clone(),
-                name: r.name.clone(),
-            })
-    }
-
-    fn owner_key(namespace: &str, kind: &str, name: &str) -> OwnerKey {
-        OwnerKey {
-            namespace: namespace.to_string(),
-            kind: kind.to_string(),
-            name: name.to_string(),
-        }
-    }
-
-    /// Trace owner chain and pick final workload using traversal + allowlist/priority strategy.
-    fn trace_owner_hierarchy(
-        &self,
-        namespace: &str,
-        initial: Option<OwnerTarget>,
-        owners_index: &HashMap<OwnerKey, OwnerTarget>,
-    ) -> (String, String, String) {
-        let mut immediate_owner = String::new();
-        let mut final_kind = "Pod".to_string();
-        let mut final_name = String::new();
-
-        if let Some(first) = initial.clone() {
-            immediate_owner = first.name.clone();
-            final_kind = first.kind.clone();
-            final_name = first.name.clone();
-        }
-
-        if !self.traverse_up_hierarchy {
-            return (final_kind, final_name, immediate_owner);
-        }
-
-        let mut chain: Vec<OwnerTarget> = Vec::new();
-        let mut cur = initial;
-        for _ in 0..8 {
-            let Some(owner) = cur.clone() else {
-                break;
-            };
-            chain.push(owner.clone());
-            final_kind = owner.kind.clone();
-            final_name = owner.name.clone();
-
-            let key = Self::owner_key(namespace, &owner.kind, &owner.name);
-            cur = owners_index.get(&key).cloned();
-            if cur.is_none() {
-                break;
-            }
-        }
-
-        if let Some(selected) = self.select_owner_from_chain(&chain) {
-            final_kind = selected.kind.clone();
-            final_name = selected.name.clone();
-        }
-
-        (final_kind, final_name, immediate_owner)
-    }
-
-    fn select_owner_from_chain<'a>(&self, chain: &'a [OwnerTarget]) -> Option<&'a OwnerTarget> {
-        if chain.is_empty() {
-            return None;
-        }
-
-        let allow_all = self.owner_kind_allowlist.is_empty();
-        let mut best: Option<(usize, usize)> = None;
-
-        for (idx, owner) in chain.iter().enumerate() {
-            if !allow_all && !self.owner_kind_allowlist.contains(&owner.kind) {
-                continue;
-            }
-
-            let rank = self
-                .owner_kind_priority
-                .get(&owner.kind)
-                .copied()
-                .unwrap_or(usize::MAX);
-
-            match best {
-                None => best = Some((idx, rank)),
-                Some((best_idx, best_rank)) => {
-                    if rank < best_rank || (rank == best_rank && idx > best_idx) {
-                        best = Some((idx, rank));
-                    }
-                }
-            }
-        }
-
-        if let Some((idx, _)) = best {
-            return chain.get(idx);
-        }
-
-        if allow_all {
-            chain.last()
-        } else {
-            chain.first()
-        }
-    }
-
-    /// Rebuild in-memory IP mapping from current Kubernetes snapshot.
     async fn refresh_snapshot(&self) -> anyhow::Result<()> {
         // Watch 触发和 30s 兜底是两个后台 task。refresh 是全量重建,必须串行化；
         // 否则更早开始但更晚完成的旧快照会覆盖较新的 watch 刷新结果。
@@ -435,13 +245,20 @@ impl K8sResolver {
         let mut next = HashMap::new();
         let mut owners_index: HashMap<OwnerKey, OwnerTarget> = HashMap::new();
 
+        // owner 上卷策略:从 self 的运行配置现场组装,按引用传给 core 的纯函数。
+        let owner_cfg = OwnerResolveConfig {
+            traverse_up_hierarchy: self.traverse_up_hierarchy,
+            allowlist: &self.owner_kind_allowlist,
+            priority: &self.owner_kind_priority,
+        };
+
         for rs in rs_list.items {
             if let (Some(ns), Some(name), Some(parent)) = (
                 rs.metadata.namespace.clone(),
                 rs.metadata.name.clone(),
-                Self::first_owner_target(&rs),
+                first_owner_target(&rs),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "ReplicaSet", &name), parent);
+                owners_index.insert(owner_key(&ns, "ReplicaSet", &name), parent);
             }
         }
 
@@ -449,9 +266,9 @@ impl K8sResolver {
             if let (Some(ns), Some(name), Some(parent)) = (
                 d.metadata.namespace.clone(),
                 d.metadata.name.clone(),
-                Self::first_owner_target(&d),
+                first_owner_target(&d),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "Deployment", &name), parent);
+                owners_index.insert(owner_key(&ns, "Deployment", &name), parent);
             }
         }
 
@@ -459,9 +276,9 @@ impl K8sResolver {
             if let (Some(ns), Some(name), Some(parent)) = (
                 s.metadata.namespace.clone(),
                 s.metadata.name.clone(),
-                Self::first_owner_target(&s),
+                first_owner_target(&s),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "StatefulSet", &name), parent);
+                owners_index.insert(owner_key(&ns, "StatefulSet", &name), parent);
             }
         }
 
@@ -469,9 +286,9 @@ impl K8sResolver {
             if let (Some(ns), Some(name), Some(parent)) = (
                 d.metadata.namespace.clone(),
                 d.metadata.name.clone(),
-                Self::first_owner_target(&d),
+                first_owner_target(&d),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "DaemonSet", &name), parent);
+                owners_index.insert(owner_key(&ns, "DaemonSet", &name), parent);
             }
         }
 
@@ -479,9 +296,9 @@ impl K8sResolver {
             if let (Some(ns), Some(name), Some(parent)) = (
                 j.metadata.namespace.clone(),
                 j.metadata.name.clone(),
-                Self::first_owner_target(&j),
+                first_owner_target(&j),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "Job", &name), parent);
+                owners_index.insert(owner_key(&ns, "Job", &name), parent);
             }
         }
 
@@ -489,9 +306,9 @@ impl K8sResolver {
             if let (Some(ns), Some(name), Some(parent)) = (
                 c.metadata.namespace.clone(),
                 c.metadata.name.clone(),
-                Self::first_owner_target(&c),
+                first_owner_target(&c),
             ) {
-                owners_index.insert(Self::owner_key(&ns, "CronJob", &name), parent);
+                owners_index.insert(owner_key(&ns, "CronJob", &name), parent);
             }
         }
 
@@ -504,9 +321,9 @@ impl K8sResolver {
             let namespace = pod.metadata.namespace.clone().unwrap_or_default();
             let pod_name = pod.metadata.name.clone().unwrap_or_default();
             let labels = pod.metadata.labels.clone().unwrap_or_default();
-            let owner_ref = Self::first_owner_target(&pod);
+            let owner_ref = first_owner_target(&pod);
             let (resolved_kind, resolved_name, immediate_owner) =
-                self.trace_owner_hierarchy(&namespace, owner_ref, &owners_index);
+                trace_owner_hierarchy(&owner_cfg, &namespace, owner_ref, &owners_index);
 
             let workload = Workload {
                 name: if resolved_name.is_empty() {
@@ -674,44 +491,6 @@ fn service_fallback_workload(name: &str, namespace: &str) -> Workload {
         namespace: namespace.to_string(),
         kind: "Service".to_string(),
         owner: String::new(),
-    }
-}
-
-// 给 sleep 加 ±50% 抖动:9 个 watch × N 个节点同时反弹时,把它们打散到一个时间窗口里,
-// 避免 API server 刚恢复就被同步的 thundering herd 二次打挂。
-//
-// 不引入 rand 依赖,用 SystemTime nanos 做廉价伪随机源——这个用途下不需要密码学强度,
-// 只需要"不同任务在同一秒内得到不同尾数"。
-async fn sleep_with_jitter(base: Duration) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // 0.5..=1.5,精度 1/1000
-    let ratio = 0.5 + (nanos as f64 % 1000.0) / 1000.0;
-    tokio::time::sleep(base.mul_f64(ratio)).await;
-}
-
-// task supervisor:把"detached spawn 后 panic 静默死亡"变成"panic → 计数 → 退避重启"。
-async fn supervise<F, Fut>(name: &'static str, factory: F)
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let mut backoff = Duration::from_secs(1);
-    const MAX_BACKOFF: Duration = Duration::from_secs(30);
-    loop {
-        let fut = AssertUnwindSafe(factory()).catch_unwind();
-        match fut.await {
-            Ok(()) => {
-                warn!("supervised task {name} returned cleanly, restarting");
-            }
-            Err(panic) => {
-                error!("supervised task {name} panicked: {panic:?}, restarting");
-            }
-        }
-        sleep_with_jitter(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
