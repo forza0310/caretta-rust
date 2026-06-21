@@ -1,9 +1,10 @@
 //! Prometheus metric definitions and update helpers for links and TCP states.
 
-use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash};
+use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash_parts};
 use log::warn;
 use once_cell::sync::Lazy;
 use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, Opts};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -181,50 +182,58 @@ pub fn mark_k8s_watch_alive(object_type: &str) {
 
 /// 构造 `caretta_links_observed` 这条 series 的全部 label values。
 /// 返回 14 元素数组，顺序与 LINKS_METRICS 注册时的 label 顺序严格一一对应。
-fn link_label_values(link: &NetworkLink) -> [String; 14] {
-    let link_id = (fnv_hash(
-        &(link.client.name.clone()
-            + "\x1f"
-            + &link.client.namespace
-            + "\x1f"
-            + &link.server.name
-            + "\x1f"
-            + &link.server.namespace),
-    ) ^ link.role.wrapping_mul(0x9E3779B1))
+///
+/// 用 `Cow` 而不是 `String`:14 个里只有 link_id/client_id/server_id/server_port/role
+/// 这 5 个是现算的(Owned),其余 9 个本就是 `NetworkLink` 里现成的串,直接借引用
+/// (Borrowed),省掉每条 link 每 tick 的 9 次 clone。
+fn link_label_values(link: &NetworkLink) -> [Cow<'_, str>; 14] {
+    let link_id = (fnv_hash_parts(&[
+        link.client.name.as_str(),
+        link.client.namespace.as_str(),
+        link.server.name.as_str(),
+        link.server.namespace.as_str(),
+    ]) ^ link.role.wrapping_mul(0x9E3779B1))
     .to_string();
     // ("a","bcd") 撞同一串；role 用 wrapping_mul 一个 32-bit 黄金比例常数后再 xor，
     // 让不同 role 的 link_id 在所有 bit 上充分发散，而不是只差最低位。
     let client_id =
-        fnv_hash(&(link.client.name.clone() + "\x1f" + &link.client.namespace)).to_string();
+        fnv_hash_parts(&[link.client.name.as_str(), link.client.namespace.as_str()]).to_string();
     let server_id =
-        fnv_hash(&(link.server.name.clone() + "\x1f" + &link.server.namespace)).to_string();
+        fnv_hash_parts(&[link.server.name.as_str(), link.server.namespace.as_str()]).to_string();
     [
-        link_id,
-        client_id,
-        link.client_ip.clone(),
-        link.client.name.clone(),
-        link.client.namespace.clone(),
-        link.client.kind.clone(),
-        link.client.owner.clone(),
-        server_id,
-        link.server_ip.clone(),
-        link.server_port.to_string(),
-        link.server.name.clone(),
-        link.server.namespace.clone(),
-        link.server.kind.clone(),
-        link.role.to_string(),
+        Cow::Owned(link_id),
+        Cow::Owned(client_id),
+        Cow::Borrowed(link.client_ip.as_str()),
+        Cow::Borrowed(link.client.name.as_str()),
+        Cow::Borrowed(link.client.namespace.as_str()),
+        Cow::Borrowed(link.client.kind.as_str()),
+        Cow::Borrowed(link.client.owner.as_str()),
+        Cow::Owned(server_id),
+        Cow::Borrowed(link.server_ip.as_str()),
+        Cow::Owned(link.server_port.to_string()),
+        Cow::Borrowed(link.server.name.as_str()),
+        Cow::Borrowed(link.server.namespace.as_str()),
+        Cow::Borrowed(link.server.kind.as_str()),
+        Cow::Owned(link.role.to_string()),
     ]
 }
 
+/// 把 `[Cow<str>; N]` 借成 `[&str; N]` 喂给 prometheus 的 with/remove_label_values
+/// 与 totals key join——栈上定长数组,不再 collect 一个临时 `Vec<&str>`。
+fn as_str_array<'a, const N: usize>(values: &'a [Cow<'_, str>; N]) -> [&'a str; N] {
+    std::array::from_fn(|i| &*values[i])
+}
+
 /// 把 label values 拼成 LAST_LINK_TOTALS 的 key。同样和 produce 路径共用。
-fn link_totals_key(label_values: &[String; 14]) -> String {
-    label_values.join("\x1f")
+fn link_totals_key(refs: &[&str; 14]) -> String {
+    refs.join("\x1f")
 }
 
 /// Update the link throughput counter for a single normalized link.
 pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
     let label_values = link_label_values(link);
-    let link_key = link_totals_key(&label_values);
+    let refs = as_str_array(&label_values);
+    let link_key = link_totals_key(&refs);
 
     let delta = if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
         let previous = seen.get(&link_key).copied().unwrap_or(0);
@@ -238,8 +247,6 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
         return;
     }
 
-    // Prometheus 的 with_label_values 接受 &[&str]，这里把 String 切片现拷一遍。
-    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
     LINKS_METRICS.with_label_values(&refs).inc_by(delta as f64);
 }
 
@@ -250,13 +257,13 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
 /// LINK_GC_TTL 控制，默认 5 分钟）。
 pub fn forget_link(link: &NetworkLink) {
     let label_values = link_label_values(link);
-    let link_key = link_totals_key(&label_values);
+    let refs = as_str_array(&label_values);
+    let link_key = link_totals_key(&refs);
 
     if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
         seen.remove(&link_key);
     }
 
-    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
     // remove_label_values 失败一律 warn:大部分会是"GC 端在 series 从未注册过的
     // 边界条件下进来"(delta 一直是 0、从未 inc_by → not-found),不算 bug 但也是
     // 信号;真正要警惕的是 cardinality drift 这类开发期 bug——同一条日志路径处理。
@@ -267,37 +274,34 @@ pub fn forget_link(link: &NetworkLink) {
 
 /// 构造 `caretta_tcp_states` 这条 series 的全部 label values。
 ///
-/// 与 link_label_values 同理——给 handle_tcp_metric 和 forget_tcp 共用。
-/// 注意签名收的是 TcpConnectionKey 而不是 TcpConnection：state 不参与 label
-/// 集合（state 在 GaugeVec 里是值不是 label），不该影响 label 拼装。
-fn tcp_label_values(key: &TcpConnectionKey) -> [String; 12] {
-    let link_id = (fnv_hash(
-        &(key.client.name.clone()
-            + "\x1f"
-            + &key.client.namespace
-            + "\x1f"
-            + &key.server.name
-            + "\x1f"
-            + &key.server.namespace),
-    ) ^ key.role.wrapping_mul(0x9E3779B1))
+/// 与 link_label_values 同理——给 handle_tcp_metric 和 forget_tcp 共用,同样用 Cow
+/// 借引用省 clone。注意签名收的是 TcpConnectionKey 而不是 TcpConnection：state 不参与
+/// label 集合（state 在 GaugeVec 里是值不是 label），不该影响 label 拼装。
+fn tcp_label_values(key: &TcpConnectionKey) -> [Cow<'_, str>; 12] {
+    let link_id = (fnv_hash_parts(&[
+        key.client.name.as_str(),
+        key.client.namespace.as_str(),
+        key.server.name.as_str(),
+        key.server.namespace.as_str(),
+    ]) ^ key.role.wrapping_mul(0x9E3779B1))
     .to_string();
     let client_id =
-        fnv_hash(&(key.client.name.clone() + "\x1f" + &key.client.namespace)).to_string();
+        fnv_hash_parts(&[key.client.name.as_str(), key.client.namespace.as_str()]).to_string();
     let server_id =
-        fnv_hash(&(key.server.name.clone() + "\x1f" + &key.server.namespace)).to_string();
+        fnv_hash_parts(&[key.server.name.as_str(), key.server.namespace.as_str()]).to_string();
     [
-        link_id,
-        client_id,
-        key.client.name.clone(),
-        key.client.namespace.clone(),
-        key.client.kind.clone(),
-        key.client.owner.clone(),
-        server_id,
-        key.server.name.clone(),
-        key.server.namespace.clone(),
-        key.server.kind.clone(),
-        key.server_port.to_string(),
-        key.role.to_string(),
+        Cow::Owned(link_id),
+        Cow::Owned(client_id),
+        Cow::Borrowed(key.client.name.as_str()),
+        Cow::Borrowed(key.client.namespace.as_str()),
+        Cow::Borrowed(key.client.kind.as_str()),
+        Cow::Borrowed(key.client.owner.as_str()),
+        Cow::Owned(server_id),
+        Cow::Borrowed(key.server.name.as_str()),
+        Cow::Borrowed(key.server.namespace.as_str()),
+        Cow::Borrowed(key.server.kind.as_str()),
+        Cow::Owned(key.server_port.to_string()),
+        Cow::Owned(key.role.to_string()),
     ]
 }
 
@@ -305,7 +309,7 @@ fn tcp_label_values(key: &TcpConnectionKey) -> [String; 12] {
 pub fn handle_tcp_metric(connection: &TcpConnection) {
     let key = TcpConnectionKey::from(connection);
     let label_values = tcp_label_values(&key);
-    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+    let refs = as_str_array(&label_values);
     TCP_STATE_METRICS
         .with_label_values(&refs)
         .set(connection.state as f64);
@@ -318,7 +322,7 @@ pub fn handle_tcp_metric(connection: &TcpConnection) {
 /// CLOSED_STATE=3 是把 gauge 值改了，**series 本身依旧存活**，cardinality 一路涨。
 pub fn forget_tcp(key: &TcpConnectionKey) {
     let label_values = tcp_label_values(key);
-    let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+    let refs = as_str_array(&label_values);
     if let Err(e) = TCP_STATE_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_tcp_states series failed: {e} (labels: {refs:?})");
     }
@@ -380,7 +384,7 @@ mod tests {
         // 这正是修复前的"泄漏 + 漂移"行为，所以我们要从相反方向断言：第二次 forget
         // 必须真的找到 series 才能删（remove_label_values 成功）。
         let label_values = link_label_values(&link);
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
+        let refs = as_str_array(&label_values);
         // remove_label_values 成功 → series 存在 → forget 后 produce 重建成功 →
         // 基准真被清空。
         assert!(

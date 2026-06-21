@@ -205,11 +205,31 @@ pub fn is_loopback(ip: u32) -> bool {
     std::net::Ipv4Addr::from(ip).is_loopback()
 }
 
+/// FNV-1a 单串版,等价于 `fnv_hash_parts(&[s])`。生产路径已全部走分段版
+/// `fnv_hash_parts`(省拼接分配),这里只留给 `fnv_hash_parts` 的等价性测试做对照基准。
+#[cfg(test)]
 pub fn fnv_hash(s: &str) -> u32 {
+    fnv_hash_parts(&[s])
+}
+
+/// FNV-1a over `parts` joined by the 0x1f unit separator, **without** allocating an
+/// intermediate `String`.
+///
+/// 与 `fnv_hash(&parts.join("\x1f"))` 逐字节等价(`"\x1f"` 恰是单字节 0x1f),因此
+/// 把过去 `fnv_hash(&(a.clone() + "\x1f" + &b))` 那种"先拼串再 hash"换成它,hash 值
+/// 完全不变、series 身份不漂移,只是省掉了拼接产生的临时分配。
+pub fn fnv_hash_parts(parts: &[&str]) -> u32 {
     let mut hash = 0x811C9DC5u32;
-    for b in s.as_bytes() {
-        hash ^= *b as u32;
-        hash = hash.wrapping_mul(0x01000193);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            // 分隔符 0x1f,与 join("\x1f") 一致。
+            hash ^= 0x1f;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        for b in part.as_bytes() {
+            hash ^= *b as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
     }
     hash
 }
@@ -320,5 +340,28 @@ mod tests {
             .await
             .expect("tcp reduction should succeed");
         assert_eq!(tcp.state, TCP_CONNECTION_CLOSED_STATE);
+    }
+
+    // fnv_hash_parts 必须与"先用 \x1f 拼串再 fnv_hash"逐位等价——否则切到分段 hash
+    // 会让 link_id/client_id/server_id 漂移,produce 与历史 series 对不上。
+    #[test]
+    fn fnv_hash_parts_matches_separator_joined_string() {
+        let cases: &[&[&str]] = &[
+            &["a", "b"],
+            &["ab", "cd"],
+            &["a", "bcd"],
+            &["client", "ns", "server", "ns"],
+            &[""],
+            &["", ""],
+            &["only"],
+        ];
+        for parts in cases {
+            let joined = parts.join("\x1f");
+            assert_eq!(
+                fnv_hash_parts(parts),
+                fnv_hash(&joined),
+                "fnv_hash_parts({parts:?}) must equal fnv_hash of the \\x1f-joined string"
+            );
+        }
     }
 }

@@ -116,10 +116,17 @@
     - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 .cargo runner 的 sudo);未新增 clippy warning。
   - 余项：二级索引复制一份 key,稳态内存约翻倍(受 max_links/max_tcp_states 上限约束,有界)。日后若顾虑内存可改 `Arc<key>` 共享,本次不做(项 E 顺带可一并优化 String 分配)。
 
-- [ ] **E. `link_label_values` / `tcp_label_values` 每条 link 14 个 String 分配**
+- [x] **E. `link_label_values` / `tcp_label_values` 每条 link 14 个 String 分配**
   - 位置：`caretta/src/metrics.rs::link_label_values`
-  - 现状：`link.client.name.clone()` 多次出现；`fnv_hash` 先 `to_string` 再 hash；`with_label_values` 还要 `iter().map(...).collect::<Vec<&str>>()`
-  - 建议：hash 直接走 byte 序列；label_values 返回 `[Cow<str>; N]`；`with_label_values` 直接接 `[&str; N]`
+  - 原状：`link.client.name.clone()` 多次出现；`fnv_hash` 先 `to_string` 再 hash；`with_label_values` 还要 `iter().map(...).collect::<Vec<&str>>()`
+  - 已做：
+    - `types.rs` 新增 `fnv_hash_parts(&[&str]) -> u32`:FNV-1a 直接吃分段 byte 序列,段间喂 0x1f 分隔符,与旧的 `fnv_hash(&parts.join("\x1f"))` **逐字节等价**——link_id/client_id/server_id 不漂移,series 身份不变。旧 `fnv_hash` 退化为 `fnv_hash_parts(&[s])` 且仅 `#[cfg(test)]` 留作等价性对照基准。新增单测 `fnv_hash_parts_matches_separator_joined_string` 钉死这条不变量。
+    - `link_label_values` 返回 `[Cow<str>; 14]`、`tcp_label_values` 返回 `[Cow<str>; 12]`:14/12 个里只有 link_id/client_id/server_id/server_port/role 这 5 个是现算的(`Cow::Owned`),其余字段本就是 `NetworkLink`/`TcpConnectionKey` 里现成的串,直接 `Cow::Borrowed` 借引用,省掉每条每 tick 的 9/7 次 clone。
+    - 新增 `as_str_array<const N>(&[Cow; N]) -> [&str; N]`(`std::array::from_fn`):把 Cow 数组借成栈上定长 `[&str; N]` 喂 prometheus 的 with/remove_label_values 与 totals key join,不再 `collect` 临时 `Vec<&str>`。`link_totals_key` 签名改收 `&[&str; 14]`。
+    - 4 个调用点(handle_link_metric / forget_link / handle_tcp_metric / forget_tcp)与 `forget_link_should_reset_delta_baseline` 测试同步改用 `as_str_array`。
+    - 行为不变:produce 与 forget 仍共用同一 label helper,invariant I1(两路 label 逐字节一致)保住;link_id 的分隔符防撞 + role 混入(I4)、state 无关(tcp_key)等单测全绿。
+    - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 sudo runner);未新增 clippy warning。
+  - 余项：暂无
 
 - [ ] **F. HTTP server 1024 字节固定 buffer + `from_utf8_lossy` + 无 read timeout**
   - 位置：`caretta/src/http_server.rs::run_metrics_server`
@@ -201,6 +208,6 @@
 | P0 | #2（watch RV / 410 / 退避） | 一个集中改动 |
 | P1 | #3（watch supervisor）/ #4（forget 错误分流） | 中等 |
 | P1 | A（并发 list）/ B（single-flight DNS） | 中等，性能收益显著 |
-| P2 | C（已处理）/ D（已处理）/ E（容量 / 排序 / String 分配） | 配置或重构 |
+| P2 | C（已处理）/ D（已处理）/ E（已处理） | 配置或重构 |
 | P2 | F / H | 小 |
 | P3 | K / L / M-T | 重构，逐步推 |
