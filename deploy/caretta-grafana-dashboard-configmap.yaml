@@ -1,0 +1,860 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caretta-rust-grafana-dashboards
+  labels:
+    grafana_dashboard: "1"
+data:
+  default-dashboard.json: |
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "target": {
+              "limit": 100,
+              "matchAny": false,
+              "tags": [],
+              "type": "dashboard"
+            },
+            "type": "dashboard"
+          }
+        ]
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 24,
+            "w": 17,
+            "x": 0,
+            "y": 0
+          },
+          "id": 2,
+          "interval": "15s",
+          "options": {
+            "edges": {
+              "mainStatUnit": "KiBs"
+            },
+            "layoutAlgorithm": "layered",
+            "nodes": {
+              "arcs": [
+                {
+                  "color": "#5794F2",
+                  "field": "arc__color"
+                }
+              ],
+              "mainStatUnit": "mbytes"
+            },
+            "zoomMode": "cooperative"
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "round(\n  increase(\n    (\n      sum by (id, title, subTitle, detail__kind, arc__color) (\n        label_replace(\n          (\n            label_join(label_join(label_join(label_join(${links_base}, \"detail__kind\", \"\", \"server_kind\"), \"subTitle\", \"\", \"server_namespace\"), \"title\", \"\", \"server_name\"), \"id\", \"\", \"server_id\")\n            or\n            label_join(label_join(label_join(label_join(${links_base}, \"detail__kind\", \"\", \"client_kind\"), \"subTitle\", \"\", \"client_namespace\"), \"title\", \"\", \"client_name\"), \"id\", \"\", \"client_id\")\n          ),\n          \"arc__color\", \"1\", \"link_id\", \"(.*)\"\n        )\n      )\n    )[$__range:$__interval]\n  )\n) / 1048576 > 0",
+              "format": "table",
+              "instant": true,
+              "legendFormat": "__auto",
+              "range": false,
+              "refId": "nodes"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "(\n  rate(\n    (\n      (\n        sum by (id, source, target, detail__client_ip, detail__server_endpoint) (\n          label_join(label_join(label_join(label_join(label_join(${links_base}, \"source\", \"\", \"client_id\"), \"target\", \"\", \"server_id\"), \"id\", \"\", \"link_id\"), \"detail__client_ip\", \"\", \"client_ip\"), \"detail__server_endpoint\", \":\", \"server_ip\", \"server_port\")\n        )\n      )\n      and on(source)\n      sum by (source) (label_join(${links_base}, \"source\", \"\", \"client_id\"))\n      and on(target)\n      sum by (target) (label_join(${links_base}, \"target\", \"\", \"server_id\"))\n    )[$__range:$__interval]\n  ) / 1024\n) > 0",
+              "format": "table",
+              "instant": true,
+              "legendFormat": "__auto",
+              "range": false,
+              "refId": "edges"
+            }
+          ],
+          "title": "Service Map",
+          "transformations": [
+            {
+              "id": "renameByRegex",
+              "options": {
+                "regex": "Value #nodes",
+                "renamePattern": "MiB"
+              }
+            },
+            {
+              "id": "renameByRegex",
+              "options": {
+                "regex": "Value #edges",
+                "renamePattern": "KiB/s"
+              }
+            }
+          ],
+          "type": "nodeGraph"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "fixedColor": "blue",
+                "mode": "fixed"
+              },
+              "custom": {
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                }
+              },
+              "links": [],
+              "mappings": [],
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 4,
+            "x": 17,
+            "y": 0
+          },
+          "id": 4,
+          "options": {
+            "displayLabels": [
+              "name"
+            ],
+            "legend": {
+              "displayMode": "list",
+              "placement": "right",
+              "showLegend": false
+            },
+            "pieType": "donut",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "sort": "desc",
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "round(sum by (server_port) (increase(${links_base}[$__range:$__interval]))) > 0",
+              "legendFormat": "__auto",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Active Ports",
+          "type": "piechart"
+        },
+        {
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 3,
+            "x": 21,
+            "y": 0
+          },
+          "id": 10,
+          "options": {
+            "code": {
+              "language": "plaintext",
+              "showLineNumbers": false,
+              "showMiniMap": false
+            },
+            "content": "<table style=\"width:100%; height:100%;border:0px solid black;\">\n     <td style=\"text-align: center;vertical-align: middle;border:0px solid black; \">\n<div style=\"text-align: center\">\n<p align=\"center\">\n  <img src=\"https://raw.githubusercontent.com/forza0310/caretta-rust/refs/heads/master/images/logo.png\" width=\"75%\" alt=\"caretta\" title=\"caretta\" />\n  <h4>by <a href=\"https://github.com/forza0310\">forza0310</h4>\n\n \n</div>\n</p>\n</div>\n</td>\n</table>\n",
+            "mode": "markdown"
+          },
+          "pluginVersion": "12.4.4",
+          "title": "",
+          "type": "text"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "fixedColor": "purple",
+                "mode": "continuous-blues"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 7,
+            "x": 17,
+            "y": 7
+          },
+          "id": 8,
+          "options": {
+            "displayMode": "gradient",
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": false
+            },
+            "maxVizHeight": 300,
+            "minVizHeight": 10,
+            "minVizWidth": 0,
+            "namePlacement": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showUnfilled": true,
+            "sizing": "auto",
+            "valueMode": "text"
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "topk(8, sum by (client_name) ((rate(caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"}[$__range:$__interval]))))",
+              "format": "time_series",
+              "instant": true,
+              "legendFormat": "__auto",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Top Throughput Workloads",
+          "type": "bargauge"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "continuous-blues"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 7,
+            "x": 17,
+            "y": 15
+          },
+          "id": 6,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "center",
+            "orientation": "horizontal",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "text": {},
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "topk(7, sum by (client_name, server_name) ( rate( (caretta_links_observed{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\", client_kind!~\"(node|external)\",} or caretta_links_observed{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\", server_kind!~\"(node|external)\"})[$__range:$__interval]) ) )",
+              "format": "time_series",
+              "instant": true,
+              "legendFormat": "{{client_name}} ⮂ {{server_name}}",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Top Throughput Connections",
+          "type": "stat"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 24
+          },
+          "id": 100,
+          "panels": [],
+          "title": "Kubernetes Events",
+          "type": "row"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisColorMode": "text",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "gradientMode": "none",
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                }
+              },
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Warning"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "red",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Normal"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "green",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 25
+          },
+          "id": 101,
+          "options": {
+            "legend": {
+              "calcs": [
+                "sum"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "sum by (type) (increase(caretta_k8s_events_total{namespace=~\"$evt_namespace\", type=~\"$evt_type\", reason=~\"$evt_reason\"}[$__rate_interval]))",
+              "legendFormat": "{{type}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Event Count Over Time (by type)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true,
+                "inspect": false
+              },
+              "mappings": []
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Count"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 90
+                  },
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        {
+                          "color": "blue",
+                          "value": 0
+                        },
+                        {
+                          "color": "orange",
+                          "value": 10
+                        },
+                        {
+                          "color": "red",
+                          "value": 50
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 12,
+            "w": 24,
+            "x": 0,
+            "y": 33
+          },
+          "id": 102,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "countRows": false,
+              "fields": "",
+              "reducer": [
+                "sum"
+              ],
+              "show": false
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "Count",
+                "desc": true
+              }
+            ]
+          },
+          "pluginVersion": "12.4.4",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (namespace, type, reason, workload_kind, workload_name) (increase(caretta_k8s_events_total{namespace=~\"$evt_namespace\", type=~\"$evt_type\", reason=~\"$evt_reason\"}[$__range])) > 0",
+              "format": "table",
+              "instant": true,
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Recent Events (counts over selected range)",
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true
+                },
+                "indexByName": {
+                  "namespace": 0,
+                  "workload_kind": 1,
+                  "workload_name": 2,
+                  "type": 3,
+                  "reason": 4,
+                  "Value": 5
+                },
+                "renameByName": {
+                  "Value": "Count",
+                  "namespace": "Namespace",
+                  "type": "Type",
+                  "reason": "Reason",
+                  "workload_kind": "Workload Kind",
+                  "workload_name": "Workload"
+                }
+              }
+            },
+            {
+              "id": "sortBy",
+              "options": {
+                "fields": "",
+                "sort": [
+                  {
+                    "desc": true,
+                    "field": "Count"
+                  }
+                ]
+              }
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "preload": false,
+      "refresh": "",
+      "schemaVersion": 42,
+      "tags": [],
+      "templating": {
+        "list": [
+          {
+            "current": {
+              "text": "default",
+              "value": "default"
+            },
+            "includeAll": false,
+            "label": "datasource",
+            "name": "DS_PROMETHEUS",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "type": "datasource"
+          },
+          {
+            "current": {
+              "text": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})",
+              "value": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})"
+            },
+            "hide": 2,
+            "label": "links base",
+            "name": "links_base",
+            "query": "(caretta_links_observed{client_namespace=~\"${namespace:regex}\", client_kind=~\"${kind:regex}\", client_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"} or caretta_links_observed{server_namespace=~\"${namespace:regex}\", server_kind=~\"${kind:regex}\", server_name=~\"${workload:regex}\", server_port=~\"${port:regex}\"})",
+            "skipUrlSync": true,
+            "type": "constant"
+          },
+          {
+            "allValue": "(.*)",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "query_result(caretta_links_observed)",
+            "includeAll": true,
+            "multi": true,
+            "name": "namespace",
+            "options": [],
+            "query": {
+              "query": "query_result(caretta_links_observed)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 1,
+            "regex": "/.*_namespace=\"([^\"]*).*/",
+            "regexApplyTo": "value",
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "allValue": "(.*)",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "query_result(caretta_links_observed)",
+            "includeAll": true,
+            "multi": true,
+            "name": "kind",
+            "options": [],
+            "query": {
+              "query": "query_result(caretta_links_observed)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 1,
+            "regex": "/.*_kind=\"([^\"]*).*/",
+            "regexApplyTo": "value",
+            "type": "query"
+          },
+          {
+            "allValue": "(.*)",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "query_result(caretta_links_observed)",
+            "includeAll": true,
+            "label": "workload",
+            "multi": true,
+            "name": "workload",
+            "options": [],
+            "query": {
+              "query": "query_result(caretta_links_observed)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 2,
+            "regex": "/.*_name=\"([^\"]*).*/",
+            "regexApplyTo": "value",
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "allValue": "(.*)",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(server_port)",
+            "includeAll": true,
+            "label": "server port",
+            "multi": true,
+            "name": "port",
+            "options": [],
+            "query": {
+              "query": "label_values(server_port)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 1,
+            "regex": "",
+            "regexApplyTo": "value",
+            "type": "query"
+          },
+          {
+            "allValue": ".*",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(caretta_k8s_events_total, namespace)",
+            "includeAll": true,
+            "label": "event namespace",
+            "multi": true,
+            "name": "evt_namespace",
+            "options": [],
+            "query": {
+              "query": "label_values(caretta_k8s_events_total, namespace)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 2,
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "allValue": ".*",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(caretta_k8s_events_total, type)",
+            "includeAll": true,
+            "label": "event type",
+            "multi": true,
+            "name": "evt_type",
+            "options": [],
+            "query": {
+              "query": "label_values(caretta_k8s_events_total, type)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 2,
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "allValue": ".*",
+            "current": {
+              "text": "All",
+              "value": [
+                "$__all"
+              ]
+            },
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(caretta_k8s_events_total, reason)",
+            "includeAll": true,
+            "label": "event reason",
+            "multi": true,
+            "name": "evt_reason",
+            "options": [],
+            "query": {
+              "query": "label_values(caretta_k8s_events_total, reason)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 2,
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {
+        "from": "now-5m",
+        "to": "now"
+      },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Caretta Dashboard",
+      "uid": "k0Om62pVf",
+      "version": 72,
+      "weekStart": ""
+    }

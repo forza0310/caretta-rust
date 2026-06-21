@@ -6,22 +6,22 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-caretta-k8s-core = { path = "../caretta-k8s-core" }
+caretta-k8s-core = { path = "../../crates/caretta-k8s-core" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
-once_cell = "1.20.2"
-prometheus = "0.13.4"
+once_cell = { workspace = true }
+prometheus = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
 lru = "0.12"
-arc-swap = "1.7"
+arc-swap = { workspace = true }
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
 async-trait = "0.1"
 tokio = { workspace = true, features = [

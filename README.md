@@ -1,6 +1,6 @@
 # Caretta Rust
 
-本项目是基于 Rust + aya + tokio 的 eBPF 网络探针实现，对齐 caretta-go 的核心能力，并保持 cargo run 可直接启动。
+本项目是基于 Rust + aya + tokio 的 Kubernetes 可观测性探针,含两个采集器:eBPF 网络连接探针(`network/`,特权 DaemonSet)与 K8s 事件采集器(`k8s-state/`,单实例 Deployment)。
 
 ## 当前能力总览
 
@@ -17,6 +17,9 @@
 - 可观测性
 	- Prometheus 指标端点
 	- Resolver 调试端点
+- K8s 事件采集(k8s-state)
+	- watch Events,按 (namespace, type, reason, workload) 聚合为 `caretta_k8s_events_total`
+	- involvedObject 上卷到 workload,复用 caretta-k8s-core 的 owner 逻辑
 
 ## 环境要求
 
@@ -24,7 +27,7 @@
   `bpf_get_socket_cookie()`,这是 sock 复用 race 修复的关键 helper。
 - 内核启用 `CONFIG_DEBUG_INFO_BTF=y`,5.5+ 主流发行版默认开。
 - 容器化部署需要把 host 的 `/sys/kernel/btf` 挂入容器(用于 vmlinux BTF 解析,见
-  [deploy/caretta-rust-k8s.yaml](deploy/caretta-rust-k8s.yaml))。
+  [deploy/caretta.yaml](deploy/caretta.yaml))。
 
 ## 运行方式
 
@@ -38,34 +41,11 @@
 - 指标端点: http://127.0.0.1:7117/metrics
 - 调试端点: 按环境变量控制，默认关闭
 
-## 镜像构建与 GHCR 发布
-
-仓库已提供：
-
-- Dockerfile: [Dockerfile](Dockerfile)
-- GitHub Actions: [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)
-
-触发方式：
-
-- push 到 master 分支
-- push 版本 tag（例如 v0.1.0）
-- 手动触发 workflow_dispatch
-
-发布地址：
-
-- ghcr.io/<owner>/<repo>
-
-例如当前仓库通常会发布到：
-
-- ghcr.io/forza0310/caretta-rust
-
-注意：
-
-- workflow 使用 GitHub 自带的 GITHUB_TOKEN 推送 ghcr，需要仓库允许 packages:write。
-- CI 只负责调用 Docker build 并推送镜像到 GHCR；Rust 编译与 eBPF 构建都在 Dockerfile 的 builder 阶段完成。
-- Dockerfile 使用 nightly + rust-src 构建，并在构建结束后只保留运行时镜像中的最终二进制。
+`cargo run` 默认运行 network 采集器;运行事件采集器用 `cargo run -p caretta-k8s-state`(默认 7118)。
 
 ## 端点说明
+
+以下端点均为 network 采集器(默认 7117)。k8s-state 采集器(默认 7118)只暴露 `/metrics`,无调试端点。
 
 ### 1) /metrics
 
@@ -120,15 +100,9 @@ scrape_configs:
 
 ### 3) 导入 dashboard
 
-- 这份 Rust 版和 caretta-go 保持了核心指标名一致，主要包括 caretta_links_observed 和 caretta_tcp_states
-- 可以直接参考 caretta-go/chart/dashboard.json 的面板定义，迁移时重点核对查询里的标签名是否与当前部署一致
-- 如果你是想快速验证，先在 Grafana Explore 里查 caretta_links_observed，再逐步导入 node graph 和 throughput 面板
-
-### 4) 排查建议
-
-- 先确认 /metrics 有数据，再看 Prometheus Targets 是否是 Up
-- 如果 Grafana 面板是空的，优先检查 job label、metrics_path 和 scrape_interval 是否匹配
-- 如果看不到外部流量名称，确认 RESOLVE_DNS 是否开启，以及 DNS 解析是否成功
+- 仓库已自带 dashboard:[deploy/caretta-grafana-dashboard-configmap.yaml](deploy/caretta-grafana-dashboard-configmap.yaml),含网络面板与 K8s 事件面板,`kubectl apply` 后由 Grafana sidecar 自动加载
+- 核心指标:网络 `caretta_links_observed` / `caretta_tcp_states`,事件 `caretta_k8s_events_total`
+- 快速验证:先在 Grafana Explore 查 `caretta_links_observed` 确认有数据,再看完整面板
 
 ## 环境变量
 
@@ -220,7 +194,7 @@ external 回退行为:
 
 | 维度 | caretta-go 行为 | Rust 版改进 |
 |---|---|---|
-| BTF 守护(手写 parser + size 校验) | BTF 全外包 cilium/ebpf,内核改 `sock_common` 字段宽度自己默默吃下去;eBPF 端用 `bpf_core_read(&out, sizeof(out), ...)`,sizeof 走用户结构体编译期常量,运行时可能把高字节吃进 IP 跑出垃圾 | 手写最小 BTF parser([src/btf/](caretta/src/btf/) 共 ~800 行 + 9 个单测覆盖魔数 / 字段缺失 / size 漂移 / typedef 链 / 匿名嵌套展平);`parse_sock_offsets` 把每字段期望 size 一并传给 `read_struct_field_offsets`,size 不匹配启动直接 fail —— 内核 ABI 变了启动期就看见 |
+| BTF 守护(手写 parser + size 校验) | BTF 全外包 cilium/ebpf,内核改 `sock_common` 字段宽度自己默默吃下去;eBPF 端用 `bpf_core_read(&out, sizeof(out), ...)`,sizeof 走用户结构体编译期常量,运行时可能把高字节吃进 IP 跑出垃圾 | 手写最小 BTF parser([src/btf/](network/caretta/src/btf/) 共 ~800 行 + 9 个单测覆盖魔数 / 字段缺失 / size 漂移 / typedef 链 / 匿名嵌套展平);`parse_sock_offsets` 把每字段期望 size 一并传给 `read_struct_field_offsets`,size 不匹配启动直接 fail —— 内核 ABI 变了启动期就看见 |
 | 整数溢出兜底 | 用户态裸 `+=` 累加 uint64,wrap 后归零触发 Counter reset,PromQL `rate()` 失真(eBPF 端 Go 是 snapshot 读 kernel `tcp_sock` 累计字段,无此问题) | eBPF 端 per-event 累加与用户态聚合 / per-CPU merge 全走 `saturating_add`,钳在 `u64::MAX`,Counter 单调性永远成立 |
 | RBAC 最小权限 | ClusterRole 授了 ~25-30 种独立资源(configmaps / endpoints / sa / pods/log / events / bindings / networkpolicies / metrics.k8s.io 等),业务侧绝大多数不用 | 只 9 种资源(pods / services / nodes + apps 4 种 + batch 2 种),全 `get/list/watch`,DaemonSet 容器 escape 攻击面也只这一小块 |
 

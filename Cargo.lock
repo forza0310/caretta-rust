@@ -283,6 +283,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "caretta-k8s-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "caretta-k8s-core",
+ "clap",
+ "env_logger",
+ "futures-util",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "once_cell",
+ "prometheus",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "cargo-platform"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

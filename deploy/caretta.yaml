@@ -1,0 +1,204 @@
+# caretta 部署清单:两个镜像、各自最小权限 RBAC。
+#   - 段一 caretta-rust:特权 eBPF DaemonSet(网络连接采集,hostNetwork,7117)
+#   - 段二 caretta-k8s-state:非特权单实例 Deployment(K8s Event 采集,ClusterIP,7118)
+# 共用 caretta-k8s-core,但运行形态与权限刻意分离。
+#
+# ===== 镜像1:eBPF DaemonSet =====
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caretta-rust
+  labels:
+    app: caretta-rust
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: caretta-rust
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: caretta-rust
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: caretta-rust
+subjects:
+  - kind: ServiceAccount
+    name: caretta-rust
+    namespace: default
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: caretta-rust
+  labels:
+    app: caretta-rust
+spec:
+  selector:
+    matchLabels:
+      app: caretta-rust
+  template:
+    metadata:
+      labels:
+        app: caretta-rust
+    spec:
+      serviceAccountName: caretta-rust
+      # Use hostNetwork so the agent runs in the node network namespace and can observe
+      # host-level socket activity consistently for eBPF-based tracing.
+      # This also exposes port 7117 directly on each node IP, rather than through
+      # an in-cluster ClusterIP Service.
+      hostNetwork: true
+      # Keep cluster DNS resolution while using host network namespace.
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: caretta-rust
+          image: ghcr.io/forza0310/caretta-rust-network:master
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: PROMETHEUS_PORT
+              value: "7117"
+            - name: PROMETHEUS_ENDPOINT
+              value: "/metrics"
+            - name: RESOLVE_DNS
+              value: "true"
+            - name: DNS_CACHE_SIZE
+              value: "10000"
+            - name: MAX_LINKS
+              value: "100000"
+            - name: DEBUG_RESOLVER_ENABLED
+              value: "false"
+            - name: DEBUG_RESOLVER_ENDPOINT
+              value: "/debug/resolver"
+            - name: TRAVERSE_UP_HIERARCHY
+              value: "true"
+          ports:
+            - name: metrics
+              containerPort: 7117
+          volumeMounts:
+            - name: vmlinux-btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: vmlinux-btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+---
+# ===== 镜像2:K8s Event 单实例 collector =====
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caretta-k8s-state
+  labels:
+    app: caretta-k8s-state
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: caretta-k8s-state
+rules:
+  # events:本采集器的主数据源。pods + 控制器:用于把 involvedObject 上卷到 workload。
+  - apiGroups: [""]
+    resources: ["events", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: caretta-k8s-state
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: caretta-k8s-state
+subjects:
+  - kind: ServiceAccount
+    name: caretta-k8s-state
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caretta-k8s-state
+  labels:
+    app: caretta-k8s-state
+spec:
+  # 单实例:Event 是 cluster 级数据,多副本会重复计数。
+  replicas: 1
+  selector:
+    matchLabels:
+      app: caretta-k8s-state
+  template:
+    metadata:
+      labels:
+        app: caretta-k8s-state
+    spec:
+      serviceAccountName: caretta-k8s-state
+      containers:
+        - name: caretta-k8s-state
+          image: ghcr.io/forza0310/caretta-rust-k8s-state:master
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PROMETHEUS_PORT
+              value: "7118"
+            - name: PROMETHEUS_ENDPOINT
+              value: "/metrics"
+            - name: REFRESH_INTERVAL
+              value: "30"
+            - name: TRAVERSE_UP_HIERARCHY
+              value: "true"
+          ports:
+            - name: metrics
+              containerPort: 7118
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caretta-k8s-state
+  labels:
+    app: caretta-k8s-state
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "7118"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: caretta-k8s-state
+  ports:
+    - name: metrics
+      port: 7118
+      targetPort: 7118

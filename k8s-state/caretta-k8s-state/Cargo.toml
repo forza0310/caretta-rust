@@ -1,0 +1,35 @@
+[package]
+name = "caretta-k8s-state"
+version = "0.1.0"
+edition.workspace = true
+
+license.workspace = true
+
+[dependencies]
+caretta-k8s-core = { path = "../../crates/caretta-k8s-core" }
+
+anyhow = { workspace = true, default-features = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+prometheus = { workspace = true }
+once_cell = { workspace = true }
+arc-swap = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[[bin]]
+name = "caretta-k8s-state"
+path = "src/main.rs"

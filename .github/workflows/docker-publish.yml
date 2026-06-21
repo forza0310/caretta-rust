@@ -16,6 +16,16 @@ jobs:
   docker:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        include:
+          # eBPF DaemonSet 镜像。
+          - dockerfile: ./network/Dockerfile
+            suffix: "-network"
+          # 单实例 K8s 控制面 collector 镜像。
+          - dockerfile: ./k8s-state/Dockerfile
+            suffix: "-k8s-state"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,7 +44,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}${{ matrix.suffix }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -44,7 +54,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
