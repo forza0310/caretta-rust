@@ -89,6 +89,27 @@ fn enforce_max_links(links: &mut HashMap<NetworkLink, LinkState>, max_links: usi
     }
 }
 
+/// tcp_states 的硬性容量上限,与 enforce_max_links 对称。
+///
+/// 淘汰优先级:missed_ticks 越大越接近自然 GC,优先踢掉。
+fn enforce_max_tcp_states(tcp_states: &mut HashMap<TcpConnectionKey, TcpState>, max: usize) {
+    if tcp_states.len() <= max {
+        return;
+    }
+
+    let mut by_staleness: Vec<(TcpConnectionKey, u32)> = tcp_states
+        .iter()
+        .map(|(key, state)| (key.clone(), state.missed_ticks))
+        .collect();
+    // missed_ticks 降序:最久没出现的排前面,先被淘汰。
+    by_staleness.sort_unstable_by_key(|(_, missed)| std::cmp::Reverse(*missed));
+
+    for (key, _) in by_staleness.into_iter().take(tcp_states.len() - max) {
+        metrics::forget_tcp(&key);
+        tcp_states.remove(&key);
+    }
+}
+
 fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
     // 加载内核暴露的 vmlinux BTF。fentry / tp_btf 程序在 verifier attach 时需要 kernel
     // BTF 做 type 检查;同一份 BTF 我们启动期也用来解 sock_common 字段偏移。
@@ -462,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 });
+                enforce_max_tcp_states(&mut tcp_states, opt.max_tcp_states);
             }
         }
     }
@@ -480,4 +502,66 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::types::Workload;
+    use super::*;
+
+    fn mk_key(n: u32) -> TcpConnectionKey {
+        TcpConnectionKey {
+            client: Workload {
+                name: format!("c{n}"),
+                namespace: "ns".into(),
+                kind: "Pod".into(),
+                owner: String::new(),
+            },
+            server: Workload {
+                name: format!("s{n}"),
+                namespace: "ns".into(),
+                kind: "Pod".into(),
+                owner: String::new(),
+            },
+            server_port: 80,
+            role: 0,
+        }
+    }
+
+    fn mk_state(key: &TcpConnectionKey, missed: u32) -> TcpState {
+        TcpState {
+            last_seen_conn: TcpConnection {
+                client: key.client.clone(),
+                server: key.server.clone(),
+                server_port: key.server_port,
+                role: key.role,
+                state: 0,
+            },
+            missed_ticks: missed,
+        }
+    }
+
+    #[test]
+    fn evicts_stalest_first_down_to_cap() {
+        // 5 条,missed_ticks = 0,1,2,3,4;cap=2 → 删 missed_ticks 最大的 3 条(2,3,4),留 0 和 1。
+        let mut map: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
+        let keys: Vec<_> = (0..5).map(mk_key).collect();
+        for (i, k) in keys.iter().enumerate() {
+            map.insert(k.clone(), mk_state(k, i as u32));
+        }
+        enforce_max_tcp_states(&mut map, 2);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&keys[0])); // missed=0 保留
+        assert!(map.contains_key(&keys[1])); // missed=1 保留
+        assert!(!map.contains_key(&keys[4])); // missed=4 被删
+    }
+
+    #[test]
+    fn noop_when_under_cap() {
+        let mut map: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
+        let k = mk_key(0);
+        map.insert(k.clone(), mk_state(&k, 0));
+        enforce_max_tcp_states(&mut map, 10);
+        assert_eq!(map.len(), 1);
+    }
 }

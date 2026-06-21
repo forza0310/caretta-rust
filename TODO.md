@@ -92,11 +92,17 @@
     - 毒化锁直接 `into_inner()` 复用 guard:inflight 语义本是"尽力去重",毒化无害。这一步顺手解了一个 trait 检查问题——`match self.inflight.lock() { Err(_) => ... await ... }` 即使 Err arm 用 `_` 也算隐式持有 PoisonError 内的 MutexGuard 跨 await,把外层 future 拽成 !Send,k8s.rs / static_resolver.rs 的 `resolve_ip` 全部编译失败
   - 余项：暂无
 
-- [ ] **C. `tcp_states` 无硬性容量上限**
+- [x] **C. `tcp_states` 无硬性容量上限**
   - 位置：`caretta/src/main.rs` 主循环
-  - 现状：`links` 有 `LINK_GC_TTL` + `enforce_max_links` 双保护；`tcp_states` 只有 `TCP_GC_MISSED_TICKS`（12 ticks）软 GC，无硬上限
+  - 原状：`links` 有 `LINK_GC_TTL` + `enforce_max_links` 双保护；`tcp_states` 只有 `TCP_GC_MISSED_TICKS`（12 ticks）软 GC，无硬上限
   - 极端场景：50k conn/s × 12 ticks × 5s ≈ 3M 条目 × 2 个 `Workload` 深拷贝 → OOM
-  - 建议：加 `MAX_TCP_STATES` 配置；超限按 missed_ticks 降序或优先淘汰已 CLOSED
+  - 已做：
+    - 新增 `enforce_max_tcp_states`,镜像 `enforce_max_links`:超限时按 `missed_ticks` 降序淘汰(最接近自然 GC 的优先踢),`forget_tcp` 删 series 后再 `remove`
+    - 在 TCP 软 GC(`tcp_states.retain`)之后调用,与 `links` 的「TTL retain → 硬上限」结构对称
+    - 配置三件套对齐 `max_links`:`DEFAULT_MAX_TCP_STATES=100000` + clap `--max-tcp-states` + `MAX_TCP_STATES` env 覆盖
+    - main.rs 新引入 `#[cfg(test)]` 模块,2 个单测覆盖淘汰顺序与未超限 no-op
+    - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 .cargo runner 的 sudo)
+  - 余项：clone+sort 性能优化归 #D,本次保持与 `links` 路径一致,不动数据结构
 
 - [ ] **D. `enforce_max_links` 每 tick 全量克隆 + 排序**
   - 位置：`caretta/src/main.rs::enforce_max_links`
@@ -188,6 +194,6 @@
 | P0 | #2（watch RV / 410 / 退避） | 一个集中改动 |
 | P1 | #3（watch supervisor）/ #4（forget 错误分流） | 中等 |
 | P1 | A（并发 list）/ B（single-flight DNS） | 中等，性能收益显著 |
-| P2 | C / D / E（容量 / 排序 / String 分配） | 配置或重构 |
+| P2 | C（已处理）/ D / E（容量 / 排序 / String 分配） | 配置或重构 |
 | P2 | F / H | 小 |
 | P3 | K / L / M-T | 重构，逐步推 |

@@ -12,6 +12,7 @@ const DEFAULT_DEBUG_RESOLVER_ENABLED: bool = false;
 const DEFAULT_RESOLVE_DNS: bool = true;
 const DEFAULT_DNS_CACHE_SIZE: usize = 10000;
 const DEFAULT_MAX_LINKS: usize = 100000;
+const DEFAULT_MAX_TCP_STATES: usize = 100000;
 const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
 const DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST: &str = "";
 const DEFAULT_OWNER_KIND_PRIORITY: &str = "";
@@ -34,6 +35,8 @@ pub struct Opt {
     pub dns_cache_size: usize,
     #[clap(long, default_value_t = DEFAULT_MAX_LINKS)]
     pub max_links: usize,
+    #[clap(long, default_value_t = DEFAULT_MAX_TCP_STATES)]
+    pub max_tcp_states: usize,
     #[clap(long, default_value_t = DEFAULT_TRAVERSE_UP_HIERARCHY)]
     pub traverse_up_hierarchy: bool,
     #[clap(long, default_value = DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST)]
@@ -105,6 +108,12 @@ impl Opt {
             match v.parse::<usize>() {
                 Ok(size) => opt.max_links = size.max(1),
                 Err(_) => Self::warn_invalid_env("MAX_LINKS", &v, "usize"),
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_TCP_STATES") {
+            match v.parse::<usize>() {
+                Ok(size) => opt.max_tcp_states = size.max(1),
+                Err(_) => Self::warn_invalid_env("MAX_TCP_STATES", &v, "usize"),
             }
         }
         if let Ok(v) = std::env::var("TRAVERSE_UP_HIERARCHY") {
