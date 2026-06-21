@@ -104,10 +104,17 @@
     - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 .cargo runner 的 sudo)
   - 余项：clone+sort 性能优化归 #D,本次保持与 `links` 路径一致,不动数据结构
 
-- [ ] **D. `enforce_max_links` 每 tick 全量克隆 + 排序**
-  - 位置：`caretta/src/main.rs::enforce_max_links`
-  - 现状：`links.iter().map(|(link, state)| (link.clone(), state.last_active)).collect()` → 100k links × 4 个 String/link → 400k 次 String alloc + O(n log n) sort
-  - 建议：`BinaryHeap` 维护最近 N 个最久未活跃；或 `links` 直接换 `BTreeMap<Instant, NetworkLink>` 索引
+- [x] **D. `enforce_max_links` 每 tick 全量克隆 + 排序**
+  - 位置：`caretta/src/main.rs::enforce_max_links`（已迁出至 `caretta/src/tables.rs`）
+  - 原状：`links.iter().map(|(link, state)| (link.clone(), state.last_active)).collect()` → 100k links × 4 个 String/link → 400k 次 String alloc + O(n log n) sort；`tcp_states` 的 `enforce_max_tcp_states` 同病。link TTL-GC 与 tcp 软-GC 也是每 tick 全表 `retain` 扫描 O(n)。
+  - 已做：
+    - 新建 `src/tables.rs`,把两张表封装成 `LinkTable` / `TcpTable`:主存仍是 `HashMap`,旁挂一个按淘汰键排序的 `BTreeMap<键, HashSet<key>>` 二级索引(同 tick 撞键,故桶用 HashSet)。淘汰 / TTL-GC / 软-GC 都从索引最旧端弹出,降到 O(被删条数)。
+    - tcp 的 `missed_ticks` 计数器改成 `last_seen_tick` 时间戳:原计数器每 tick 给所有空闲条目 +1、索引键全表变动,BTreeMap 无收益;改存"上次出现的 tick 序号"后只有本 tick 见到的条目动键。GC 判据 `current_tick - last_seen_tick > N` 与原 `missed_ticks > N` 逐 tick 等价,仍是 tick 计数、不受 poll_interval 影响。
+    - main.rs 主循环接入新表(`touch` / `observe` / `gc_older_than` / `gc_stale` / `enforce_max`),删掉两个内联 `enforce_max_*` fn、`LinkState`/`TcpState` struct 与 `tcp_seen_this_tick` set;新增单调 `tick` 计数器。
+    - tables.rs 加 9 个行为级单测(累加/迁桶/TTL-GC/硬上限淘汰顺序/索引与主存计数一致);重写 `tests/state_table_gc.rs` 的 grep 断言钉住新 wiring(`gc_older_than`/`gc_stale`/`enforce_max`/tables.rs 内的 `BTreeMap`+`forget_*`)。
+    - 行为完全保持:GC 时机、淘汰顺序(最旧/最 stale 优先)、prometheus series 清理都与改造前逐 tick 等价,不碰对外指标/eBPF/ABI。
+    - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 .cargo runner 的 sudo);未新增 clippy warning。
+  - 余项：二级索引复制一份 key,稳态内存约翻倍(受 max_links/max_tcp_states 上限约束,有界)。日后若顾虑内存可改 `Arc<key>` 共享,本次不做(项 E 顺带可一并优化 String 分配)。
 
 - [ ] **E. `link_label_values` / `tcp_label_values` 每条 link 14 个 String 分配**
   - 位置：`caretta/src/metrics.rs::link_label_values`
@@ -194,6 +201,6 @@
 | P0 | #2（watch RV / 410 / 退避） | 一个集中改动 |
 | P1 | #3（watch supervisor）/ #4（forget 错误分流） | 中等 |
 | P1 | A（并发 list）/ B（single-flight DNS） | 中等，性能收益显著 |
-| P2 | C（已处理）/ D / E（容量 / 排序 / String 分配） | 配置或重构 |
+| P2 | C（已处理）/ D（已处理）/ E（容量 / 排序 / String 分配） | 配置或重构 |
 | P2 | F / H | 小 |
 | P3 | K / L / M-T | 重构，逐步推 |

@@ -3,13 +3,14 @@
 //! 旧 bug:`links` / `tcp_states` 没有 GC,长跑下来进程内存 + Prometheus
 //! cardinality 双向泄漏。修复后必须保住:
 //!   - 非零 GC 常量(零 TTL 等于"立刻过期"或"永不过期",都还原成 bug);
-//!   - poll loop 真的调 forget_link / forget_tcp + retain 兜底;
+//!   - poll loop 真的跑 link TTL-GC(gc_older_than)与 tcp 软-GC(gc_stale);
+//!   - 两张表(tables.rs)用 BTreeMap 二级索引做淘汰,调 forget_link / forget_tcp 清 series;
 //!   - links 表有可配置硬上限,超限按 last_active 淘汰最老 entry;
 //!   - forget_* 同时清 series 和差分基准 LAST_LINK_TOTALS(只清一边等于没清);
 //!   - produce 路径和 forget 路径用同一个 label 构造 helper(防漂移);
 //!   - last_active 只刷新本 tick 真见到的 link,不能刷 cumulative 合并视图里的死 link。
 //!
-//! 行为正确性由 metrics.rs 的 unit tests 覆盖,这里专门钉源码层 wiring。
+//! 行为正确性由 metrics.rs 与 tables.rs 的 unit tests 覆盖,这里专门钉源码层 wiring。
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,25 +45,29 @@ fn should_define_nonzero_gc_constants_for_link_and_tcp() {
 
 #[test]
 fn should_invoke_forget_helpers_during_poll_loop_gc() {
-    let src = read("caretta/src/main.rs");
+    let tables_src = read("caretta/src/tables.rs");
+    let main_src = read("caretta/src/main.rs");
 
+    // forget_* 现在收口在 tables.rs 的淘汰/GC 私有路径里。
     assert!(
-        src.contains("metrics::forget_link("),
-        "poll loop must call metrics::forget_link to clean up expired link series"
+        tables_src.contains("metrics::forget_link("),
+        "tables module must call metrics::forget_link to clean up expired link series"
     );
     assert!(
-        src.contains("metrics::forget_tcp("),
-        "poll loop must call metrics::forget_tcp to clean up stale tcp series"
+        tables_src.contains("metrics::forget_tcp("),
+        "tables module must call metrics::forget_tcp to clean up stale tcp series"
     );
+    // poll loop 必须真的驱动两张表的 GC。
     assert!(
-        src.contains("links.retain(") && src.contains("tcp_states.retain("),
-        "poll loop must run retain-based GC on both state tables"
+        main_src.contains("links.gc_older_than(") && main_src.contains("tcp_states.gc_stale("),
+        "poll loop must run index-based GC on both state tables"
     );
 }
 
 #[test]
 fn should_cap_link_state_table_by_configured_max_links() {
     let main_src = read("caretta/src/main.rs");
+    let tables_src = read("caretta/src/tables.rs");
     let config_src = read("caretta/src/config.rs");
 
     assert!(
@@ -71,17 +76,20 @@ fn should_cap_link_state_table_by_configured_max_links() {
             && config_src.contains("MAX_LINKS"),
         "config should expose MAX_LINKS as a positive env/CLI setting"
     );
+    // 淘汰逻辑改用 BTreeMap 二级索引,从最旧端弹出,不再全表 clone+sort。
     assert!(
-        main_src.contains("fn enforce_max_links(")
-            && main_src.contains("sort_unstable_by_key")
-            && main_src.contains("state.last_active")
-            && main_src.contains("metrics::forget_link(&link)")
-            && main_src.contains("links.remove(&link)"),
-        "poll loop should evict oldest links and clear prometheus state when max_links is exceeded"
+        tables_src.contains("BTreeMap")
+            && tables_src.contains("fn enforce_max(")
+            && tables_src.contains("metrics::forget_link("),
+        "tables module should evict oldest links via a sorted index and clear prometheus state"
     );
     assert!(
-        main_src.contains("enforce_max_links(&mut links, opt.max_links)"),
+        main_src.contains("links.enforce_max(opt.max_links)"),
         "poll loop should apply max_links after normal TTL GC"
+    );
+    assert!(
+        main_src.contains("tcp_states.enforce_max(opt.max_tcp_states)"),
+        "poll loop should apply max_tcp_states after tcp soft GC"
     );
 }
 

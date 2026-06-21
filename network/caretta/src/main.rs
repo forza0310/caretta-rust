@@ -9,6 +9,7 @@ mod http_server;
 mod metrics;
 mod per_cpu;
 mod resolver;
+mod tables;
 mod types;
 
 use anyhow::Context as _;
@@ -24,12 +25,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tables::{LinkTable, TcpTable};
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
+    aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
     reduce_connection_to_tcp,
 };
 
@@ -52,63 +54,6 @@ const LINK_GC_TTL: Duration = Duration::from_secs(300);
 /// 这里取 12 个 tick（默认 poll 1s ≈ 12s 没出现就删）。tick 数而不是绝对时间是因为
 /// poll_interval 可配置。
 const TCP_GC_MISSED_TICKS: u32 = 12;
-
-/// past_links 表里每条 link 的状态。
-struct LinkState {
-    /// 自启动以来这条 link 的累计字节数（活着的 + 已死亡部分）。
-    /// 每次 poll 用它合并出 current_links。
-    cumulative_bytes: u64,
-    /// 最近一次"还在产生流量"的时间。GC 用 now() - last_active > TTL 判定回收。
-    /// 任何让 cumulative_bytes 变大的写入都要刷新这里。
-    last_active: Instant,
-}
-
-/// tcp_states 表里每条连接的 GC 状态。
-struct TcpState {
-    /// 上一次在本 tick 看到这条连接时的 TcpConnection 快照——GC 时需要拿它去删 series。
-    /// 也用于在 main loop 里 push 到 current_tcp_connections 上报。
-    last_seen_conn: TcpConnection,
-    /// 自上次出现以来连续没出现的 tick 数；超过 TCP_GC_MISSED_TICKS 就 forget。
-    missed_ticks: u32,
-}
-
-fn enforce_max_links(links: &mut HashMap<NetworkLink, LinkState>, max_links: usize) {
-    if links.len() <= max_links {
-        return;
-    }
-
-    let mut by_age: Vec<(NetworkLink, Instant)> = links
-        .iter()
-        .map(|(link, state)| (link.clone(), state.last_active))
-        .collect();
-    by_age.sort_unstable_by_key(|(_, last_active)| *last_active);
-
-    for (link, _) in by_age.into_iter().take(links.len() - max_links) {
-        metrics::forget_link(&link);
-        links.remove(&link);
-    }
-}
-
-/// tcp_states 的硬性容量上限,与 enforce_max_links 对称。
-///
-/// 淘汰优先级:missed_ticks 越大越接近自然 GC,优先踢掉。
-fn enforce_max_tcp_states(tcp_states: &mut HashMap<TcpConnectionKey, TcpState>, max: usize) {
-    if tcp_states.len() <= max {
-        return;
-    }
-
-    let mut by_staleness: Vec<(TcpConnectionKey, u32)> = tcp_states
-        .iter()
-        .map(|(key, state)| (key.clone(), state.missed_ticks))
-        .collect();
-    // missed_ticks 降序:最久没出现的排前面,先被淘汰。
-    by_staleness.sort_unstable_by_key(|(_, missed)| std::cmp::Reverse(*missed));
-
-    for (key, _) in by_staleness.into_iter().take(tcp_states.len() - max) {
-        metrics::forget_tcp(&key);
-        tcp_states.remove(&key);
-    }
-}
 
 fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
     // 加载内核暴露的 vmlinux BTF。fentry / tp_btf 程序在 verifier attach 时需要 kernel
@@ -269,11 +214,14 @@ async fn main() -> anyhow::Result<()> {
     // LAST_LINK_TOTALS 和 LINKS_METRICS 的 prometheus series。GC 用
     // LINK_GC_TTL 给一条 link 没活动后 N 分钟的宽限，过期后调 metrics::forget_link
     // 一并清掉所有相关状态。
-    let mut links: HashMap<NetworkLink, LinkState> = HashMap::new();
+    let mut links = LinkTable::new();
 
     // TCP series 生命周期跟踪：记录"每条连接最近 N 个 tick 的可见性"，连续 missed_ticks > 阈值就调
     // metrics::forget_tcp 把 series 真正从注册表里抠掉。
-    let mut tcp_states: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
+    let mut tcp_states = TcpTable::new();
+
+    // 单调递增的 tick 序号:作为 tcp_states 软-GC 的时间基准(见 TcpTable::gc_stale)。
+    let mut tick: u64 = 0;
 
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip); // 不在压力大时堆积过多 tick，反正每个 tick 都是全量扫描。
@@ -288,15 +236,13 @@ async fn main() -> anyhow::Result<()> {
             _ = ticker.tick() => {
                 metrics::mark_poll();
                 let now = Instant::now();
+                tick += 1;
 
                 let mut current_links: HashMap<NetworkLink, u64> = HashMap::new();
                 // 本 tick 在 eBPF map 里实际见到（活跃或刚关闭）的 link 集合——只有
                 // 这些 link 在 GC 端会被刷新 last_active。已经从 eBPF map 消失、仅靠
                 // past 累计值留在 links 表里的 link 不在此集合中，它们会自然老化。
                 let mut link_seen_this_tick: std::collections::HashSet<NetworkLink> =
-                    std::collections::HashSet::new();
-                // 本 tick 看到的 TCP 连接 key 集合——GC 用它来增 missed_ticks 计数。
-                let mut tcp_seen_this_tick: std::collections::HashSet<TcpConnectionKey> =
                     std::collections::HashSet::new();
                 let mut current_tcp_connections: Vec<TcpConnection> = Vec::new();
                 let mut to_delete: Vec<ConnectionIdentifier> = Vec::new();
@@ -360,7 +306,6 @@ async fn main() -> anyhow::Result<()> {
                     let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     *current_links.entry(link.clone()).or_insert(0) += bytes;
                     link_seen_this_tick.insert(link);
-                    tcp_seen_this_tick.insert(TcpConnectionKey::from(&tcp));
                     current_tcp_connections.push(tcp);
                 }
 
@@ -371,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
                 // 不写——last_active 不在这里刷新，否则一条死了一小时的 link 仍会每
                 // tick 被"复活"，GC 永远不触发。真正活着的证据只有两条：本 tick 在
                 // eBPF map 里看到（link_seen_this_tick），或被加入 to_delete（下面）。
-                for (past_link, past_state) in &links {
+                for (past_link, past_state) in links.iter() {
                     *current_links.entry(past_link.clone()).or_insert(0) +=
                         past_state.cumulative_bytes;
                 }
@@ -409,13 +354,8 @@ async fn main() -> anyhow::Result<()> {
 
                     if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn).await {
                         let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
-                        // 写入即"还活着的证据"——刷新 last_active 让 GC 重新计时。
-                        let entry = links.entry(link).or_insert_with(|| LinkState {
-                            cumulative_bytes: 0,
-                            last_active: now,
-                        });
-                        entry.cumulative_bytes = entry.cumulative_bytes.saturating_add(bytes);
-                        entry.last_active = now;
+                        // 写入即"还活着的证据"——touch 刷新 last_active 让 GC 重新计时。
+                        links.touch(link, now, bytes);
                     }
                     metrics::mark_map_deletion();
                 }
@@ -426,64 +366,27 @@ async fn main() -> anyhow::Result<()> {
                 for (link, throughput) in current_links {
                     metrics::handle_link_metric(&link, throughput);
                     if link_seen_this_tick.contains(&link) {
-                        links
-                            .entry(link)
-                            .and_modify(|s| s.last_active = now)
-                            .or_insert(LinkState {
-                                cumulative_bytes: 0,
-                                last_active: now,
-                            });
+                        links.touch(link, now, 0);
                     }
                 }
 
                 for tcp in current_tcp_connections {
                     metrics::handle_tcp_metric(&tcp);
-                    let key = TcpConnectionKey::from(&tcp);
-                    tcp_states
-                        .entry(key)
-                        .and_modify(|s| {
-                            s.last_seen_conn = tcp.clone();
-                            s.missed_ticks = 0;
-                        })
-                        .or_insert(TcpState {
-                            last_seen_conn: tcp,
-                            missed_ticks: 0,
-                        });
+                    tcp_states.observe(tcp, tick);
                 }
 
                 // ---- GC: link series ----
                 // 把 last_active 早于 (now - LINK_GC_TTL) 的 link 全部清掉，并同步删除
-                // 它们在 prometheus 注册表 + LAST_LINK_TOTALS 里的状态。
-                let ttl = LINK_GC_TTL;
-                links.retain(|link, state| {
-                    if now.duration_since(state.last_active) > ttl {
-                        metrics::forget_link(link);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                enforce_max_links(&mut links, opt.max_links);
+                // 它们在 prometheus 注册表 + LAST_LINK_TOTALS 里的状态。索引让这步只
+                // 触碰最旧端的过期条目,而非全表扫描。
+                links.gc_older_than(now, LINK_GC_TTL);
+                links.enforce_max(opt.max_links);
 
                 // ---- GC: tcp series ----
-                // 本 tick 没看到的连接 missed_ticks +1；超过阈值的 forget 并从表里抹去。
+                // 连续 (tick - last_seen_tick) > 阈值 的连接 forget 并从表里抹去。
                 // 修问题：connection 被 ebpf map 删除后仍保留 series。
-                tcp_states.retain(|key, state| {
-                    if tcp_seen_this_tick.contains(key) {
-                        // 在本 tick 已被上面的 entry().and_modify() 重置过 missed_ticks
-                        // 与 last_seen_conn——这里只需保留即可。
-                        true
-                    } else {
-                        state.missed_ticks = state.missed_ticks.saturating_add(1);
-                        if state.missed_ticks > TCP_GC_MISSED_TICKS {
-                            metrics::forget_tcp(key);
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                });
-                enforce_max_tcp_states(&mut tcp_states, opt.max_tcp_states);
+                tcp_states.gc_stale(tick, TCP_GC_MISSED_TICKS);
+                tcp_states.enforce_max(opt.max_tcp_states);
             }
         }
     }
@@ -504,64 +407,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::types::Workload;
-    use super::*;
-
-    fn mk_key(n: u32) -> TcpConnectionKey {
-        TcpConnectionKey {
-            client: Workload {
-                name: format!("c{n}"),
-                namespace: "ns".into(),
-                kind: "Pod".into(),
-                owner: String::new(),
-            },
-            server: Workload {
-                name: format!("s{n}"),
-                namespace: "ns".into(),
-                kind: "Pod".into(),
-                owner: String::new(),
-            },
-            server_port: 80,
-            role: 0,
-        }
-    }
-
-    fn mk_state(key: &TcpConnectionKey, missed: u32) -> TcpState {
-        TcpState {
-            last_seen_conn: TcpConnection {
-                client: key.client.clone(),
-                server: key.server.clone(),
-                server_port: key.server_port,
-                role: key.role,
-                state: 0,
-            },
-            missed_ticks: missed,
-        }
-    }
-
-    #[test]
-    fn evicts_stalest_first_down_to_cap() {
-        // 5 条,missed_ticks = 0,1,2,3,4;cap=2 → 删 missed_ticks 最大的 3 条(2,3,4),留 0 和 1。
-        let mut map: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
-        let keys: Vec<_> = (0..5).map(mk_key).collect();
-        for (i, k) in keys.iter().enumerate() {
-            map.insert(k.clone(), mk_state(k, i as u32));
-        }
-        enforce_max_tcp_states(&mut map, 2);
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key(&keys[0])); // missed=0 保留
-        assert!(map.contains_key(&keys[1])); // missed=1 保留
-        assert!(!map.contains_key(&keys[4])); // missed=4 被删
-    }
-
-    #[test]
-    fn noop_when_under_cap() {
-        let mut map: HashMap<TcpConnectionKey, TcpState> = HashMap::new();
-        let k = mk_key(0);
-        map.insert(k.clone(), mk_state(&k, 0));
-        enforce_max_tcp_states(&mut map, 10);
-        assert_eq!(map.len(), 1);
-    }
-}
