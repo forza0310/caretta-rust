@@ -51,6 +51,52 @@ unsafe impl aya::Pod for ConnectionIdentifier {}
 unsafe impl aya::Pod for ConnectionThroughputStats {}
 unsafe impl aya::Pod for SockOffsets {}
 
+// ── ABI 契约:与 eBPF 端镜像结构体逐字节一致 ────────────────────────────────
+// 下面这几个 `#[repr(C)]` 结构体在 `caretta-ebpf/src/main.rs` 里有一份完全相同的
+// 定义:eBPF 程序在内核里按那份布局写 map,用户态在这里按这份布局读同一块字节。
+// Rust 不跨 crate 校验布局——两侧字段类型/顺序/对齐只要错一处,读出来就是错位的
+// 垃圾值,且静默(aya::Pod 只保证可安全 transmute,不保证两侧一致)。
+//
+// 故两侧各放一组编译期断言把 size / align / 每个字段 offset 钉死成同样的字面量。
+// 任何一侧改了字段都会在本侧编译期炸,提示同步另一侧;两侧断言全过 ⇔ 布局相同
+// ⇔ ABI 兼容。改这里的数字前,务必同步 caretta-ebpf 里的同名断言。
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+
+    // ConnectionTuple: src_ip(u32) dst_ip(u32) src_port(u16) dst_port(u16)
+    assert!(size_of::<ConnectionTuple>() == 12);
+    assert!(align_of::<ConnectionTuple>() == 4);
+    assert!(offset_of!(ConnectionTuple, src_ip) == 0);
+    assert!(offset_of!(ConnectionTuple, dst_ip) == 4);
+    assert!(offset_of!(ConnectionTuple, src_port) == 8);
+    assert!(offset_of!(ConnectionTuple, dst_port) == 10);
+
+    // ConnectionIdentifier: pid(u32) tuple(ConnectionTuple) role(u32)
+    assert!(size_of::<ConnectionIdentifier>() == 20);
+    assert!(align_of::<ConnectionIdentifier>() == 4);
+    assert!(offset_of!(ConnectionIdentifier, pid) == 0);
+    assert!(offset_of!(ConnectionIdentifier, tuple) == 4);
+    assert!(offset_of!(ConnectionIdentifier, role) == 16);
+
+    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64)
+    assert!(size_of::<ConnectionThroughputStats>() == 16);
+    assert!(align_of::<ConnectionThroughputStats>() == 8);
+    assert!(offset_of!(ConnectionThroughputStats, bytes_sent) == 0);
+    assert!(offset_of!(ConnectionThroughputStats, bytes_received) == 8);
+
+    // SockOffsets: 4 × u32
+    assert!(size_of::<SockOffsets>() == 16);
+    assert!(align_of::<SockOffsets>() == 4);
+    assert!(offset_of!(SockOffsets, skc_daddr_off) == 0);
+    assert!(offset_of!(SockOffsets, skc_rcv_saddr_off) == 4);
+    assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
+    assert!(offset_of!(SockOffsets, skc_num_off) == 12);
+
+    // role 常量两侧必须同值(eBPF 侧:CONNECTION_ROLE_CLIENT / _SERVER)。
+    assert!(ROLE_CLIENT == 1);
+    assert!(ROLE_SERVER == 2);
+};
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Workload {
     pub name: String,

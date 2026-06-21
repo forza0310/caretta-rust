@@ -169,9 +169,11 @@
   - 进度：**部分缓解**。后续重构已把 watch / owner 逻辑抽到 `crates/caretta-k8s-core` 共享 crate(`owner.rs` 等),`k8s.rs` 从 653 → 563 行。但 caretta crate 内的 `k8s.rs` 本身仍未按建议拆成 `watch.rs` / `snapshot.rs` / `service.rs`,snapshot/service/debug 职责仍同文件。
   - 余项：crate 内文件级拆分待做。
 
-- [ ] **M. eBPF / 用户态结构体双侧定义无 ABI 校验**
-  - 位置：`ConnectionThroughputStats` / `ConnectionIdentifier` / `CONNECTION_ROLE_*`
-  - 建议：`static_assertions::assert_eq_size!` 或 build.rs 时校验
+- [x] **M. eBPF / 用户态结构体双侧定义无 ABI 校验**
+  - 位置：`ConnectionThroughputStats` / `ConnectionIdentifier` / `ConnectionTuple` / `SockOffsets` / `CONNECTION_ROLE_*`
+  - 做法：两侧各加一组 `const _: () = { assert!(...) }` 编译期断言,把每个 `#[repr(C)]` 结构体的 `size_of` / `align_of` / 逐字段 `offset_of!` 钉死成同一组字面量,并校验 `ROLE_CLIENT/SERVER` 常量同值。用户态在 [types.rs](network/caretta/src/types.rs)(Pod impl 之后),eBPF 在 [caretta-ebpf/src/main.rs](network/caretta-ebpf/src/main.rs)(结构体定义之后)。
+  - 为什么不用 `static_assertions::assert_eq_size!`:两 crate 不共享类型(eBPF 是 `no_std` bpf target),无法跨 crate 直接比。改用对称字面量断言 + 交叉引用注释——两侧断言全过 ⇔ 布局相同 ⇔ ABI 兼容,且 `offset_of!` 连字段顺序/对齐都锁住,比只比 size 更强。
+  - 验证:故意把某字段 offset 断言改错,`cargo build` 立即 `E0080: evaluation panicked` 编译失败(已实测);改回即过。零新增 clippy warning,测试全绿。
 
 - [x] **N. `fnv_hash` / `connection_id` 双侧实现**
   - 位置：eBPF + 用户态

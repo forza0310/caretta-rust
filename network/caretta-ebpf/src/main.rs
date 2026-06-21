@@ -60,6 +60,52 @@ pub struct ConnectionThroughputStats {
     pub bytes_received: u64,
 }
 
+// ── ABI 契约:与用户态镜像结构体逐字节一致 ──────────────────────────────────
+// 这几个结构体在 `network/caretta/src/types.rs`(SockOffsets/ConnectionTuple/
+// ConnectionIdentifier)与 `per_cpu.rs`(ConnectionThroughputStats)里有完全相同
+// 的定义。eBPF 端在内核里按这份布局写 map,用户态按那份布局读同一块字节——两侧
+// 字段类型/顺序/对齐错一处就静默读到错位数据。
+//
+// 下面把 size / align / 每个字段 offset 钉死成同样的字面量,与用户态 types.rs 里的
+// 同名断言一一对应。任一侧改字段都会在本侧编译期炸,提示同步另一侧。改这里的数字
+// 前,务必同步 caretta/src/types.rs 的断言。
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    // ConnectionTuple: src_ip(u32) dst_ip(u32) src_port(u16) dst_port(u16)
+    assert!(size_of::<ConnectionTuple>() == 12);
+    assert!(align_of::<ConnectionTuple>() == 4);
+    assert!(offset_of!(ConnectionTuple, src_ip) == 0);
+    assert!(offset_of!(ConnectionTuple, dst_ip) == 4);
+    assert!(offset_of!(ConnectionTuple, src_port) == 8);
+    assert!(offset_of!(ConnectionTuple, dst_port) == 10);
+
+    // ConnectionIdentifier: pid(u32) tuple(ConnectionTuple) role(u32)
+    assert!(size_of::<ConnectionIdentifier>() == 20);
+    assert!(align_of::<ConnectionIdentifier>() == 4);
+    assert!(offset_of!(ConnectionIdentifier, pid) == 0);
+    assert!(offset_of!(ConnectionIdentifier, tuple) == 4);
+    assert!(offset_of!(ConnectionIdentifier, role) == 16);
+
+    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64)
+    assert!(size_of::<ConnectionThroughputStats>() == 16);
+    assert!(align_of::<ConnectionThroughputStats>() == 8);
+    assert!(offset_of!(ConnectionThroughputStats, bytes_sent) == 0);
+    assert!(offset_of!(ConnectionThroughputStats, bytes_received) == 8);
+
+    // SockOffsets: 4 × u32
+    assert!(size_of::<SockOffsets>() == 16);
+    assert!(align_of::<SockOffsets>() == 4);
+    assert!(offset_of!(SockOffsets, skc_daddr_off) == 0);
+    assert!(offset_of!(SockOffsets, skc_rcv_saddr_off) == 4);
+    assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
+    assert!(offset_of!(SockOffsets, skc_num_off) == 12);
+
+    // role 常量两侧必须同值(用户态:ROLE_CLIENT / ROLE_SERVER)。
+    assert!(CONNECTION_ROLE_CLIENT == 1);
+    assert!(CONNECTION_ROLE_SERVER == 2);
+};
+
 #[cfg(not(test))]
 #[panic_handler] //#[panic_handler] is required to keep the compiler happy, although it is never used since we cannot panic.
 fn panic(_info: &core::panic::PanicInfo) -> ! {
