@@ -7,6 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// owner 链上卷的最大步数。
+const MAX_OWNER_CHAIN_DEPTH: usize = 8;
+
 /// owners_index 的 key:(namespace, kind, name) 三元组。namespace 由子资源继承
 /// 传入,所以 [`OwnerTarget`] 本身不带 namespace。
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -85,7 +88,7 @@ pub fn trace_owner_hierarchy(
 
     let mut chain: Vec<OwnerTarget> = Vec::new();
     let mut cur = initial;
-    for _ in 0..8 {
+    for _ in 0..MAX_OWNER_CHAIN_DEPTH {
         let Some(owner) = cur.clone() else {
             break;
         };
