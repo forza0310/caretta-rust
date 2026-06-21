@@ -164,25 +164,28 @@
   - 现状：单分支 200+ 行、8 个阶段（collect / resolve / merge / purge / produce-link / produce-tcp / gc-link / gc-tcp）挤在一起
   - 建议：拆成命名函数
 
-- [ ] **L. `k8s.rs` 单文件 653 行**
+- [~] **L. `k8s.rs` 单文件 653 行**
   - 现状：watch / snapshot / owner / service / dns / debug 9 个职责挤一起
-  - 建议：拆 `watch.rs` / `snapshot.rs` / `owner.rs` / `service.rs`
+  - 进度：**部分缓解**。后续重构已把 watch / owner 逻辑抽到 `crates/caretta-k8s-core` 共享 crate(`owner.rs` 等),`k8s.rs` 从 653 → 563 行。但 caretta crate 内的 `k8s.rs` 本身仍未按建议拆成 `watch.rs` / `snapshot.rs` / `service.rs`,snapshot/service/debug 职责仍同文件。
+  - 余项：crate 内文件级拆分待做。
 
 - [ ] **M. eBPF / 用户态结构体双侧定义无 ABI 校验**
   - 位置：`ConnectionThroughputStats` / `ConnectionIdentifier` / `CONNECTION_ROLE_*`
   - 建议：`static_assertions::assert_eq_size!` 或 build.rs 时校验
 
-- [ ] **N. `fnv_hash` / `connection_id` 双侧实现**
+- [x] **N. `fnv_hash` / `connection_id` 双侧实现**
   - 位置：eBPF + 用户态
-  - 建议：抽到共享 crate 或加交叉注释
+  - 状态：**已随 #6 自然消解**。#6 删掉了 eBPF 端 `connection_id()` 函数及其 FNV 常量(`ConnectionIdentifier.id` 字段一并移除),eBPF 侧现在不再做任何 hash;`fnv_hash`/`fnv_hash_parts` 只剩用户态 `types.rs` 一份(给 prometheus label id 用)。"双侧重复会漂移"的隐患不复存在,无需再抽共享 crate / 加交叉注释。
+  - 验证：`grep -rniE "fnv|connection_id" caretta-ebpf/src` 为空。
 
 - [ ] **O. `caretta_links_observed` Counter 缺 `_total` 后缀**
   - 现状：违反 prometheus 命名约定
   - 注意：改名要同步所有 dashboard / alert，需权衡
 
-- [ ] **P. role 维度 prometheus label 无白名单校验**
+- [~] **P. role 维度 prometheus label 无白名单校验**
   - 现状：`role.to_string()` 接受任何 u32；非法 role 会污染 cardinality
-  - 建议：入口验 `ROLE_CLIENT/SERVER` 白名单
+  - 进度：**入口已隐式兜底,但无显式 label 层白名单**。`reduce_connection_to_link` / `reduce_connection_to_tcp`([types.rs:158](network/caretta/src/types.rs#L158)/[:189](network/caretta/src/types.rs#L189))对 `ROLE_CLIENT`/`ROLE_SERVER` 之外的 role 直接 `bail!`,而 `NetworkLink`/`TcpConnection` 只能由这两条 reduce 路径构造——所以走到 metrics 层的 role 必 ∈ {1,2},cardinality 污染在数据通路上已不可能发生。
+  - 余项：缺一处显式的"label 层白名单"作为防御深度(若未来新增不经 reduce 的构造路径,这层隐式保证会失效)。优先级低。
 
 - [ ] **Q. `OWNER_RESOLVE_KIND_ALLOWLIST` 空集合语义未文档化**
   - 现状：空字符串 → 空 HashSet，但"空 = 允许全部" vs "空 = 拒绝全部" 没文档
