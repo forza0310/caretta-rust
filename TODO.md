@@ -128,10 +128,17 @@
     - `cargo build/clippy/test -p caretta` 全绿(纯单测用 `CARGO_TARGET_..._RUNNER=env` 绕过 sudo runner);未新增 clippy warning。
   - 余项：暂无
 
-- [ ] **F. HTTP server 1024 字节固定 buffer + `from_utf8_lossy` + 无 read timeout**
+- [x] **F. HTTP server 1024 字节固定 buffer + `from_utf8_lossy` + 无 read timeout**
   - 位置：`caretta/src/http_server.rs::run_metrics_server`
-  - 风险：长 query / 长 header 静默截断；非 UTF-8 替换为 U+FFFD 后 `starts_with` 行为怪异；慢客户端长占连接
-  - 建议：buffer 满 → 414；`from_utf8` 严格 + 400；`tokio::time::timeout(5s, stream.read())`
+  - 原状：长 query / 长 header 静默截断；非 UTF-8 替换为 U+FFFD 后 `starts_with` 行为怪异；慢客户端长占连接(read 无超时,Slowloris 面)
+  - 已做：
+    - read 包 `tokio::time::timeout(5s, ...)`,超时 / 出错 / EOF(n==0)一律弃连接——堵住"连上却不发完整请求行"的慢速攻击让 task 永久挂死。
+    - write 同样包 5s 超时(reviewer 未列的对称问题):兜住"连上却不读 response body"的慢速读取型 Slowloris。
+    - `from_utf8_lossy` 改严格 `std::str::from_utf8`:请求行按 RFC 是 ASCII,非法字节 → 400,不再替换 U+FFFD 后继续拿被污染串路由。
+    - buffer 读满(n==REQUEST_BUFFER_SIZE)仍未匹配已知路由 → 414 URI Too Long,语义比"静默截断当 404"清晰。
+    - 路由判定抽成纯函数 `route_request(&[u8], buffer_full, ...) -> Route`(从 I/O / resolver 剥离),补 7 个单测覆盖 metrics/debug(启用与否)/404/400(非法 UTF-8)/414(读满未匹配)/读满仍正常路由已知前缀。常量 `REQUEST_READ_TIMEOUT`/`RESPONSE_WRITE_TIMEOUT`/`REQUEST_BUFFER_SIZE` 提名。
+    - `cargo build/clippy/test -p caretta` 全绿,无新增 clippy warning。
+  - 余项：仍是手写极简 server(未引入 hyper/axum);若日后换框架这些补丁可弃。
 
 - [ ] **G. DNS LRU + Negative 互相挤占**
   - 位置：`caretta/src/resolver/dns.rs::DnsCache`
@@ -214,5 +221,5 @@
 | P1 | #3（watch supervisor）/ #4（forget 错误分流） | 中等 |
 | P1 | A（并发 list）/ B（single-flight DNS） | 中等，性能收益显著 |
 | P2 | C（已处理）/ D（已处理）/ E（已处理） | 配置或重构 |
-| P2 | F / H（已处理） | 小 |
+| P2 | F（已处理） / H（已处理） | 小 |
 | P3 | K / L / M-T | 重构，逐步推 |
