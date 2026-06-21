@@ -200,10 +200,10 @@
   - 现状：实际处理 INT/ENUM/STRUCT/UNION/PTR
   - 已做：随 #5 一并改名为 `resolve_field_size`
 
-- [ ] **T. `still_dead_keys<K: Copy>` 不必要的 `Copy` bound**
-  - 位置：`caretta/src/purge.rs`
-  - 原因：`into_iter` 拿所有权
-  - 建议：去掉 bound
+- [x] **T. `still_dead_keys<K: Copy>` 不必要的 `Copy` bound**
+  - 位置：[caretta/src/purge.rs:12](network/caretta/src/purge.rs#L12)
+  - 原因：函数体是纯 move + borrow——`into_iter()` 拿 owned `K`,`filter` 谓词只收 `&K`,`collect()` 搬走 owned `K`,全程零拷贝,`Copy` 从未被用到。
+  - 做法：`<K: Copy>` → `<K>`。纯放宽:唯一调用点 [main.rs:326](network/caretta/src/main.rs#L326) 传的 `ConnectionIdentifier` 仍是 `Copy`,完全兼容;行为零变化。clippy 无新增 warning,测试全绿。
 
 ---
 
