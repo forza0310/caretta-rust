@@ -43,6 +43,10 @@ pub struct Opt {
     pub owner_resolve_kind_allowlist: String,
     #[clap(long, default_value = DEFAULT_OWNER_KIND_PRIORITY)]
     pub owner_kind_priority: String,
+    /// vmlinux BTF blob 路径。启动期解析 sock_common 字段偏移用,默认所有支持 BTF 的
+    /// 内核(5.5+)挂在 `/sys/kernel/btf/vmlinux`。容器里若挂到别处可用 env 覆盖。
+    #[clap(long, default_value = crate::btf::DEFAULT_VMLINUX_BTF_PATH)]
+    pub vmlinux_btf_path: String,
 }
 
 impl Opt {
@@ -127,6 +131,11 @@ impl Opt {
         }
         if let Ok(v) = std::env::var("OWNER_KIND_PRIORITY") {
             opt.owner_kind_priority = v;
+        }
+        if let Ok(v) = std::env::var("VMLINUX_BTF_PATH") {
+            if !v.is_empty() {
+                opt.vmlinux_btf_path = v;
+            }
         }
 
         opt

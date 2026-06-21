@@ -56,4 +56,4 @@
 mod lookup;
 mod parser;
 
-pub use lookup::parse_sock_offsets;
+pub use lookup::{DEFAULT_VMLINUX_BTF_PATH, parse_sock_offsets};

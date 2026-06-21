@@ -12,6 +12,7 @@
 use anyhow::{Context as _, anyhow, bail};
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use super::parser::{
     KIND_STRUCT, TypeInfo, flatten_named_members, parse_header, read_string, read_type_at,
@@ -30,12 +31,12 @@ pub const DEFAULT_VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 ///
 /// 返回 `字段名 -> byte offset`。
 pub fn read_struct_field_offsets(
-    btf_path: &str,
+    btf_path: &Path,
     struct_name: &str,
     fields: &[(&str, u32)],
 ) -> anyhow::Result<HashMap<String, u32>> {
-    let data =
-        fs::read(btf_path).with_context(|| format!("failed to read BTF blob: {btf_path}"))?;
+    let data = fs::read(btf_path)
+        .with_context(|| format!("failed to read BTF blob: {}", btf_path.display()))?;
     parse_struct_field_offsets(&data, struct_name, fields)
 }
 
@@ -135,19 +136,13 @@ pub fn parse_struct_field_offsets(
 
 /// 解析 vmlinux BTF 拿 caretta eBPF 程序需要读的 sock_common 字段偏移。
 ///
-///
-/// 用 `VMLINUX_BTF_PATH` 环境变量覆盖默认 `/sys/kernel/btf/vmlinux` 路径
-///
 /// 字段 size 校验:
 ///   - skc_daddr / skc_rcv_saddr 是 __be32,4 字节
 ///   - skc_dport / skc_num       是 __u16,2 字节
 /// size 不符就 bail,免得 eBPF 端读错字段导致数据乱掉还不好排查。
-pub fn parse_sock_offsets() -> anyhow::Result<SockOffsets> {
-    let path =
-        std::env::var("VMLINUX_BTF_PATH").unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
-
+pub fn parse_sock_offsets(btf_path: &Path) -> anyhow::Result<SockOffsets> {
     let offs = read_struct_field_offsets(
-        &path,
+        btf_path,
         "sock_common",
         &[
             ("skc_daddr", 4),
@@ -531,7 +526,7 @@ mod tests {
         let path = std::env::var("VMLINUX_BTF_PATH")
             .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
         let off = read_struct_field_offsets(
-            &path,
+            Path::new(&path),
             "sock_common",
             &[
                 ("skc_daddr", 4),

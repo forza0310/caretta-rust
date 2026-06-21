@@ -138,10 +138,15 @@
   - 现状：LRU 不区分 Positive / Negative；一波失败 IP 把高价值 Positive entry 挤出
   - 建议：双层缓存（Positive 大池 / Negative 小池），或淘汰策略优先驱逐 Negative
 
-- [ ] **H. `VMLINUX_BTF_PATH` 绕过统一配置系统**
+- [x] **H. `VMLINUX_BTF_PATH` 绕过统一配置系统**
   - 位置：`caretta/src/btf/lookup.rs::parse_sock_offsets`
-  - 现状：函数内部 `std::env::var("VMLINUX_BTF_PATH")`，绕过 `Opt` / clap
-  - 建议：进 `Opt` 加 `--vmlinux-btf-path` clap 参数 + env 覆盖；`parse_sock_offsets` 改成接 `&Path`
+  - 原状：函数内部 `std::env::var("VMLINUX_BTF_PATH")`，绕过 `Opt` / clap——隐藏配置、`--help` 不可见、只能 env 设无命令行入口、函数从全局环境偷读不好测
+  - 已做：
+    - `Opt` 新增 `vmlinux_btf_path: String` 字段(clap `--vmlinux-btf-path`),`default_value` 复用 `btf::DEFAULT_VMLINUX_BTF_PATH`(经 mod.rs 重导出);`from_env_and_args` 加 `VMLINUX_BTF_PATH` env 覆盖,与其余 string env 项(PROMETHEUS_ENDPOINT 等)同形(空串不覆盖)——env 覆盖语义不变,只是纳入统一框架。
+    - `parse_sock_offsets` 从无参 + 内部读 env 改成接 `&Path`,纯接参、无全局副作用、好测;`read_struct_field_offsets` 签名 `&str` → `&Path`(`with_context` 改 `btf_path.display()`)。
+    - main.rs 调用点改 `parse_sock_offsets(Path::new(&opt.vmlinux_btf_path))`;ignored 真机烟雾测试调用点同步改 `Path::new(&path)`。
+    - `cargo build/clippy/test -p caretta` 全绿;新增的 env 覆盖块与既有两处 string-env handler 共用同一 `if let Ok(v) { if !v.is_empty() }` 形态(刻意保持一致),clippy 仅多一条与邻居同类的 `collapsible_if`,不引入新类警告。
+  - 余项：暂无
 
 ---
 
@@ -209,5 +214,5 @@
 | P1 | #3（watch supervisor）/ #4（forget 错误分流） | 中等 |
 | P1 | A（并发 list）/ B（single-flight DNS） | 中等，性能收益显著 |
 | P2 | C（已处理）/ D（已处理）/ E（已处理） | 配置或重构 |
-| P2 | F / H | 小 |
+| P2 | F / H（已处理） | 小 |
 | P3 | K / L / M-T | 重构，逐步推 |

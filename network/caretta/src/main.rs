@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     // SOCK_OFFSETS:从 vmlinux BTF 解出的 sock_common 字段偏移,推到 eBPF 端给
     // try_handle_sock_set_state 走 bpf_probe_read_kernel 用。
-    let offsets = parse_sock_offsets()?;
+    let offsets = parse_sock_offsets(std::path::Path::new(&opt.vmlinux_btf_path))?;
     let offsets_key = 0u32;
     let mut offsets_map: BpfHashMap<_, u32, SockOffsets> = BpfHashMap::try_from(
         ebpf.map_mut("SOCK_OFFSETS")
