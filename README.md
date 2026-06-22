@@ -1,213 +1,297 @@
 # Caretta Rust
 
-本项目是基于 Rust + aya + tokio 的 Kubernetes 可观测性探针,含两个采集器:eBPF 网络连接探针(`network/`,特权 DaemonSet)与 K8s 事件采集器(`k8s-state/`,单实例 Deployment)。
+基于 **Rust + aya + tokio** 的 Kubernetes 可观测性探针。两个独立采集器、共享一份 K8s 客户端基础库,各自暴露 Prometheus 端点:
 
-## 当前能力总览
+| 采集器 | 形态 | 端口 | 数据源 | 主指标 |
+|---|---|---|---|---|
+| **network/caretta** | 特权 DaemonSet (`hostNetwork`) | `7117` | eBPF (fentry + tp_btf) | `caretta_links_observed` / `caretta_tcp_states` |
+| **k8s-state/caretta-k8s-state** | 非特权单实例 Deployment | `7118` | K8s API (watch Events) | `caretta_k8s_events_total` |
 
-- eBPF 采集
-	- fentry tcp_sendmsg: 统计 bytes_sent
-	- fentry tcp_cleanup_rbuf: 统计 bytes_received
-	- tp_btf sock/inet_sock_set_state: 追踪连接状态变化
-- 吞吐语义
-	- 用户态链路吞吐采用 bytes_sent + bytes_received
-- Kubernetes 解析
-	- Pod/Service/Node 解析
-	- owner 层级追溯: Service -> Pod -> ReplicaSet -> Deployment 等,可配置 allowlist + priority
-	- watch 事件模型: 资源变更触发刷新，并有周期性全量刷新兜底
-- 可观测性
-	- Prometheus 指标端点
-	- Resolver 调试端点
-- K8s 事件采集(k8s-state)
-	- watch Events,按 (namespace, type, reason, workload) 聚合为 `caretta_k8s_events_total`
-	- involvedObject 上卷到 workload,复用 caretta-k8s-core 的 owner 逻辑
+两者共用 [crates/caretta-k8s-core](crates/caretta-k8s-core/) 里的 watch loop / owner 上卷 / 后台任务 supervisor,**部署形态与 RBAC 刻意分离**:eBPF 探针必须每个节点一份且特权,Events 采集器只需要一份且只 watch、不写。
+
+---
+
+## 架构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  network/caretta  (DaemonSet, 每节点一份)                            │
+│                                                                     │
+│   eBPF 内核态                          用户态 (tokio)                  │
+│   ┌──────────────────────────┐         ┌─────────────────────────┐   │
+│   │ fentry tcp_sendmsg       │ ──────► │ poll loop (默认 5s)       │   │
+│   │   → bytes_sent           │  maps   │   ├─ Pass 1 同步收集     │   │
+│   │ fentry tcp_cleanup_rbuf  │         │   ├─ Pass 2 resolver fan-out│ │
+│   │   → bytes_received       │         │   ├─ to_purge 复检 + 删除   │ │
+│   │ tp_btf inet_sock_set_state│        │   └─ link/tcp 表 GC      │   │
+│   │   → 连接状态变化            │       │                          │   │
+│   └──────────────────────────┘         │  IpResolver               │   │
+│                                        │   ├─ K8sResolver (watch)  │   │
+│   启动期:从 vmlinux BTF 解 sock        │   └─ StaticResolver (fallback)│ │
+│   字段偏移 → SOCK_OFFSETS map         │                          │   │
+│                                        │  /metrics  /debug/resolver│   │
+│                                        └─────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  k8s-state/caretta-k8s-state  (Deployment, 单实例)                   │
+│                                                                     │
+│   watch Events ──► EventObserver ──► owner 上卷 ──► counter delta    │
+│        │                              ↑                              │
+│        └─ 周期重建 owners_index ──────┘                              │
+│                                                                     │
+│   /metrics  (CounterVec by namespace/type/reason/workload)           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### eBPF 侧 (`network/caretta-ebpf`)
+
+三个 program,内核 ≥ 5.5 用 BTF-typed hook,不依赖 kprobe + offset 硬编码:
+
+- **`fentry tcp_sendmsg`** —— 每次发包累加 `bytes_sent` 到 PerCpu map
+- **`fentry tcp_cleanup_rbuf`** —— 收包累加 `bytes_received`(同 caretta-go,语义为「已消费」字节)
+- **`tp_btf inet_sock_set_state`** —— TCP 状态机迁移,识别 client/server role,写 `CONNECTION_STATES`
+
+`bpf_probe_read_kernel` 用的 `sock_common` 字段 byte offset 在**用户态启动期**从 `/sys/kernel/btf/vmlinux` 解出来塞到 `SOCK_OFFSETS` map,内核改 ABI 时启动就 fail——不再有 kernel-version-specific 硬编码。
+
+### 用户态主循环 (`network/caretta`)
+
+每 tick (默认 5s) 全量扫一遍 eBPF map:
+
+1. **Pass 1** 同步遍历 `CONNECTION_STATES`,聚合 PerCpu 吞吐、收集 to_delete 候选、过滤 loopback。
+2. **Pass 2** 用 `futures_util::join_all` 把 IP → Workload 解析并发 fan-out(每条连接两次 resolver 调用)。
+3. **to_purge 复检**——`iter()` 与 `remove()` 之间存在 race(4-tuple+pid 可能被新连接复用),`still_dead_keys` 再读一次 `CONNECTION_STATES` 把已复用的 key 过滤掉。
+4. **link / tcp 表 GC**:
+   - `LinkTable` —— `HashMap<NetworkLink, LinkState>` + 按 `last_active` 排序的 `BTreeMap` 二级索引;TTL 5min,从最旧端弹出。
+   - `TcpTable` —— 同构,按 `last_seen_tick` 排序,12 tick 没见到就 forget。
+
+二级索引让 GC + 硬上限淘汰从 O(n) 全表 scan 降到 O(被删条数)。
+
+### IpResolver
+
+```
+K8sResolver (优先) ───► watch Pods/Services/Nodes + 周期 refresh
+                      │
+                      ├─ ArcSwap 无锁快照(读路径不持锁)
+                      ├─ owner 上卷:Pod → ReplicaSet → Deployment → ...
+                      │   按 allowlist + priority 挑最终归并目标
+                      └─ K8s miss → DnsCache (LRU + hickory async)
+
+StaticResolver (fallback) ───► 一律标 kind=external,name = 反向 DNS 或 IP
+```
+
+集群凭据不可用 / K8s API 不通时,自动退化到 `StaticResolver`——程序仍能跑,只是所有目标都标 `external`。
+
+---
 
 ## 环境要求
 
-- 内核版本 ≥ 5.5(fentry / tp_btf 需要 BPF_PROG_TYPE_TRACING)。该程序类型才能使用
-  `bpf_get_socket_cookie()`,这是 sock 复用 race 修复的关键 helper。
-- 内核启用 `CONFIG_DEBUG_INFO_BTF=y`,5.5+ 主流发行版默认开。
-- 容器化部署需要把 host 的 `/sys/kernel/btf` 挂入容器(用于 vmlinux BTF 解析,见
-  [deploy/caretta.yaml](deploy/caretta.yaml))。
+- **内核 ≥ 5.5**(`BPF_PROG_TYPE_TRACING` 才支持 fentry / tp_btf,也是 `bpf_get_socket_cookie()` 的最低门槛——sock 复用 race 修复依赖它)
+- **`CONFIG_DEBUG_INFO_BTF=y`**——5.5+ 主流发行版默认开
+- **容器化部署**:把宿主机 `/sys/kernel/btf` 挂入容器(用于启动期解析 sock 字段偏移),见 [deploy/caretta.yaml](deploy/caretta.yaml)
+- 仅 `network/caretta` 需要特权;`caretta-k8s-state` 普通 Pod 跑
 
-## 运行方式
+---
 
-1. 在项目根目录运行:
-	 sudo -E cargo run
-2. 如果你在 .cargo/config.toml 中配置了 runner = sudo -E，也可直接运行:
-	 cargo run
+## 运行
 
-默认监听:
+### 本机调试
 
-- 指标端点: http://127.0.0.1:7117/metrics
-- 调试端点: 按环境变量控制，默认关闭
+```bash
+# network 采集器(默认 7117,需要 root 加载 eBPF)
+sudo -E cargo run -p caretta
+# 或:已在 .cargo/config.toml 配 runner = sudo -E 时
+cargo run -p caretta
 
-`cargo run` 默认运行 network 采集器;运行事件采集器用 `cargo run -p caretta-k8s-state`(默认 7118)。
+# events 采集器(默认 7118,普通用户即可,只读 K8s API)
+cargo run -p caretta-k8s-state
+```
 
-## 端点说明
+默认端点:
 
-以下端点均为 network 采集器(默认 7117)。k8s-state 采集器(默认 7118)只暴露 `/metrics`,无调试端点。
+- **网络指标** —— http://127.0.0.1:7117/metrics
+- **resolver 调试**(默认关闭) —— http://127.0.0.1:7117/debug/resolver
+- **事件指标** —— http://127.0.0.1:7118/metrics
 
-### 1) /metrics
+### Kubernetes 部署
 
-- 用途: 导出 Prometheus 指标
-- 典型检查:
-	- curl -s http://127.0.0.1:7117/metrics | head
+完整模板在 [deploy/README.md](deploy/README.md)。最短路径:
 
-### 2) /debug/resolver
+```bash
+kubectl apply -f deploy/caretta.yaml                              # 两个工作负载 + RBAC
+kubectl apply -f deploy/caretta-grafana-dashboard-configmap.yaml  # Grafana sidecar 自动加载的 dashboard
+```
 
-- 用途: 返回当前 IP -> Workload 的解析快照(JSON)
-- 场景: 排查连接为何被标记为 external，或确认 owner 上卷是否生效
-- 默认: 关闭
+DaemonSet 用 `hostNetwork: true`,每节点直接在 `NodeIP:7117` 暴露指标——不需要 Service。Events 采集器走 ClusterIP `:7118`。
 
-启用示例:
+---
 
-	DEBUG_RESOLVER_ENABLED=true cargo run
-	curl -s http://127.0.0.1:7117/debug/resolver | head -n 40
+## 暴露的指标
 
-## Grafana 接入
+### `network/caretta` (7117)
 
-当前 Rust 版已经暴露了 Prometheus 兼容指标端点，可以直接接入 Grafana。最短路径是先让 Prometheus 抓取 /metrics，再让 Grafana 连接这个 Prometheus 数据源，最后导入 caretta 的 dashboard。
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `caretta_links_observed` | CounterVec | 自启动以来每条 link 的累计字节数 (`bytes_sent + bytes_received`)。labels: link/client/server 全套 + role |
+| `caretta_tcp_states` | GaugeVec | 当前观察到的 TCP 连接状态;label 同 link |
+| `caretta_polls_made` | IntCounter | 主循环 tick 数,健康度信号 |
+| `caretta_ebpf_connections_map_size` | IntGauge | 本 tick `CONNECTION_STATES` 条目数 |
+| `caretta_current_loopback_connections` | Gauge | 本 tick 被过滤的 loopback 连接数 |
+| `caretta_failed_deletions` | IntCounter | 用户态删 eBPF map entry 失败计数 |
+| `caretta_connection_deletions` | IntCounter | 用户态删 eBPF map entry 成功计数 |
 
-部署模板见 [deploy/README.md](deploy/README.md)。
+`role` label 取值固定为 `1`(client)或 `2`(server),由 `inet_sock_set_state` 在 `SYN_SENT/SYN_RECV` 时分类。
 
-### 1) 让 Prometheus 抓取本项目指标
+### `caretta-k8s-state` (7118)
 
-- 指标端点默认是 http://127.0.0.1:7117/metrics
-- 如果你部署到 Kubernetes 且使用当前 DaemonSet 清单（hostNetwork=true），每个节点会直接在 NodeIP:7117 暴露 /metrics
-- Prometheus 建议使用基于 Pod/Node 的发现与 relabel 后按 NodeIP:7117 抓取，不需要 ClusterIP Service
-- 抓取间隔建议与 poll interval 保持在同一量级，例如 5s 到 15s
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `caretta_k8s_events_total` | CounterVec | 自启动以来 K8s Events 总数,按 `(namespace, type, reason, workload_kind, workload_name)` 聚合 |
+| `caretta_k8s_state_watch_last_active_unix_seconds` | GaugeVec | 每条 watch 最近一次活动时间戳(任何变更),给存活监控用 |
 
-一个最小 Prometheus scrape 配置示例：
+**注意**:`_events_total` 不含 event message 文本——是 counter 不是日志流。要原文事件流接 Loki / vector。
+
+---
+
+## 端点
+
+### `/metrics`
+
+两个采集器都暴露。标准 Prometheus 文本格式。
+
+### `/debug/resolver` (仅 network/caretta,默认关闭)
+
+返回当前 IP → Workload 解析快照(JSON)。**默认关闭**(K8s 清单里也默认关闭),用于排查:
+
+- 为什么某条连接被标记为 `external`?
+- owner 上卷是不是按预期跳到了 Deployment / Installation?
+
+启用:
+
+```bash
+DEBUG_RESOLVER_ENABLED=true cargo run
+curl -s http://127.0.0.1:7117/debug/resolver | head -n 40
+```
+
+HTTP server 自身硬化:读/写各 5s timeout(挡 Slowloris)、严格 UTF-8 请求行(非法 → 400)、buffer 满未匹配 → 414。
+
+---
+
+## 配置
+
+**两个采集器共享同一套约定**:CLI flag 先 parse,环境变量再覆盖。任一无效的 env var 都会打 warn 并退回默认值,不会让程序起不来。
+
+### `network/caretta`
+
+| 环境变量 / CLI flag | 默认值 | 含义 |
+|---|---|---|
+| `PROMETHEUS_PORT` / `--prometheus-port` | `7117` | Prometheus 端点端口 |
+| `PROMETHEUS_ENDPOINT` / `--prometheus-endpoint` | `/metrics` | Prometheus 路径 |
+| `POLL_INTERVAL` / `--poll-interval` | `5` | 主循环 tick 间隔(秒) |
+| `DEBUG_RESOLVER_ENABLED` / `--debug-resolver-enabled` | `false` | 是否开启 `/debug/resolver` |
+| `DEBUG_RESOLVER_ENDPOINT` / `--debug-resolver-endpoint` | `/debug/resolver` | 调试端点路径 |
+| `RESOLVE_DNS` / `--resolve-dns` | `true` | 对未命中 K8s 映射的 external IP 做反向 DNS |
+| `DNS_CACHE_SIZE` / `--dns-cache-size` | `10000` | DNS LRU 缓存容量 |
+| `MAX_LINKS` / `--max-links` | `100000` | link 状态表硬上限,超限按 `last_active` 淘汰最旧 |
+| `MAX_TCP_STATES` / `--max-tcp-states` | `100000` | TCP 状态表硬上限,按 `last_seen_tick` 淘汰最 stale |
+| `TRAVERSE_UP_HIERARCHY` / `--traverse-up-hierarchy` | `true` | 沿 owner 链上卷到更稳定的工作负载 |
+| `OWNER_RESOLVE_KIND_ALLOWLIST` / `--owner-resolve-kind-allowlist` | (空) | CSV;限制可作为最终归并目标的 Kind。空 = 全放行 |
+| `OWNER_KIND_PRIORITY` / `--owner-kind-priority` | (空) | CSV;链上有多候选时按此优先级挑;越靠前优先 |
+| `VMLINUX_BTF_PATH` / `--vmlinux-btf-path` | `/sys/kernel/btf/vmlinux` | vmlinux BTF blob 路径,容器里挂到别处时用 |
+| `KUBECONFIG` | — | 集群外运行时指定 kubeconfig;集群内自动用 ServiceAccount |
+
+### `caretta-k8s-state`
+
+| 环境变量 / CLI flag | 默认值 | 含义 |
+|---|---|---|
+| `PROMETHEUS_PORT` / `--prometheus-port` | `7118` | (刻意避开 7117,方便共存) |
+| `PROMETHEUS_ENDPOINT` / `--prometheus-endpoint` | `/metrics` | |
+| `REFRESH_INTERVAL` / `--refresh-interval` | `30` | `owners_index` 周期重建间隔(秒) |
+| `TRAVERSE_UP_HIERARCHY` / `--traverse-up-hierarchy` | `true` | 同上 |
+| `OWNER_RESOLVE_KIND_ALLOWLIST` / `--owner-resolve-kind-allowlist` | (空) | 同上 |
+| `OWNER_KIND_PRIORITY` / `--owner-kind-priority` | (空) | 同上 |
+
+### Owner 上卷示例
+
+链路 `Pod → ReplicaSet → Deployment → Installation`,想最终归并到 Installation:
+
+```bash
+TRAVERSE_UP_HIERARCHY=true
+OWNER_RESOLVE_KIND_ALLOWLIST=Deployment,StatefulSet,DaemonSet,Installation
+OWNER_KIND_PRIORITY=Installation,Deployment,StatefulSet,DaemonSet
+```
+
+规则:`allowlist` 非空时只考虑列入的 Kind;在候选里挑 `priority` rank 最小者,同 rank 取链中更深(更靠根)的。空 allowlist = 全放行,取链尾(最远祖先)。
+
+---
+
+## Prometheus + Grafana 接入
+
+### 抓取
+
+DaemonSet 用 `hostNetwork=true`,每节点直接在 `NodeIP:7117` 暴露 `/metrics`,**不需要 ClusterIP Service**。建议:
+
+- 抓取间隔与 `POLL_INTERVAL` 同量级(5~15s)
+- 用 Pod/Node SD + relabel `keep` 自己的 app 标签
+
+最小配置:
 
 ```yaml
 scrape_configs:
-	- job_name: caretta-rust
-		metrics_path: /metrics
-		scrape_interval: 5s
-		kubernetes_sd_configs:
-			- role: pod
-		relabel_configs:
-			- source_labels: [__meta_kubernetes_pod_label_app]
-				regex: caretta-rust
-				action: keep
+  - job_name: caretta-rust
+    metrics_path: /metrics
+    scrape_interval: 5s
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: caretta-rust
+        action: keep
 ```
 
-### 2) 在 Grafana 中添加 Prometheus 数据源
+### Grafana
 
-- 数据源类型选择 Prometheus
-- URL 指向你的 Prometheus 地址，例如 http://prometheus:9090
-- 如果你已经有现成的 Grafana/Prometheus 组件，可以直接复用 caretta-go 的部署方式
+仓库自带 dashboard:[deploy/caretta-grafana-dashboard-configmap.yaml](deploy/caretta-grafana-dashboard-configmap.yaml)——含网络面板与 K8s 事件行,`kubectl apply` 后由 Grafana sidecar 自动加载。
 
-### 3) 导入 dashboard
+快速验证:Explore 里查 `caretta_links_observed` 有数据 → 再看完整面板。
 
-- 仓库已自带 dashboard:[deploy/caretta-grafana-dashboard-configmap.yaml](deploy/caretta-grafana-dashboard-configmap.yaml),含网络面板与 K8s 事件面板,`kubectl apply` 后由 Grafana sidecar 自动加载
-- 核心指标:网络 `caretta_links_observed` / `caretta_tcp_states`,事件 `caretta_k8s_events_total`
-- 快速验证:先在 Grafana Explore 查 `caretta_links_observed` 确认有数据,再看完整面板
-
-## 环境变量
-
-### Kubernetes 凭据
-
-- KUBECONFIG
-	- 集群外运行时可指定 kubeconfig 路径
-	- 未设置时，kube 客户端会尝试默认位置 ~/.kube/config
-- 集群内运行
-	- 自动使用 ServiceAccount Token 与集群 CA
-
-### Resolver 行为
-
-- RESOLVE_DNS
-	- 可选值: true 或 false
-	- 默认: true
-	- 作用: 对未命中 K8s 映射的 external IP 做反向 DNS 解析
-- DNS_CACHE_SIZE
-	- 可选值: 正整数
-	- 默认: 10000
-	- 作用: LRU 缓存容量(缓存 external IP 到反向解析主机名)
-- MAX_LINKS
-	- 可选值: 正整数
-	- 默认: 100000
-	- 作用: 用户态 link 状态表硬上限,超限时按 last_active 淘汰最老 link
-- TRAVERSE_UP_HIERARCHY
-	- 可选值: true 或 false
-	- 默认: true
-	- 作用: 是否沿 owner 链继续上卷到更稳定工作负载
-- OWNER_RESOLVE_KIND_ALLOWLIST
-	- 格式: 逗号分隔 Kind 列表
-	- 默认: 空(表示不限制)
-	- 作用: 限制哪些 Kind 可以作为最终归并目标
-	- 示例: Deployment,StatefulSet,DaemonSet,Installation
-- OWNER_KIND_PRIORITY
-	- 格式: 逗号分隔 Kind 列表，越靠前优先级越高
-	- 默认: 空(表示按 owner 链最高层目标归并)
-	- 作用: 当 owner 链上存在多个候选 Kind 时，按优先级挑选最终归并目标
-	- 示例: Installation,Deployment,StatefulSet,DaemonSet,Job,CronJob,ReplicaSet
-
-Installation 场景示例:
-
-	TRAVERSE_UP_HIERARCHY=true
-	OWNER_RESOLVE_KIND_ALLOWLIST=Deployment,StatefulSet,DaemonSet,Installation
-	OWNER_KIND_PRIORITY=Installation,Deployment,StatefulSet,DaemonSet
-
-当链路为 Pod -> ReplicaSet -> Deployment -> Installation 时，最终会归并到 Installation。
-
-external 回退行为:
-
-- 当 RESOLVE_DNS=true 且解析成功时，external 名称会显示为反向 DNS 结果。
-- 当 RESOLVE_DNS=false 或解析失败时，external 名称回退为原始 IP 字符串。
-
-### 调试端点
-
-- DEBUG_RESOLVER_ENABLED
-	- 可选值: true 或 false
-	- 默认: false
-	- 作用: 开启或关闭 resolver 调试端点（K8s 清单默认关闭）
-- DEBUG_RESOLVER_ENDPOINT
-	- 默认: /debug/resolver
-	- 作用: 自定义调试端点路径
+---
 
 ## 运行行为说明
 
-- 在有可用 kube 凭据时，启用 K8sResolver。
-- 在无 kube 凭据或不可访问集群时，解析会回退为 external。
-- 即使 K8sResolver 启用，external 仍可能出现(真实外部流量或回环流量)。
+- 有 kube 凭据 ⇒ `K8sResolver`,日志会打 `kubernetes resolver enabled`
+- 无 kube 凭据或集群不可访问 ⇒ 退化到 `StaticResolver`,所有目标标 `external`
+- 即使 `K8sResolver` 启用,external 仍会出现——真实外部流量或被过滤掉的回环
 
-## 快速排障
+### 排障三步
 
-1. 看程序日志，确认是否打印 kubernetes resolver enabled。
-2. 访问 /metrics，确认有 caretta_links_observed 等指标。
-3. 开启 DEBUG_RESOLVER_ENABLED 后访问调试端点，核对目标 IP 的解析结果。
+1. 看日志:有没有 `kubernetes resolver enabled` 与 `eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + tp_btf inet_sock_set_state`?
+2. `curl /metrics`:`caretta_links_observed` 是否有 sample?`caretta_polls_made` 是否在涨?
+3. `DEBUG_RESOLVER_ENABLED=true` + `curl /debug/resolver`:目标 IP 的解析结果对不对?
 
-## 对比 caretta go 原版的关键改进
+---
 
-按稳定性 / 安全性 / 鲁棒性 / 可观测性归类。每行都对照两边代码核对过。
+## 项目结构
 
-### 稳定性
+```
+caretta/
+├── network/
+│   ├── caretta/          用户态二进制 (DaemonSet)
+│   │   └── src/
+│   │       ├── main.rs       orchestration:加载 eBPF、起 resolver/server、tick loop
+│   │       ├── tables.rs     LinkTable / TcpTable(主存 + BTreeMap 二级索引)
+│   │       ├── resolver/     K8sResolver / StaticResolver / DnsCache
+│   │       ├── metrics.rs    所有 prometheus 指标 + label 构造 + forget
+│   │       ├── http_server.rs Slowloris-hardened /metrics + /debug/resolver
+│   │       ├── btf/          vmlinux BTF 解析(sock_common 字段偏移)
+│   │       ├── purge.rs      to_delete race 复检闸门
+│   │       └── types.rs      ABI 镜像结构体 + 编译期布局断言
+│   └── caretta-ebpf/     eBPF 程序 (#![no_std])
+├── k8s-state/
+│   └── caretta-k8s-state/ Event 采集器二进制 (Deployment)
+├── crates/
+│   └── caretta-k8s-core/ 共享:watch loop / owner 上卷 / supervisor
+└── deploy/               K8s 清单 + Grafana dashboard
+```
 
-| 维度 | caretta-go 行为 | Rust 版改进 |
-|---|---|---|
-| sock 身份与 eBPF 程序类型现代化 | 反查表 `sock_infos` 用 `struct sock *` 裸地址做 key,sock free 后内核复用同一片 slab 会让旧 close 与新 sendmsg 串扰;close 路径反查失败时还会现场拼一个 `(pid=0, id=new)` 的幽灵 entry。程序类型停留在 legacy kprobe + tracepoint,寄存器猜参 | 全面迁到 `BPF_PROG_TYPE_TRACING`(fentry / tp_btf),解锁 `bpf_get_socket_cookie()` 做 key —— cookie 一生一码、sock free 后不复用;close 路径只走 cookie 反查,失败 `return` 不写,杜绝幽灵 entry。args 走 BTF 类型化,字段偏移从 vmlinux BTF 拿,不依赖 tracefs |
-| 用户态状态表 GC 与 cardinality 治理 | `pastLinks map[NetworkLink]uint64` 只增不删,prometheus series 永久占用 → 长跑 OOM;`TracesPollingIteration` 批量删除候选不复检 `IsActive`,4-tuple+pid 被 keep-alive 复用时会误删新连接;`TcpConnection` 把 `State` 嵌成 key 字段,同一条连接拆三条 GC entry | 引入 `links` / `tcp_states` 状态表 + TTL/missed-ticks GC,过期同时调 `forget_link` / `forget_tcp` 清 prometheus series 与差分基准,produce/forget 共用 label 构造 helper 编译期保证一致;批量 remove 前过 `purge::still_dead_keys` 复检候选在 `CONNECTION_STATES` 仍是 0 才放行;`TcpConnectionKey` 显式去掉 `state`,同一连接所有 state 折叠成一条 GC entry |
-| 启动 / 关闭与 watch 风暴的信号化 | `Stop()` 发完通道就 return,metrics server 用 `context.Background()` 关 —— 卡住挂死也不报错;启动 goroutine 起 server 后主流程 `time.Sleep(10s)`,端口被占 goroutine 内 `log.Fatalf`,主流程不感知;watch 事件每条即时改 snapshot,rolling update 时写者 CPU 顶满,丢一条 modify 永久漂移 | `ctrl_c` → `watch::channel` 触发 shutdown,主 task `await` 真正回收;启动 `oneshot` 把 bind 成功/失败回报主 task,失败直接退;resolver 用容量 1 的 `mpsc` + `try_send` 合并 watch 风暴成单一刷新信号,30s 周期性 `refresh_snapshot` 兜底,`refresh_lock` 串行化全量重建防旧 list 覆盖新结果 |
-
-### 安全性
-
-| 维度 | caretta-go 行为 | Rust 版改进 |
-|---|---|---|
-| BTF 守护(手写 parser + size 校验) | BTF 全外包 cilium/ebpf,内核改 `sock_common` 字段宽度自己默默吃下去;eBPF 端用 `bpf_core_read(&out, sizeof(out), ...)`,sizeof 走用户结构体编译期常量,运行时可能把高字节吃进 IP 跑出垃圾 | 手写最小 BTF parser([src/btf/](network/caretta/src/btf/) 共 ~800 行 + 9 个单测覆盖魔数 / 字段缺失 / size 漂移 / typedef 链 / 匿名嵌套展平);`parse_sock_offsets` 把每字段期望 size 一并传给 `read_struct_field_offsets`,size 不匹配启动直接 fail —— 内核 ABI 变了启动期就看见 |
-| 整数溢出兜底 | 用户态裸 `+=` 累加 uint64,wrap 后归零触发 Counter reset,PromQL `rate()` 失真(eBPF 端 Go 是 snapshot 读 kernel `tcp_sock` 累计字段,无此问题) | eBPF 端 per-event 累加与用户态聚合 / per-CPU merge 全走 `saturating_add`,钳在 `u64::MAX`,Counter 单调性永远成立 |
-| RBAC 最小权限 | ClusterRole 授了 ~25-30 种独立资源(configmaps / endpoints / sa / pods/log / events / bindings / networkpolicies / metrics.k8s.io 等),业务侧绝大多数不用 | 只 9 种资源(pods / services / nodes + apps 4 种 + batch 2 种),全 `get/list/watch`,DaemonSet 容器 escape 攻击面也只这一小块 |
-
-### 鲁棒性
-
-| 维度 | caretta-go 行为 | Rust 版改进 |
-|---|---|---|
-| 字节统计精确化(双向 + 接收点) | link throughput 只算 `BytesSent`,server 视角入流量整片消失;接收侧挂 `tcp_data_queue`,数据一进 receive queue 就计数,read 前关连接的部分计入但未消费,数值偏高 | 用户态聚合走 `bytes_sent + bytes_received`,metric help 同步改为 "total bytes transferred";接收侧改挂 `tcp_cleanup_rbuf`(数据真正被用户态消费时),对负 `copied` 显式守护 |
-| K8s resolver 重构 | owner 解析沿链爬到顶,无法限制 Kind;ClusterIP 直接打 `kind=Service`,DNAT 下 client / server 视角拆两条 series;link_id 用 `fnvHash(name+ns+...) + role`,无分隔符且 role 只动最低位,易碰撞;读路径 `sync.Map` + 不安全的 `val.(Workload)` 类型断言,偶蹦 `type confusion` | `trace_owner_hierarchy` + `select_owner_from_chain` 接受 `OWNER_RESOLVE_KIND_ALLOWLIST` / `OWNER_KIND_PRIORITY` env 收窄候选;`refresh_snapshot` 用 `svc.spec.selector` 把 ClusterIP map 到同 ns 已上卷的 Pod Workload,两端视角合并成单 series;link_label 字段间用 `\x1f` 分隔 + `role.wrapping_mul(0x9E3779B1)` XOR 消碰撞;读路径换 `ArcSwap<HashMap>`,`load()` 原子指针交换无锁等待 |
-| 运行时错误处理与配置防错 | `net.LookupAddr(ip)` 同步阻塞,glibc 默认最长约 15 秒,失败 IP 无负缓存 TTL;`time.NewTicker` 配 0/负数得无限频率 ticker,CPU 100%;`for entries.Next(...)` 只返回 bool,迭代失败被吞 | DNS 走 hickory async + 800ms `timeout` + `DnsCacheEntry::Negative` 60s 负缓存,LRU 容量 `DNS_CACHE_SIZE` env 可调;poll 间隔 `.max(1)` 兜最低 1s;eBPF map 每条 entry 单独 `match` 错误并 `warn!`,删除失败 `mark_failed_connection_deletion()` 计入 `caretta_failed_deletions` 指标 |
-
-### 可观测性
-
-| 维度 | caretta-go 行为 | Rust 版改进 |
-|---|---|---|
-| 运行时观测口子 | 无 IP→Workload 解析快照的查询接口,排"为什么被打成 external"靠 grep 日志;`watchEventsCounter` 只有 `object_type` 一个 label | `DEBUG_RESOLVER_ENABLED` env 开 `/debug/resolver` 返回 IP→Workload 快照 + watch 事件计数 + 总条目数 JSON;`caretta_k8s_watch_last_active_unix_seconds{object_type}` Gauge 给每条 watch 做存活探测(time() - 它 > 阈值即告警) |
+`network/caretta/src/types.rs` 与 `network/caretta-ebpf/src/main.rs` 都有一组 `const _: () = { assert!(...) }` 编译期断言,把镜像结构体的 size / align / 字段 offset 钉死成同一组字面量——任一侧改字段,build 即 `E0080` 报错提示同步另一侧。
