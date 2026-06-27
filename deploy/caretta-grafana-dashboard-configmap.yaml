@@ -98,6 +98,7 @@ data:
               "refId": "edges"
             }
           ],
+          "description": "Kubernetes 工作负载之间的逐链路字节量,来自 caretta_links_observed(由 tcp_sendmsg + tcp_cleanup_rbuf 字节计数累加)。节点弧按 link_id 上色,边上的数值是该方向的 KiB/s。这是入口视图,异常点请下钻到下方的具体面板。同名节点自环表示 pod 内部流量;external / node 节点对应跨集群边界的流量。",
           "title": "Service Map",
           "transformations": [
             {
@@ -186,6 +187,7 @@ data:
               "refId": "A"
             }
           ],
+          "description": "按服务端口聚合所选时间窗内的总字节量。常用来发现意外开放的端口(调试端点、忘了关的 NodePort)或验证路由配置是否符合预期。底层是 increase(caretta_links_observed) 按 server_port 聚合,受当前 dashboard 过滤器约束。",
           "title": "Active Ports",
           "type": "piechart"
         },
@@ -291,6 +293,7 @@ data:
               "refId": "A"
             }
           ],
+          "description": "所选窗口内吞吐量(Bytes/s)最高的工作负载排行,按该负载作为 client 时参与的所有链路求和。只算它主动发出的字节量;想看它到底在跟谁说话,配合下方 Top Throughput Connections 看。",
           "title": "Top Throughput Workloads",
           "type": "bargauge"
         },
@@ -364,6 +367,7 @@ data:
               "refId": "A"
             }
           ],
+          "description": "所选窗口内吞吐量最高的 client→server 配对。底层字节计数与 Top Throughput Workloads 相同,但按方向性链路分组,适合定位最吵的一对一通信对。node / external 端点已过滤,聚焦集群内部流量;要看包含跨边界流量的全貌请回到 Service Map。",
           "title": "Top Throughput Connections",
           "type": "stat"
         },
@@ -385,7 +389,7 @@ data:
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "description": "p50 / p95 / p99 of TCP connection lifetime, observed once per close. Filtered by client side of the connection — intra-cluster connections will contribute one sample per role observation. Read the spread between p50 and p99 as a tail-latency signal: short-lived connections (RPC pools) sit ≤ 100ms, long-lived (DB/streaming) climb to seconds+.",
+          "description": "TCP 连接 lifetime 的 p50 / p95 / p99 分位,每次连接 close 时采样一次。按 client 侧过滤——集群内连接每个 role 视角各贡献一次样本。p50 与 p99 的差距反映尾部延迟:短连接(RPC 池)通常 ≤ 100ms,长连接(DB / 流式)爬到秒级以上。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -483,7 +487,7 @@ data:
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "description": "Full distribution of close-time lifetimes per bucket, over time. Hot bands at the short end = RPC / probe traffic; hot bands at the long end = persistent connections. Sudden migration across bands often coincides with retries or pool churn.",
+          "description": "close 时刻 lifetime 在各桶上的分布随时间演化。短端(底部)亮带 = RPC / 健康探测;长端(顶部)亮带 = 持久连接。亮带突然在桶之间迁移通常意味着重试增多或连接池洗牌。",
           "fieldConfig": {
             "defaults": {
               "custom": {
@@ -495,7 +499,8 @@ data:
                 "scaleDistribution": {
                   "type": "linear"
                 }
-              }
+              },
+              "unit": "suffix: count"
             },
             "overrides": []
           },
@@ -566,7 +571,7 @@ data:
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "description": "Top workloads sending or receiving the most retransmitted TCP segments per second. retransmits/s is the eBPF segs counter — high values usually mean packet loss to/from the workload, congestion, or a sick NIC. Compare against throughput to gauge severity.",
+          "description": "所选窗口内重传 TCP 段数最多的工作负载排行。底层是 tcp_retransmit_skb 上报的 segs 计数累加——数值高通常意味着丢包、链路拥塞或网卡异常。要判断严重程度,把它和该负载的吞吐量对比看。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -583,15 +588,15 @@ data:
                   },
                   {
                     "color": "orange",
-                    "value": 1
+                    "value": 10
                   },
                   {
                     "color": "red",
-                    "value": 10
+                    "value": 100
                   }
                 ]
               },
-              "unit": "cps"
+              "unit": "short"
             },
             "overrides": []
           },
@@ -635,7 +640,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "topk(8, sum by (client_name) (rate(caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"}[$__range:$__interval])))",
+              "expr": "topk(8, sum by (client_name) (increase(caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"}[$__range])))",
               "format": "time_series",
               "instant": true,
               "legendFormat": "__auto",
@@ -643,7 +648,7 @@ data:
               "refId": "A"
             }
           ],
-          "title": "Top Retransmitting Workloads (segs/s)",
+          "title": "Top Retransmitting Workloads (window total)",
           "type": "bargauge"
         },
         {
@@ -651,7 +656,7 @@ data:
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "description": "Top client→server pairs by retransmits/s. Pairs where retransmits/s > throughput/s × 0.01 are usually the ones worth investigating — the eBPF segs counter is per direction, so the value here is exactly what tcp_retransmit_skb fired for that link.",
+          "description": "所选窗口内重传量最高的 client→server 配对。底层同为 tcp_retransmit_skb 的 segs 计数;重传 / 吞吐占比高的配对最值得查。eBPF 计数按方向统计,不混淆收发。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -667,15 +672,15 @@ data:
                   },
                   {
                     "color": "orange",
-                    "value": 1
+                    "value": 10
                   },
                   {
                     "color": "red",
-                    "value": 10
+                    "value": 100
                   }
                 ]
               },
-              "unit": "cps"
+              "unit": "short"
             },
             "overrides": []
           },
@@ -713,7 +718,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "topk(7, sum by (client_name, server_name) ( rate( (caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\", client_kind!~\"(node|external)\"} or caretta_tcp_retransmits_total{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\", server_kind!~\"(node|external)\"})[$__range:$__interval]) ) ) > 0",
+              "expr": "topk(7, sum by (client_name, server_name) ( increase( (caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\", client_kind!~\"(node|external)\"} or caretta_tcp_retransmits_total{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\", server_kind!~\"(node|external)\"})[$__range:]) ) ) > 0",
               "format": "time_series",
               "instant": true,
               "legendFormat": "{{client_name}} ⮂ {{server_name}}",
@@ -721,7 +726,7 @@ data:
               "refId": "A"
             }
           ],
-          "title": "Top Retransmitting Connections (segs/s)",
+          "title": "Top Retransmitting Connections (window total)",
           "type": "stat"
         },
         {
@@ -839,6 +844,7 @@ data:
               "refId": "A"
             }
           ],
+          "description": "每个采样桶内 Kubernetes 事件计数堆叠,按 reason 上色:Warning 红、Normal 绿(在 field overrides 里固定)。峰值往往伴随 reload 风暴、OOMKilled 爆发、调度失败——肉眼对照上方 TCP 面板,可关联集群级抖动与流量异常。仅受事件侧的模板变量过滤,与 TCP 侧过滤器独立。",
           "title": "Event Count Over Time (by reason)",
           "type": "timeseries"
         },
@@ -943,6 +949,7 @@ data:
               "refId": "A"
             }
           ],
+          "description": "所选窗口内按 (namespace, type, reason, workload) 聚合的事件总数,按 Count 降序排序。给出最近最吵的事件扁平排行。Count 单元有色阶(蓝 → 橙 ≥10 → 红 ≥50)。在 kubectl describe 前快速定位活跃 reason(BackOff / FailedScheduling / OOMKilled 等)。",
           "title": "Recent Events (counts over selected range)",
           "transformations": [
             {
