@@ -188,13 +188,24 @@ static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
 // label 集合与 caretta_tcp_states 完全相同——这样 TcpTable GC 一条 series 时可以
 // 用同一组 label 把这边的直方图 series 也一并 forget 掉,不必再造一套生命周期。
 //
-// buckets 手工挑(1ms / 10ms / 100ms / 1s / 5s / 10s / 20s / 40s / 60s,+Inf 由
+// buckets 按语义分段铺,相邻比例 ~2-5×,覆盖 5ms → 2h:
+//   亚秒:健康探测 / 同机房 RPC / 短请求(5ms / 25ms / 100ms / 250ms / 500ms)
+//   秒级:正常 request-response、慢请求       (1s / 2.5s / 10s)
+//   数十秒:轮询、连接池中转                  (30s / 60s)
+//   分钟到小时:长连接、DB pool / keep-alive / 流式 RPC(5min / 30min / 2h)
+// 老配置顶端封死在 60s,生产里持久连接全挤进 +Inf;100ms→1s 中间又跨整个数量级
+// 没桶,业务请求最密集那段反而看不到细节——这次一并补全。
 static TCP_LIFETIME_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "caretta_tcp_connection_lifetime_seconds",
         "duration in seconds between SYN_SENT/SYN_RECV and TCP_CLOSE for each observed connection",
     )
-    .buckets(vec![0.001, 0.01, 0.1, 1.0, 5.0, 10.0, 20.0, 40.0, 60.0]);
+    .buckets(vec![
+        0.005, 0.025, 0.1, 0.25, 0.5, // 亚秒
+        1.0, 2.5, 10.0, // 秒级
+        30.0, 60.0, // 数十秒
+        300.0, 1800.0, 7200.0, // 分钟 / 小时
+    ]);
     let h = HistogramVec::new(
         opts,
         &[
