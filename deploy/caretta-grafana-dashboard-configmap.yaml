@@ -571,7 +571,7 @@ data:
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "description": "所选窗口内重传 TCP 段数最多的工作负载排行。底层是 tcp_retransmit_skb 上报的 segs 计数累加——数值高通常意味着丢包、链路拥塞或网卡异常。要判断严重程度,把它和该负载的吞吐量对比看。",
+          "description": "所选窗口内重传 TCP 段数最多的工作负载排行。无论该负载是 client 还是 server,只要参与的连接发生重传就计入(底层是 tcp_retransmit_skb 上报的 segs 计数)。数值高通常意味着丢包、链路拥塞或网卡异常,严重程度结合该负载吞吐量看。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -640,7 +640,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "topk(8, sum by (client_name) (increase(caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"}[$__range])))",
+              "expr": "topk(8, sum by (workload) ( label_replace( increase(caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\"}[$__range]), \"workload\", \"$1\", \"client_name\", \"(.*)\") or label_replace( increase(caretta_tcp_retransmits_total{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\"}[$__range]), \"workload\", \"$1\", \"server_name\", \"(.*)\") )) > 0",
               "format": "time_series",
               "instant": true,
               "legendFormat": "__auto",
@@ -718,7 +718,7 @@ data:
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "topk(7, sum by (client_name, server_name) ( increase( (caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\", client_kind!~\"(node|external)\"} or caretta_tcp_retransmits_total{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\", server_kind!~\"(node|external)\"})[$__range:]) ) ) > 0",
+              "expr": "topk(7, sum by (client_name, server_name) ( increase(caretta_tcp_retransmits_total{client_namespace=~\"$namespace\", client_kind=~\"$kind\", client_name=~\"$workload\", server_port=~\"$port\", client_kind!~\"(node|external)\"}[$__range]) or increase(caretta_tcp_retransmits_total{server_namespace=~\"$namespace\", server_kind=~\"$kind\", server_name=~\"$workload\", server_port=~\"$port\", server_kind!~\"(node|external)\"}[$__range]) ) ) > 0",
               "format": "time_series",
               "instant": true,
               "legendFormat": "{{client_name}} ⮂ {{server_name}}",
