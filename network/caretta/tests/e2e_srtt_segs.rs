@@ -1,13 +1,13 @@
-//! E2E: caretta_tcp_srtt_seconds + caretta_tcp_segs_{in,out}_total 必须在真实 TCP
-//! 流量下出合理的值。
+//! E2E: caretta_tcp_srtt_seconds + caretta_tcp_segs_{in,out}_total +
+//! caretta_links_observed 必须在真实 TCP 流量下出合理的值。
 //!
 //! 守的是 wiring guards / 单元 / BTF 三层都覆盖不到的"运行时事实":
-//!   1. tcp_cleanup_rbuf fentry 在当前 kernel 上能挂上 + 真触发
+//!   1. tcp_sendmsg / tcp_cleanup_rbuf fentry 在当前 kernel 上能挂上 + 真触发
 //!   2. TCP_SOCK_OFFSETS 解出的偏移读到的就是 srtt_us / segs_in / segs_out
 //!      (不是别的字段错位的垃圾值)
-//!   3. 用户态 SOCK_SAMPLES 真的被 lookup + 喂给 prom histogram / counter
+//!   3. 用户态 SOCK_SAMPLES + CONNECTIONS 真的被 lookup + 喂给 prom 直方图/计数器
 //!   4. /metrics 端点上 srtt 直方图 sum/count 与人为加的 50ms RTT 一致,
-//!      segs_in/out 计数随流量真实增长
+//!      segs_in/out 计数随流量真实增长,bytes counter 与应用层发送字节数对得上
 //!
 //! 用 50ms netem delay 是关键:在 lo 上无 delay 时 srtt 在 10-30µs 量级,
 //! 加了 delay 后跳到 ms 量级——断"avg 落在 [1ms, 10s]"既能挡住"读到的是常数 0 /
@@ -358,5 +358,38 @@ fn caretta_srtt_and_segs_must_reflect_real_traffic_under_netem_delay() {
         "[segs] testing flow segs_in={in_v} segs_out={out_v} (✓ 双向流量被精准采到)"
     );
 
-    eprintln!("[PASS] srtt + segs 在真实流量 + 50ms netem delay 下均符合预期");
+    // ── bytes:caretta_links_observed 必须真实反映应用层流量 ──────────────────
+    //
+    // 走与 srtt/segs 同一条采样链(tcp_sendmsg + tcp_cleanup_rbuf 的 fentry RMW),不另
+    // 起一轮流量——同 link label 双重定位 testing flow 那条 series。
+    //
+    // user 发 4MB,server 端 sock 不在 SOCK_TO_CONNECTION(child sock 不走 tcp_set_state),
+    // 只能采到 client 端视角:bytes_sent ≈ 4MB(client→server bulk)、bytes_received ≈
+    // 32×8B ≈ 256B(server echo)。link metric = bytes_sent + bytes_received ≈ 4MB。
+    //
+    // 下界 3MB:留 25% 余量给"主循环最后一拍漏采"(sample 在 conn close 时被抹,死亡
+    // tick 不再追加);上界 8MB:防"读到的字段不是 bytes 而是 segs / timestamps"(那种
+    // 情况下数值会偏离 4MB 量级一个数量级以上)。
+    let bytes_v = testing_flow_counter(&body, "caretta_links_observed")
+        .unwrap_or_else(|| panic!(
+            "caretta_links_observed 里没有 testing flow 这条 link.\n\
+             links_observed 全量行:\n{}",
+            body.lines()
+                .filter(|l| l.starts_with("caretta_links_observed"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    let payload_lo: f64 = 3.0 * 1024.0 * 1024.0;
+    let payload_hi: f64 = 8.0 * 1024.0 * 1024.0;
+    assert!(
+        (payload_lo..payload_hi).contains(&bytes_v),
+        "testing flow bytes = {bytes_v}, 不在 [3MB, 8MB] 区间.\n\
+         应用层发 4MB + echo 256B,bytes_sent + bytes_received 期望 ≈ 4MB.\n\
+         偏离一个数量级通常意味着 tcp_sendmsg / tcp_cleanup_rbuf 的 RMW 累加路径出错."
+    );
+    eprintln!(
+        "[bytes] testing flow bytes={bytes_v:.0} (≈ 4MB ✓ throughput counter 正确)"
+    );
+
+    eprintln!("[PASS] srtt + segs + bytes 在真实流量 + 50ms netem delay 下均符合预期");
 }
