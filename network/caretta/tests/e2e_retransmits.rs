@@ -158,7 +158,6 @@ fn sum_caretta_retransmits_total(metrics: &str) -> f64 {
 }
 
 #[test]
-#[ignore]
 fn caretta_tcp_retransmits_total_must_grow_under_netem_loss() {
     require_root();
     let _netem = LoNetem::setup();

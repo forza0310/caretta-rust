@@ -3,7 +3,7 @@
 use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash_parts};
 use log::warn;
 use once_cell::sync::Lazy;
-use prometheus::{CounterVec, Gauge, GaugeVec, HistogramVec, IntCounter, Opts, exponential_buckets};
+use prometheus::{CounterVec, Gauge, GaugeVec, HistogramVec, IntCounter, Opts};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -116,15 +116,13 @@ static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
 // label 集合与 caretta_tcp_states 完全相同——这样 TcpTable GC 一条 series 时可以
 // 用同一组 label 把这边的直方图 series 也一并 forget 掉,不必再造一套生命周期。
 //
-// buckets 选取:exponential_buckets(0.001, 4, 9) ≈ 1ms / 4ms / 16ms / 64ms / 256ms /
-// 1s / 4s / 16s / 64s。覆盖从短 RPC 到长连接的常见跨度,9 个桶在 cardinality 与
-// 分辨率之间是个均衡点。需要更长尾的场景再调,避免上来就 10+ 桶把存储压力顶上去。
+// buckets 手工挑(1ms / 10ms / 100ms / 1s / 5s / 10s / 20s / 40s / 60s,+Inf 由
 static TCP_LIFETIME_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "caretta_tcp_connection_lifetime_seconds",
         "duration in seconds between SYN_SENT/SYN_RECV and TCP_CLOSE for each observed connection",
     )
-    .buckets(exponential_buckets(0.001, 4.0, 9).expect("lifetime buckets"));
+    .buckets(vec![0.001, 0.01, 0.1, 1.0, 5.0, 10.0, 20.0, 40.0, 60.0]);
     let h = HistogramVec::new(
         opts,
         &[
