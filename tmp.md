@@ -27,6 +27,26 @@ role
 
 12 个 label（同上去掉 IP），value ∈ {1=OPEN, 2=ACCEPT, 3=CLOSED}。
 
+#### `caretta_tcp_connection_lifetime_seconds` — 连接存活时长（Histogram）
+
+label 与 `caretta_tcp_states` 同。一条连接 CLOSE 时 observe 一次 `close_ns - open_ns` 转秒;
+bucket 从 1ms 跨到 ~1000s,可挑出超短(SYN 立刻 RST)/超长(连接池长存活)两端。
+
+#### `caretta_tcp_retransmits_total` — 重传计数（Counter）
+
+label 与 `caretta_links_observed` 同。eBPF fentry `tcp_retransmit_skb` 每次触发 +1,
+用户态走 delta 上报;高重传率 = 链路丢包或拥塞窗口被打回。
+
+#### `caretta_tcp_srtt_seconds` — 平滑 RTT 直方图(Histogram)
+
+label 与 `caretta_tcp_states` 同。eBPF 在 `tcp_cleanup_rbuf` 路径上采样 `tp->srtt_us` 写入
+快照,用户态收割时 observe 一次。bucket 100µs → 1.6s,kernel 端编码 us<<3 已折算为秒。
+
+#### `caretta_tcp_segs_in_total` / `caretta_tcp_segs_out_total` — 收发包数(Counter)
+
+label 与 `caretta_links_observed` 同。来源是 `tcp_sock.segs_in/out` 采样,做 delta 上报。
+配合字节数可算包平均大小、配合 retransmits 可算重传率分母。
+
 #### `caretta_k8s_events_total` — K8s 事件（Counter）
 
 5 个 label：
@@ -54,10 +74,14 @@ workload_kind, workload_name
 | 拓扑 | ✅ 全量 ground truth（eBPF 看 socket，跑不掉） | ⚠️ 仅有埋点的服务才能看到 |
 | L7 协议 | ❌ 无 | ✅ HTTP/gRPC 完整 |
 | 字节数 | ✅ 精确 | ❌ 通常没有 |
-| 延迟 | ❌ 无 | ✅ span duration |
+| 收发包数 | ✅ 精确（tcp_sock 采样） | ❌ |
+| 网络延迟 | ✅ smoothed RTT 直方图 | ❌（只有应用 span duration） |
+| 应用延迟 | ❌ 无 | ✅ span duration |
+| 重传 | ✅ tcp_retransmit_skb fentry 计数 | ❌ |
+| 连接寿命 | ✅ open→close 直方图 | ❌ |
 | 错误率 | ❌ 无 | ✅ status_code |
 | K8s 事件 | ✅ 单独通道 | ❌ |
-| TCP 异常 | ✅ 状态变化 | ❌ |
+| TCP 状态变化 | ✅ Gauge OPEN/ACCEPT/CLOSED | ❌ |
 
 **这给出了一个很有价值的组合**：caretta 提供"实际在通信的图"，SigNoz 提供"应用层语义"，K8s 事件提供"基础设施事件"。三者在时间轴上对齐就能做多模态异常检测和根因。
 

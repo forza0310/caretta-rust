@@ -72,6 +72,71 @@ static LINKS_RETRANSMITS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
     c
 });
 
+// 每条 link 上 TCP 收/发的累计段数。eBPF 端 cleanup_rbuf 采样到 SOCK_SAMPLES,
+// 用户态按 link 求和做 delta;label 与 caretta_links_observed 同。
+//
+// 与 throughput 的差异:throughput 有 LinkState past 留存,segs 没有——sock 采样在
+// conn close 时即清,死亡 conn 最后一拍会丢一段,saturating_sub 保 Counter 单调。
+static LINKS_SEGS_IN_METRICS: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
+        Opts::new(
+            "caretta_tcp_segs_in_total",
+            "TCP segments received per link since launch (sampled from tcp_sock.segs_in on each tcp_cleanup_rbuf tick)",
+        ),
+        &[
+            "link_id",
+            "client_id",
+            "client_ip",
+            "client_name",
+            "client_namespace",
+            "client_kind",
+            "client_owner",
+            "server_id",
+            "server_ip",
+            "server_port",
+            "server_name",
+            "server_namespace",
+            "server_kind",
+            "role",
+        ],
+    )
+    .expect("create caretta_tcp_segs_in_total");
+    prometheus::default_registry()
+        .register(Box::new(c.clone()))
+        .expect("register caretta_tcp_segs_in_total");
+    c
+});
+
+static LINKS_SEGS_OUT_METRICS: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
+        Opts::new(
+            "caretta_tcp_segs_out_total",
+            "TCP segments transmitted per link since launch (sampled from tcp_sock.segs_out on each tcp_cleanup_rbuf tick)",
+        ),
+        &[
+            "link_id",
+            "client_id",
+            "client_ip",
+            "client_name",
+            "client_namespace",
+            "client_kind",
+            "client_owner",
+            "server_id",
+            "server_ip",
+            "server_port",
+            "server_name",
+            "server_namespace",
+            "server_kind",
+            "role",
+        ],
+    )
+    .expect("create caretta_tcp_segs_out_total");
+    prometheus::default_registry()
+        .register(Box::new(c.clone()))
+        .expect("register caretta_tcp_segs_out_total");
+    c
+});
+
 // 每条 link 上次上报到的累计字节数。
 //
 // 生命周期管理：与 main.rs `links` 表一一对应。链路 GC 时（main.rs 的 retain）调
@@ -82,6 +147,13 @@ static LAST_LINK_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
 // 同 LAST_LINK_TOTALS,但跟踪重传 counter 的差分基准。两张表必须由 forget_link 同步
 // 清,只清一边等于没清——下次 link 复活会把累计值灌成 delta 造成 counter 毛刺。
 static LAST_LINK_RETRANS_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// segs_in/segs_out 的差分基准。和 retransmits 一样:link 生命周期由 forget_link 统一管,
+// 任何一张不清都会让同名 link 复活时 delta 失真,这里再加两张同步入栈。
+static LAST_LINK_SEGS_IN_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static LAST_LINK_SEGS_OUT_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
@@ -387,6 +459,54 @@ pub fn handle_link_retransmits(link: &NetworkLink, retransmits_total: u64) {
         .inc_by(delta as f64);
 }
 
+/// segs_in / segs_out 的 delta 上报。源是 SOCK_SAMPLES 里 per-conn last sample 在 link 维度的求和。
+///
+/// conn close 后 segs 字段随 sock 销毁,link 聚合可能下降——saturating_sub 把 delta 兜成 0,
+/// LAST 同步降到新值,下条 conn 把 segs 推回旧值之上时再正常累加。代价是死亡 conn 最后一拍丢失。
+pub fn handle_link_segs_in(link: &NetworkLink, segs_in_total: u64) {
+    let label_values = link_label_values(link);
+    let refs = as_str_array(&label_values);
+    let link_key = link_totals_key(&refs);
+
+    let delta = if let Ok(mut seen) = LAST_LINK_SEGS_IN_TOTALS.lock() {
+        let previous = seen.get(&link_key).copied().unwrap_or(0);
+        seen.insert(link_key, segs_in_total);
+        segs_in_total.saturating_sub(previous)
+    } else {
+        0
+    };
+
+    if delta == 0 {
+        return;
+    }
+
+    LINKS_SEGS_IN_METRICS
+        .with_label_values(&refs)
+        .inc_by(delta as f64);
+}
+
+pub fn handle_link_segs_out(link: &NetworkLink, segs_out_total: u64) {
+    let label_values = link_label_values(link);
+    let refs = as_str_array(&label_values);
+    let link_key = link_totals_key(&refs);
+
+    let delta = if let Ok(mut seen) = LAST_LINK_SEGS_OUT_TOTALS.lock() {
+        let previous = seen.get(&link_key).copied().unwrap_or(0);
+        seen.insert(link_key, segs_out_total);
+        segs_out_total.saturating_sub(previous)
+    } else {
+        0
+    };
+
+    if delta == 0 {
+        return;
+    }
+
+    LINKS_SEGS_OUT_METRICS
+        .with_label_values(&refs)
+        .inc_by(delta as f64);
+}
+
 /// 清理一条 link 占用的所有用户态/Prometheus 状态。GC 必须把 LAST_LINK_TOTALS 里
 /// 的"上次值"和 LINKS_METRICS 里的 series 一起删
 ///
@@ -400,9 +520,15 @@ pub fn forget_link(link: &NetworkLink) {
     if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
         seen.remove(&link_key);
     }
-    // retransmits 基准与 throughput 基准独立,GC 必须同步清——只清一边,下次同名 link
-    // 复活时另一边会把累计值灌成 delta,Counter 出现毛刺。
+    // 各差分基准独立维护,GC 必须把同一 link 的所有基准一并清——只清一份,下次同名
+    // link 复活时另一份会把累计值灌成 delta,对应 Counter 出现一次跳变毛刺。
     if let Ok(mut seen) = LAST_LINK_RETRANS_TOTALS.lock() {
+        seen.remove(&link_key);
+    }
+    if let Ok(mut seen) = LAST_LINK_SEGS_IN_TOTALS.lock() {
+        seen.remove(&link_key);
+    }
+    if let Ok(mut seen) = LAST_LINK_SEGS_OUT_TOTALS.lock() {
         seen.remove(&link_key);
     }
 
@@ -412,10 +538,16 @@ pub fn forget_link(link: &NetworkLink) {
     if let Err(e) = LINKS_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_links_observed series failed: {e} (labels: {refs:?})");
     }
-    // 重传 series 与字节 series 一一对应:有的 link 一直没重传过,这边删不到属于正常
-    // 边界,与 LINKS_METRICS 走同一条 warn 路径。
+    // 重传 / segs series 与字节 series 一一对应:有的 link 一直没重传 / 没 segs 样本,
+    // 这边删不到属于正常边界,与 LINKS_METRICS 走同一条 warn 路径。
     if let Err(e) = LINKS_RETRANSMITS_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_tcp_retransmits_total series failed: {e} (labels: {refs:?})");
+    }
+    if let Err(e) = LINKS_SEGS_IN_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_tcp_segs_in_total series failed: {e} (labels: {refs:?})");
+    }
+    if let Err(e) = LINKS_SEGS_OUT_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_tcp_segs_out_total series failed: {e} (labels: {refs:?})");
     }
 }
 
@@ -927,6 +1059,72 @@ mod tests {
         for link in &links {
             forget_link(link);
         }
+    }
+
+    // 与 forget_link_should_reset_retransmits_baseline 对称:segs_in/out 两条基准也必须
+    // 被 forget_link 一并清掉,否则同名 link 复活后 delta 失真。一次性把两个方向都断言,
+    // 避免后续 forget_link 增删字段时漏掉一边。
+    #[test]
+    fn forget_link_should_reset_segs_baselines() {
+        let link = mk_link("uniq-segs-c", "uniq-segs-s", ROLE_CLIENT);
+
+        handle_link_segs_in(&link, 100);
+        handle_link_segs_out(&link, 200);
+        // 同值重放 → delta=0,基准仍是 100 / 200。
+        handle_link_segs_in(&link, 100);
+        handle_link_segs_out(&link, 200);
+
+        forget_link(&link);
+
+        // forget 后再用相同 cumulative 值喂:基准被清空才能重建 series,remove 才能成功。
+        handle_link_segs_in(&link, 100);
+        handle_link_segs_out(&link, 200);
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        assert!(
+            LINKS_SEGS_IN_METRICS.remove_label_values(&refs).is_ok(),
+            "forget_link must reset segs_in baseline"
+        );
+        assert!(
+            LINKS_SEGS_OUT_METRICS.remove_label_values(&refs).is_ok(),
+            "forget_link must reset segs_out baseline"
+        );
+    }
+
+    // 零 delta(包括首次 0 与持平)不应触发 inc_by——避免在没有 segs 流动的 link 上
+    // 平白注册 series 占 cardinality。
+    #[test]
+    fn handle_link_segs_should_skip_zero_delta() {
+        let link = mk_link("zero-segs-c", "zero-segs-s", ROLE_CLIENT);
+        handle_link_segs_in(&link, 0);
+        handle_link_segs_out(&link, 0);
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        assert!(LINKS_SEGS_IN_METRICS.remove_label_values(&refs).is_err());
+        assert!(LINKS_SEGS_OUT_METRICS.remove_label_values(&refs).is_err());
+    }
+
+    // segs 聚合值在死亡 conn 拖累下会下降——必须保证 Counter 单调,且 LAST 跟着回退
+    // 让后续 delta 从新值起算。守住 handle_link_segs_in 的 saturating_sub 路径,后续若有人
+    // 把 saturating_sub 改成 wrapping_sub,Counter 会瞬间漂到 u64::MAX,这条断言会立刻爆。
+    #[test]
+    fn handle_link_segs_in_must_stay_monotonic_when_aggregate_drops() {
+        let link = mk_link("drop-segs-c", "drop-segs-s", ROLE_CLIENT);
+
+        handle_link_segs_in(&link, 1000);
+        // 模拟 conn 死亡:聚合下降到 0,delta 应被 saturating_sub 兜底成 0。
+        handle_link_segs_in(&link, 0);
+        // 新 conn 起步,从 5 重新累加:基准是 0,delta=5。Counter 此时应为 1005。
+        handle_link_segs_in(&link, 5);
+
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        let v = LINKS_SEGS_IN_METRICS.with_label_values(&refs).get();
+        assert_eq!(
+            v as u64, 1005,
+            "Counter must be 1000 (pre-drop) + 5 (post-recovery), never decrease"
+        );
+        forget_link(&link);
     }
 
     // 多线程并发 observe lifetime:_count 必须等于实际观测次数,_sum 必须等于

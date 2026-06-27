@@ -72,24 +72,28 @@ pub struct ConnectionThroughputStats {
 // vmlinux BTF 解出来写到 TCP_SOCK_OFFSETS map,eBPF 端按这些 offset 读 tcp_sock 字段。
 //
 // `struct sock *` 与 `struct tcp_sock *` 在 Linux 里同基址(tcp_sock 头部递归嵌入
-// inet_connection_sock → inet_sock → sock),所以 BTF 解出的 tcp_sock.srtt_us bit_offset
-// 直接当作相对 sk 指针的 byte offset。`_reserved` 预留给后续 segs_in/segs_out 偏移。
+// inet_connection_sock → inet_sock → sock),所以 BTF 解出的 tcp_sock 字段 bit_offset
+// 直接当作相对 sk 指针的 byte offset。`_reserved` 预留给后续要补的采样字段。
 pub struct TcpSockOffsets {
     pub srtt_us_off: u32,
-    pub _reserved: [u32; 3],
+    pub segs_in_off: u32,
+    pub segs_out_off: u32,
+    pub _reserved: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 // 每条连接最近一次观测到的 sock 采样型快照。cleanup_rbuf 路径 last-writer-wins
-// 覆写一次,用户态在收割 CONNECTION_STATES 时 lookup 拿"最近一次的 srtt"投到直方图。
+// 覆写一次,用户态在收割 CONNECTION_STATES 时 lookup 拿这一份快照投到对应指标。
 //
-// 不放 PerCpuHashMap 的理由:srtt 是 instantaneous gauge,加法无意义;放普通 HashMap
-// 接受微小竞写——u32 单条 store 在 x86 上原子,实际不撕裂。`_reserved` 预留给后续
-// segs_in / segs_out 等 u32 计数器接力使用。
+// 不放 PerCpuHashMap 的理由:srtt 是 gauge / segs 是 kernel 内部计数器,跨 CPU 求和
+// 没有意义,本就该 last-writer-wins。读写都走 BPF_MAP_LOOKUP/UPDATE_ELEM,内核 hashtab
+// 的 bucket lock 保证读者看到完整 entry——不依赖单字段原子性,扩到多字段也成立。
 pub struct SockSampleSnapshot {
     pub last_srtt_us: u32,
-    pub _reserved: [u32; 3],
+    pub last_segs_in: u32,
+    pub last_segs_out: u32,
+    pub _reserved: u32,
 }
 
 // ── ABI 契约:与用户态镜像结构体逐字节一致 ──────────────────────────────────
@@ -134,15 +138,19 @@ const _: () = {
     assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
     assert!(offset_of!(SockOffsets, skc_num_off) == 12);
 
-    // TcpSockOffsets: srtt_us_off(u32) + 3 × u32 预留 = 16 byte
+    // TcpSockOffsets: srtt_us_off + segs_in_off + segs_out_off + _reserved = 4 × u32
     assert!(size_of::<TcpSockOffsets>() == 16);
     assert!(align_of::<TcpSockOffsets>() == 4);
     assert!(offset_of!(TcpSockOffsets, srtt_us_off) == 0);
+    assert!(offset_of!(TcpSockOffsets, segs_in_off) == 4);
+    assert!(offset_of!(TcpSockOffsets, segs_out_off) == 8);
 
-    // SockSampleSnapshot: last_srtt_us(u32) + 3 × u32 预留 = 16 byte
+    // SockSampleSnapshot: last_srtt_us + last_segs_in + last_segs_out + _reserved = 4 × u32
     assert!(size_of::<SockSampleSnapshot>() == 16);
     assert!(align_of::<SockSampleSnapshot>() == 4);
     assert!(offset_of!(SockSampleSnapshot, last_srtt_us) == 0);
+    assert!(offset_of!(SockSampleSnapshot, last_segs_in) == 4);
+    assert!(offset_of!(SockSampleSnapshot, last_segs_out) == 8);
 
     // role 常量两侧必须同值(用户态:ROLE_CLIENT / ROLE_SERVER)。
     assert!(CONNECTION_ROLE_CLIENT == 1);
@@ -204,9 +212,10 @@ static TCP_SOCK_OFFSETS: HashMap<u32, TcpSockOffsets> =
     HashMap::<u32, TcpSockOffsets>::with_max_entries(1, 0);
 
 #[map]
-// 每条连接最近一次的 sock 采样快照(目前只装 srtt)。cleanup_rbuf last-writer-wins 写入,
-// 用户态每 tick 在收割 CONNECTION_STATES 时 lookup → 观测进直方图。
-// max_entries 与 CONNECTION_STATES 同阶,close 路径与用户态 GC 都会同步删,避免泄漏。
+// 每条连接最近一次的 sock 采样快照(srtt_us / segs_in / segs_out)。cleanup_rbuf
+// last-writer-wins 写入,用户态每 tick 在收割 CONNECTION_STATES 时 lookup → 分别
+// 投到 srtt 直方图 / segs 计数器。max_entries 与 CONNECTION_STATES 同阶,close 路径
+// 与用户态 GC 都会同步删,避免泄漏。
 static SOCK_SAMPLES: HashMap<ConnectionIdentifier, SockSampleSnapshot> =
     HashMap::<ConnectionIdentifier, SockSampleSnapshot>::with_max_entries(131072, 0);
 
@@ -462,22 +471,27 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
         return Err(e);
     }
 
-    // srtt 采样:cleanup_rbuf 每次 ACK 段进来时,tp->srtt_us 都是当前最新的 smoothed RTT
-    // 估计。顺手按 TCP_SOCK_OFFSETS 给的偏移读一次写到 SOCK_SAMPLES。
+    // sock 采样:cleanup_rbuf 每次 ACK 段进来时,顺手把 tp 上最新的 srtt_us / segs_in /
+    // segs_out 读一份写到 SOCK_SAMPLES,用户态收割时拿来分别喂 srtt 直方图与 segs 计数器。
     //
     // 容错:TCP_SOCK_OFFSETS 缺失(BTF populate race)时直接跳过——throughput 已经记上了,
-    // 不要为采样字段把这条 ACK 整条丢掉。读到的 srtt_us==0 也跳过:0 是 tp 初始值,kernel
-    // 还没拿到任何 RTT 样本前都是 0,写进去会把直方图首桶刷糊。
+    // 不要为采样字段把这条 ACK 整条丢掉。srtt_us==0 是 tp 初始值(kernel 还没拿到任何 RTT
+    // 样本前都是 0),写进去会把直方图首桶刷糊——所以即便 segs 已经非零,srtt==0 时整条
+    // 采样仍跳过;反正下一次 cleanup_rbuf 会带着真正非零的 srtt 把 segs 一并写进来。
     let off_key = 0u32;
     if let Some(tcp_off) = unsafe { TCP_SOCK_OFFSETS.get(&off_key) } {
         if let Some(srtt_us) = read_sock_field::<u32>(sk as u64, tcp_off.srtt_us_off)
             && srtt_us > 0
         {
+            let segs_in = read_sock_field::<u32>(sk as u64, tcp_off.segs_in_off).unwrap_or(0);
+            let segs_out = read_sock_field::<u32>(sk as u64, tcp_off.segs_out_off).unwrap_or(0);
             let snap = SockSampleSnapshot {
                 last_srtt_us: srtt_us,
-                _reserved: [0; 3],
+                last_segs_in: segs_in,
+                last_segs_out: segs_out,
+                _reserved: 0,
             };
-            // insert 失败只 warn 不返回错误:srtt 采样丢一拍不影响其他指标。
+            // insert 失败只 warn 不返回错误:采样丢一拍不影响其他指标。
             if let Err(e) = SOCK_SAMPLES.insert(&key, &snap, 0) {
                 warn!(ctx, "SOCK_SAMPLES insert failed: err={}", e);
             }

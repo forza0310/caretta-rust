@@ -49,33 +49,37 @@ pub struct SockOffsets {
 /// `struct tcp_sock` 关键字段相对 sk 指针的 byte offset。
 ///
 /// 内核里 `struct tcp_sock` 头部递归嵌入 `inet_connection_sock` → `inet_sock` → `sock`,
-/// `struct sock *` 与 `struct tcp_sock *` 同一基址,所以 BTF 解出的 `tcp_sock.srtt_us`
+/// `struct sock *` 与 `struct tcp_sock *` 同一基址,所以 BTF 解出的 `tcp_sock.<field>`
 /// bit_offset 可以直接当成相对 sk 指针的 byte offset 走 `bpf_probe_read_kernel`。
 ///
-/// `_reserved` 预留 12 byte 给后续要采的 `segs_in` / `segs_out` 偏移补进来——结构总大小
-/// 保持 16 byte 不变,新增字段不会推动 ABI。
+/// `_reserved` 给后续要补的采样字段(如 `delivered`)留位,占满后 struct 总大小
+/// 仍 16 byte 不变。
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TcpSockOffsets {
     pub srtt_us_off: u32,
-    pub _reserved: [u32; 3],
+    pub segs_in_off: u32,
+    pub segs_out_off: u32,
+    pub _reserved: u32,
 }
 
-/// 单条 sock 的采样型 gauge 快照。`tcp_cleanup_rbuf` 每次 ACK 处理时 last-writer-wins
-/// 覆写一次,用户态在收割连接状态时顺手 lookup 当作"最近一次观测的 srtt"喂直方图。
+/// 单条 sock 的采样型快照。`tcp_cleanup_rbuf` 每次 ACK 处理时 last-writer-wins
+/// 覆写一次,用户态在收割连接状态时顺手 lookup 拿这一份快照:`last_srtt_us` 喂直方图,
+/// `last_segs_{in,out}` 当作 monotonic counter 喂 segs 计数器。
 ///
 /// 这一族字段语义与 `ConnectionThroughputStats` 完全不同:
 ///   - throughput 是 monotonic counter,跨 CPU 各加各的、用户态聚合求和——所以放
 ///     PerCpuHashMap。
-///   - srtt 是 instantaneous gauge,加法无意义、各 CPU 看到的值刷新即覆盖——所以放
-///     普通 HashMap,接受微小竞写(u32 写在 x86 上单条 store 不会撕裂)。
-///
-/// `_reserved` 与 `TcpSockOffsets` 配对:后续 segs_in/out 采样字段填这里,不动 ABI。
+///   - sock 采样里 srtt 是 gauge / segs 是 kernel 内部计数器,跨 CPU 求和无意义——所以
+///     放普通 HashMap,接受 last-writer-wins。读者通过 hashtab bucket lock 总能看到完整
+///     entry,不依赖单字段原子性。
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct SockSampleSnapshot {
     pub last_srtt_us: u32,
-    pub _reserved: [u32; 3],
+    pub last_segs_in: u32,
+    pub last_segs_out: u32,
+    pub _reserved: u32,
 }
 
 unsafe impl aya::Pod for ConnectionTuple {}
@@ -127,16 +131,19 @@ const _: () = {
     assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
     assert!(offset_of!(SockOffsets, skc_num_off) == 12);
 
-    // TcpSockOffsets: srtt_us_off(u32) + 3 × u32 预留 = 16 byte。预留槽算结构的不可
-    // 分割部分,size 一动两侧立刻在编译期炸。
+    // TcpSockOffsets: 4 × u32,前三个字段固定占用,_reserved 给未来的采样字段。
     assert!(size_of::<TcpSockOffsets>() == 16);
     assert!(align_of::<TcpSockOffsets>() == 4);
     assert!(offset_of!(TcpSockOffsets, srtt_us_off) == 0);
+    assert!(offset_of!(TcpSockOffsets, segs_in_off) == 4);
+    assert!(offset_of!(TcpSockOffsets, segs_out_off) == 8);
 
-    // SockSampleSnapshot: last_srtt_us(u32) + 3 × u32 预留 = 16 byte。同 TcpSockOffsets。
+    // SockSampleSnapshot: 4 × u32,与 TcpSockOffsets 对齐
     assert!(size_of::<SockSampleSnapshot>() == 16);
     assert!(align_of::<SockSampleSnapshot>() == 4);
     assert!(offset_of!(SockSampleSnapshot, last_srtt_us) == 0);
+    assert!(offset_of!(SockSampleSnapshot, last_segs_in) == 4);
+    assert!(offset_of!(SockSampleSnapshot, last_segs_out) == 8);
 
     // role 常量两侧必须同值(eBPF 侧:CONNECTION_ROLE_CLIENT / _SERVER)。
     assert!(ROLE_CLIENT == 1);

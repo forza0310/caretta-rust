@@ -281,7 +281,10 @@ async fn main() -> anyhow::Result<()> {
                 let now = Instant::now();
                 tick += 1;
 
-                let mut current_links: HashMap<NetworkLink, (u64, u64)> = HashMap::new();
+                // current_links 每条 link 上四个累计量:(bytes, retransmits, segs_in, segs_out)。
+                // 前两个有 LinkState past 兜底累计,后两个走 sock 采样、conn close 时即清,
+                // 死亡 conn 最后一拍会丢——handle_link_segs_in/out 用 saturating_sub 保单调。
+                let mut current_links: HashMap<NetworkLink, (u64, u64, u64, u64)> = HashMap::new();
                 // 本 tick 在 eBPF map 里实际见到（活跃或刚关闭）的 link 集合——只有
                 // 这些 link 在 GC 端会被刷新 last_active。已经从 eBPF map 消失、仅靠
                 // past 累计值留在 links 表里的 link 不在此集合中，它们会自然老化。
@@ -297,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
                 // 主循环以 CONNECTION_STATES 为权威连接清单——它在 sock_set_state 路径上
                 // open 时写 1、close 时写 0
                 //
-                // pending 元组里夹带 srtt 采样:Pass 1 拿 conn 时顺手 lookup SOCK_SAMPLES,
+                // pending 元组里夹带 sock 采样:Pass 1 拿 conn 时顺手 lookup SOCK_SAMPLES,
                 // 没采到(连接还没收过 ACK / sock 刚 reset)就给 None,Pass 2 / observe 阶段
                 // 跳过即可。lookup 必须在这里做——Pass 2 之后只剩 resolved 出来的
                 // TcpConnection,失去与原始 ConnectionIdentifier 的关联,无法再查 map。
@@ -324,8 +327,9 @@ async fn main() -> anyhow::Result<()> {
                         Err(_) => ConnectionThroughputStats::default(),
                     };
 
-                    // srtt 采样:lookup 失败(没采到)是 happy 路径,不报错。
-                    let srtt_sample = sock_samples.get(&conn, 0).ok();
+                    // sock 采样:lookup 失败(没采到)是 happy 路径,不报错。snapshot 内含
+                    // srtt_us / segs_in / segs_out,下游 Pass 2 与 observe 阶段各取所需。
+                    let sample = sock_samples.get(&conn, 0).ok();
 
                     if is_active == 0 {
                         to_delete.push(conn);
@@ -336,45 +340,52 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    pending.push((conn, is_active, throughput, srtt_sample));
+                    pending.push((conn, is_active, throughput, sample));
                 }
 
                 // Pass 2:resolver 调用并发 fan-out。
                 let resolver_ref = resolver.as_ref();
                 let resolved = futures_util::future::join_all(pending.into_iter().map(
-                    |(conn, is_active, throughput, srtt_sample)| async move {
+                    |(conn, is_active, throughput, sample)| async move {
                         let link = reduce_connection_to_link(resolver_ref, conn).await.ok()?;
                         let tcp =
                             reduce_connection_to_tcp(resolver_ref, conn, throughput, is_active)
                                 .await
                                 .ok()?;
-                        Some((link, tcp, throughput, srtt_sample))
+                        Some((link, tcp, throughput, sample))
                     },
                 ))
                 .await;
 
-                // current_tcp_connections 同时把 srtt 采样一起带过来——同一条 tcp 上立刻
-                // 喂直方图,不再额外存第三张表。
+                // current_tcp_connections 同时把 sock 采样一起带过来——同一条 tcp 上立刻
+                // 喂 srtt 直方图,不再额外存第三张表。
                 let mut current_tcp_connections: Vec<(TcpConnection, Option<SockSampleSnapshot>)> =
                     Vec::new();
-                for (link, tcp, throughput, srtt_sample) in resolved.into_iter().flatten() {
+                for (link, tcp, throughput, sample) in resolved.into_iter().flatten() {
                     let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
-                    let entry = current_links.entry(link.clone()).or_insert((0, 0));
+                    let entry = current_links.entry(link.clone()).or_insert((0, 0, 0, 0));
                     entry.0 += bytes;
                     entry.1 += throughput.retransmits;
+                    // segs 来源是 sock 采样而非 throughput,所以独立累加;没采到就贡献 0。
+                    if let Some(s) = sample {
+                        entry.2 += s.last_segs_in as u64;
+                        entry.3 += s.last_segs_out as u64;
+                    }
                     link_seen_this_tick.insert(link);
-                    current_tcp_connections.push((tcp, srtt_sample));
+                    current_tcp_connections.push((tcp, sample));
                 }
 
                 metrics::set_map_size(items_counter);
                 metrics::set_filtered_loopback_connections(loopback_counter);
 
-                // 把已死亡 link 的累计字节数合并进本 tick 的 current_links。注意只读
+                // 把已死亡 link 的累计字节数 / 重传合并进本 tick 的 current_links。注意只读
                 // 不写——last_active 不在这里刷新，否则一条死了一小时的 link 仍会每
                 // tick 被"复活"，GC 永远不触发。真正活着的证据只有两条：本 tick 在
                 // eBPF map 里看到（link_seen_this_tick），或被加入 to_delete（下面）。
+                //
+                // segs 不在这里追加:LinkState 不带 cumulative_segs,sock 采样 close 即清。
                 for (past_link, past_state) in links.iter() {
-                    let entry = current_links.entry(past_link.clone()).or_insert((0, 0));
+                    let entry = current_links.entry(past_link.clone()).or_insert((0, 0, 0, 0));
                     entry.0 += past_state.cumulative_bytes;
                     entry.1 += past_state.cumulative_retransmits;
                 }
@@ -425,19 +436,21 @@ async fn main() -> anyhow::Result<()> {
                 // 上报 link counter。同时对"本 tick 真正看到的"link 刷新 last_active
                 // ——已死、靠 past 累计值进 current_links 的 link 不进 link_seen，
                 // 不被刷新，也就不会逃过 GC。
-                for (link, (throughput, retransmits)) in current_links {
+                for (link, (throughput, retransmits, segs_in, segs_out)) in current_links {
                     metrics::handle_link_metric(&link, throughput);
                     metrics::handle_link_retransmits(&link, retransmits);
+                    metrics::handle_link_segs_in(&link, segs_in);
+                    metrics::handle_link_segs_out(&link, segs_out);
                     if link_seen_this_tick.contains(&link) {
                         links.touch(link, now, 0, 0);
                     }
                 }
 
-                for (tcp, srtt_sample) in current_tcp_connections {
+                for (tcp, sample) in current_tcp_connections {
                     metrics::handle_tcp_metric(&tcp);
                     // 采到非零样本才喂直方图,避免给 histogram 灌 0 误导分位数。
                     // kernel 端 srtt_us 编码是 真实 us << 3,所以先 / 8 再 / 1e6 转秒。
-                    if let Some(sample) = srtt_sample
+                    if let Some(sample) = sample
                         && sample.last_srtt_us > 0
                     {
                         let secs = (sample.last_srtt_us as f64) / 8.0 / 1_000_000.0;
