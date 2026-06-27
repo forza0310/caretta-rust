@@ -87,3 +87,20 @@ fn should_register_lifetime_histogram_with_tcp_state_labels() {
         "forget_tcp must also forget the lifetime histogram series"
     );
 }
+
+#[test]
+fn should_purge_connection_open_ts_alongside_connection_states() {
+    // sock 异常拆解(bpf reload / kernel 路径异常 / sock_cookie==0)时,eBPF 端
+    // mark_connection_closed 跑不到,CONNECTION_OPEN_TS 的 entry 会孤儿化。
+    // 用户态 purge dying connection 时必须 best-effort 跟着删,否则 131072
+    // 上限会被长期泄漏慢慢撑爆——这条守卫钉死 purge 块里两张表同生命周期。
+    let src = read("caretta/src/main.rs");
+    assert!(
+        src.contains("CONNECTION_OPEN_TS"),
+        "userspace must take CONNECTION_OPEN_TS map for purge cleanup"
+    );
+    assert!(
+        src.contains("connection_open_ts.remove"),
+        "purge path must remove CONNECTION_OPEN_TS entry alongside connection_states"
+    );
+}

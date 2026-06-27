@@ -156,6 +156,13 @@ async fn main() -> anyhow::Result<()> {
     let mut closed_lifetimes: BpfHashMap<_, ConnectionIdentifier, u64> =
         BpfHashMap::try_from(lifetimes_map)?;
 
+    let open_ts_map = ebpf
+        .take_map("CONNECTION_OPEN_TS")
+        .context("CONNECTION_OPEN_TS map not found")?;
+    // 仅在用户态 purge 路径上跟随 CONNECTION_STATES 删除做 best-effort 清理,避免孤儿化 entry 长期占位。
+    let mut connection_open_ts: BpfHashMap<_, ConnectionIdentifier, u64> =
+        BpfHashMap::try_from(open_ts_map)?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], opt.prometheus_port));
     let endpoint = opt.normalized_prometheus_endpoint();
@@ -359,6 +366,8 @@ async fn main() -> anyhow::Result<()> {
                     // CONNECTION_STATES 的 remove 才是关键路径,删失败下个 tick 会把它重新
                     // 列回 to_delete,需要 mark 一条失败计数。
                     let _ = connections.remove(&conn);
+                    // CONNECTION_OPEN_TS 同时清理
+                    let _ = connection_open_ts.remove(&conn);
 
                     if let Err(e) = connection_states.remove(&conn) {
                         warn!("Error deleting connection state from map: {e}");
