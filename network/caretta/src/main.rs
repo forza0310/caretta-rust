@@ -31,7 +31,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use types::{
     ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
+    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
     reduce_connection_to_tcp,
 };
 
@@ -95,6 +95,15 @@ async fn main() -> anyhow::Result<()> {
     kprobe_recv.load("tcp_cleanup_rbuf", &btf)?;
     kprobe_recv.attach()?;
 
+    // tcp_retransmit_skb fentry:每次 segs 重传累加到当前 CPU 的 retransmits 计数器,
+    // 走的 RMW 模板与 tcp_sendmsg / tcp_cleanup_rbuf 相同。漏挂等于这条计数器永远 0。
+    let kprobe_rtx: &mut FEntry = ebpf
+        .program_mut("handle_tcp_retransmit_skb")
+        .context("fentry program handle_tcp_retransmit_skb not found")?
+        .try_into()?;
+    kprobe_rtx.load("tcp_retransmit_skb", &btf)?;
+    kprobe_rtx.attach()?;
+
     // SOCK_OFFSETS:从 vmlinux BTF 解出的 sock_common 字段偏移,推到 eBPF 端给
     // try_handle_sock_set_state 走 bpf_probe_read_kernel 用。
     let offsets = parse_sock_offsets(std::path::Path::new(&opt.vmlinux_btf_path))?;
@@ -116,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     // 之后任何 tcp_sendmsg / tcp_cleanup_rbuf / inet_sock_set_state 都会触发我们的
     // ebpf 程序。把这条日志放在最后一次 attach() 之后,出现即代表 ebpf 侧上线。
     info!(
-        "eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + tp_btf inet_sock_set_state"
+        "eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + fentry tcp_retransmit_skb + tp_btf inet_sock_set_state"
     );
 
     // EbpfLogger::init 必须放在所有 program.load() 之后
@@ -138,6 +147,14 @@ async fn main() -> anyhow::Result<()> {
     // 用户态把它当一张普通 HashMap 读即可。
     let mut connection_states: BpfHashMap<_, ConnectionIdentifier, u64> =
         BpfHashMap::try_from(states_map)?;
+
+    let lifetimes_map = ebpf
+        .take_map("CLOSED_LIFETIMES")
+        .context("CLOSED_LIFETIMES map not found")?;
+    // close 时 eBPF 端把 lifetime(ns)投到这里。用户态每 tick 全量读+删,
+    // 当成一次性投递桶用——和 CONNECTION_STATES 同 key 体系便于 resolver 复用。
+    let mut closed_lifetimes: BpfHashMap<_, ConnectionIdentifier, u64> =
+        BpfHashMap::try_from(lifetimes_map)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], opt.prometheus_port));
@@ -238,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
                 let now = Instant::now();
                 tick += 1;
 
-                let mut current_links: HashMap<NetworkLink, u64> = HashMap::new();
+                let mut current_links: HashMap<NetworkLink, (u64, u64)> = HashMap::new();
                 // 本 tick 在 eBPF map 里实际见到（活跃或刚关闭）的 link 集合——只有
                 // 这些 link 在 GC 端会被刷新 last_active。已经从 eBPF map 消失、仅靠
                 // past 累计值留在 links 表里的 link 不在此集合中，它们会自然老化。
@@ -270,10 +287,7 @@ async fn main() -> anyhow::Result<()> {
                     // KeyNotFound 是合法的——open 之后还没传过字节,按零计。
                     let throughput = match connections.get(&conn, 0) {
                         Ok(per_cpu) => aggregate_per_cpu_throughput(per_cpu.iter().copied()),
-                        Err(_) => ConnectionThroughputStats {
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                        },
+                        Err(_) => ConnectionThroughputStats::default(),
                     };
 
                     if is_active == 0 {
@@ -304,7 +318,9 @@ async fn main() -> anyhow::Result<()> {
 
                 for (link, tcp, throughput) in resolved.into_iter().flatten() {
                     let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
-                    *current_links.entry(link.clone()).or_insert(0) += bytes;
+                    let entry = current_links.entry(link.clone()).or_insert((0, 0));
+                    entry.0 += bytes;
+                    entry.1 += throughput.retransmits;
                     link_seen_this_tick.insert(link);
                     current_tcp_connections.push(tcp);
                 }
@@ -317,8 +333,9 @@ async fn main() -> anyhow::Result<()> {
                 // tick 被"复活"，GC 永远不触发。真正活着的证据只有两条：本 tick 在
                 // eBPF map 里看到（link_seen_this_tick），或被加入 to_delete（下面）。
                 for (past_link, past_state) in links.iter() {
-                    *current_links.entry(past_link.clone()).or_insert(0) +=
-                        past_state.cumulative_bytes;
+                    let entry = current_links.entry(past_link.clone()).or_insert((0, 0));
+                    entry.0 += past_state.cumulative_bytes;
+                    entry.1 += past_state.cumulative_retransmits;
                 }
 
                 // remove 前对候选再查一次 CONNECTION_STATES,只放行仍 is_active==0 的。
@@ -335,10 +352,7 @@ async fn main() -> anyhow::Result<()> {
                     // 否则下个 tick 又会被列回 to_delete,死循环占位。
                     let throughput = match connections.get(&conn, 0) {
                         Ok(per_cpu) => aggregate_per_cpu_throughput(per_cpu.iter().copied()),
-                        Err(_) => ConnectionThroughputStats {
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                        },
+                        Err(_) => ConnectionThroughputStats::default(),
                     };
 
                     // CONNECTIONS 表的 remove 失败只是 best-effort 清理——可能本来就没 entry。
@@ -355,7 +369,8 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(link) = reduce_connection_to_link(resolver.as_ref(), conn).await {
                         let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
                         // 写入即"还活着的证据"——touch 刷新 last_active 让 GC 重新计时。
-                        links.touch(link, now, bytes);
+                        // 重传也一起接力,否则 dying link 的最后一段重传计数会丢。
+                        links.touch(link, now, bytes, throughput.retransmits);
                     }
                     metrics::mark_map_deletion();
                 }
@@ -363,16 +378,67 @@ async fn main() -> anyhow::Result<()> {
                 // 上报 link counter。同时对"本 tick 真正看到的"link 刷新 last_active
                 // ——已死、靠 past 累计值进 current_links 的 link 不进 link_seen，
                 // 不被刷新，也就不会逃过 GC。
-                for (link, throughput) in current_links {
+                for (link, (throughput, retransmits)) in current_links {
                     metrics::handle_link_metric(&link, throughput);
+                    metrics::handle_link_retransmits(&link, retransmits);
                     if link_seen_this_tick.contains(&link) {
-                        links.touch(link, now, 0);
+                        links.touch(link, now, 0, 0);
                     }
                 }
 
                 for tcp in current_tcp_connections {
                     metrics::handle_tcp_metric(&tcp);
                     tcp_states.observe(tcp, tick);
+                }
+
+                // ---- drain: closed-connection lifetimes ----
+                // eBPF 端在 mark_connection_closed 把 (conn, lifetime_ns) 投到 CLOSED_LIFETIMES,
+                // 用户态每 tick 全量收割一次:resolver 解出 TcpConnectionKey → observe 直方图 →
+                // 删 map 条目。
+                //
+                // 先 iter 收集再 remove,iter 期间删 entry 行为对 BPF HashMap 不安全;
+                // resolver 放到收集后再做(可能 await),避免在 iter 中 await。
+                let mut lifetime_entries: Vec<(ConnectionIdentifier, u64)> = Vec::new();
+                let mut lifetime_iter = closed_lifetimes.iter();
+                while let Some(entry) = lifetime_iter.next() {
+                    match entry {
+                        Ok((conn, lifetime_ns)) => lifetime_entries.push((conn, lifetime_ns)),
+                        Err(e) => warn!("failed to iterate CLOSED_LIFETIMES entry: {e}"),
+                    }
+                }
+                drop(lifetime_iter);
+
+                for (conn, _) in &lifetime_entries {
+                    if let Err(e) = closed_lifetimes.remove(conn) {
+                        // 删失败下一 tick 还会再次进入这块,duplicate observe 会把 histogram
+                        // 多加一笔——监控数据微小失真,优于丢失或死循环占位。
+                        warn!("failed to remove CLOSED_LIFETIMES entry: {e}");
+                    }
+                }
+
+                let resolver_ref = resolver.as_ref();
+                let lifetime_resolved =
+                    futures_util::future::join_all(lifetime_entries.into_iter().map(
+                        |(conn, lifetime_ns)| async move {
+                            // throughput/is_active 在 lifetime 路径里不参与 key——传 0 占位,
+                            // reduce_connection_to_tcp 只用 conn 解 client/server/port/role。
+                            let tcp = reduce_connection_to_tcp(
+                                resolver_ref,
+                                conn,
+                                ConnectionThroughputStats::default(),
+                                0,
+                            )
+                            .await
+                            .ok()?;
+                            // ns → secs:f64 在 millisecond 量级以上足够精度,直方图桶用秒为单位。
+                            let secs = (lifetime_ns as f64) / 1_000_000_000.0;
+                            Some((TcpConnectionKey::from(&tcp), secs))
+                        },
+                    ))
+                    .await;
+
+                for (key, secs) in lifetime_resolved.into_iter().flatten() {
+                    metrics::handle_tcp_lifetime(&key, secs);
                 }
 
                 // ---- GC: link series ----

@@ -78,11 +78,12 @@ const _: () = {
     assert!(offset_of!(ConnectionIdentifier, tuple) == 4);
     assert!(offset_of!(ConnectionIdentifier, role) == 16);
 
-    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64)
-    assert!(size_of::<ConnectionThroughputStats>() == 16);
+    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64) retransmits(u64)
+    assert!(size_of::<ConnectionThroughputStats>() == 24);
     assert!(align_of::<ConnectionThroughputStats>() == 8);
     assert!(offset_of!(ConnectionThroughputStats, bytes_sent) == 0);
     assert!(offset_of!(ConnectionThroughputStats, bytes_received) == 8);
+    assert!(offset_of!(ConnectionThroughputStats, retransmits) == 16);
 
     // SockOffsets: 4 × u32
     assert!(size_of::<SockOffsets>() == 16);
@@ -380,6 +381,7 @@ mod tests {
         let throughput = ConnectionThroughputStats {
             bytes_sent: 1,
             bytes_received: 2,
+            retransmits: 0,
         };
 
         let tcp = reduce_connection_to_tcp(&resolver, conn, throughput, 0)

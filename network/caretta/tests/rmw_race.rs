@@ -1,26 +1,24 @@
 //! 检查 BPF map RMW race 修复后,用户态收割侧能正确把 N 个 CPU 的字节计数副本
-//! 求和,不会因为并发写出现读写脏数据导致的统计不一致。
+//! 求和,不会因为并发写出现读写脏数据导致的统计不一致。retransmits 字段走同一条
+//! per-CPU RMW 路径,顺路一起守:聚合值必须严格等于"线程数 × 每线程写次数 × 每次写入"。
 
 use caretta::per_cpu::{ConnectionThroughputStats, aggregate_per_cpu_throughput};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 /// 模拟 PerCpuHashMap 模型:N 个写线程各自只动自己的副本,聚合时求和。
-/// 期望:总字节数 = 写线程数 × 每线程写次数 × 单次字节数,一字节不少。
+/// 期望:总字节数 = 写线程数 × 每线程写次数 × 单次字节数,一字节不少;
+/// 重传段数同理 = 总写次数 × 每次 segs。任何一段被丢都会让最终聚合不等。
 #[test]
 fn should_not_lose_bytes_under_concurrent_per_cpu_writes() {
     const CPUS: usize = 8;
     const WRITES_PER_CPU: usize = 100_000;
     const SEND_PER_WRITE: u64 = 1024;
     const RECV_PER_WRITE: u64 = 2048;
+    const RTX_PER_WRITE: u64 = 3;
 
     let slots: Vec<Arc<Mutex<ConnectionThroughputStats>>> = (0..CPUS)
-        .map(|_| {
-            Arc::new(Mutex::new(ConnectionThroughputStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-            }))
-        })
+        .map(|_| Arc::new(Mutex::new(ConnectionThroughputStats::default())))
         .collect();
 
     let barrier = Arc::new(Barrier::new(CPUS));
@@ -33,6 +31,7 @@ fn should_not_lose_bytes_under_concurrent_per_cpu_writes() {
                 let mut s = slot.lock().unwrap();
                 s.bytes_sent = s.bytes_sent.saturating_add(SEND_PER_WRITE);
                 s.bytes_received = s.bytes_received.saturating_add(RECV_PER_WRITE);
+                s.retransmits = s.retransmits.saturating_add(RTX_PER_WRITE);
             }
         }));
     }
@@ -47,6 +46,11 @@ fn should_not_lose_bytes_under_concurrent_per_cpu_writes() {
     let total_writes = (CPUS * WRITES_PER_CPU) as u64;
     assert_eq!(agg.bytes_sent, total_writes * SEND_PER_WRITE);
     assert_eq!(agg.bytes_received, total_writes * RECV_PER_WRITE);
+    assert_eq!(
+        agg.retransmits,
+        total_writes * RTX_PER_WRITE,
+        "aggregate retransmits must equal total writes × segs-per-write, no segment lost"
+    );
 }
 
 /// 反例对照:如果用单一共享槽做 RMW(修复前的模型),并发会丢字节。
@@ -60,10 +64,7 @@ fn should_show_shared_rmw_loses_bytes_without_per_cpu_split() {
 
     // 共享槽:多线程对同一份 struct 做 read-copy-write,模拟 BPF hash map 的
     // entry-level replace 语义(无字段级原子)。
-    let shared = Arc::new(Mutex::new(ConnectionThroughputStats {
-        bytes_sent: 0,
-        bytes_received: 0,
-    }));
+    let shared = Arc::new(Mutex::new(ConnectionThroughputStats::default()));
 
     let barrier = Arc::new(Barrier::new(THREADS));
     let mut handles = Vec::with_capacity(THREADS);

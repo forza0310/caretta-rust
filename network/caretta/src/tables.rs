@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 pub struct LinkState {
     /// 自启动以来这条 link 的累计字节数(活着的 + 已死亡部分)。每次 poll 合并出 current_links。
     pub cumulative_bytes: u64,
+    /// 同 cumulative_bytes,但跟踪重传 segs 总数。两个计数器并行维护是为了 dying-link
+    /// 合并路径:连接从 eBPF 端消失的瞬间,字节与重传都要把"最后一段没上报的累计"接
+    /// 力到用户态,否则下个 tick 上报会跌到 0 触发 prom counter reset。
+    pub cumulative_retransmits: u64,
     /// 最近一次"还在产生流量"的时间。GC 用 now() - last_active > TTL 判定回收。
     pub last_active: Instant,
 }
@@ -39,15 +43,24 @@ impl LinkTable {
         self.map.iter()
     }
 
-    /// 插入或刷新一条 link:`cumulative_bytes += add_bytes`、`last_active = now`,并同步索引。
+    /// 插入或刷新一条 link:`cumulative_bytes += add_bytes`、
+    /// `cumulative_retransmits += add_retransmits`、`last_active = now`,并同步索引。
     ///
-    /// - 本 tick 真见到的 link:`add_bytes = 0`(只刷新时间,保留累计值)。
-    /// - dying-link 合并路径:传入这条连接最后一段字节。
-    pub fn touch(&mut self, link: NetworkLink, now: Instant, add_bytes: u64) {
+    /// - 本 tick 真见到的 link:两个 add 都传 0(只刷新时间,保留累计值)。
+    /// - dying-link 合并路径:传入这条连接最后一段字节 + 最后一段重传计数。
+    pub fn touch(
+        &mut self,
+        link: NetworkLink,
+        now: Instant,
+        add_bytes: u64,
+        add_retransmits: u64,
+    ) {
         match self.map.get_mut(&link) {
             Some(state) => {
                 let old = state.last_active;
                 state.cumulative_bytes = state.cumulative_bytes.saturating_add(add_bytes);
+                state.cumulative_retransmits =
+                    state.cumulative_retransmits.saturating_add(add_retransmits);
                 state.last_active = now;
                 if old != now {
                     Self::bucket_remove(&mut self.by_active, old, &link);
@@ -59,6 +72,7 @@ impl LinkTable {
                     link.clone(),
                     LinkState {
                         cumulative_bytes: add_bytes,
+                        cumulative_retransmits: add_retransmits,
                         last_active: now,
                     },
                 );
@@ -316,8 +330,8 @@ mod tests {
         let mut t = LinkTable::new();
         let link = mk_link(0);
 
-        t.touch(link.clone(), base, 100);
-        t.touch(link.clone(), base + Duration::from_secs(10), 50);
+        t.touch(link.clone(), base, 100, 0);
+        t.touch(link.clone(), base + Duration::from_secs(10), 50, 0);
 
         assert_eq!(t.len(), 1);
         assert_eq!(t.index_entry_count(), 1); // 旧 base 桶已被清空,无残留
@@ -331,8 +345,8 @@ mod tests {
         let base = Instant::now();
         let mut t = LinkTable::new();
         let link = mk_link(0);
-        t.touch(link.clone(), base, 0);
-        t.touch(link.clone(), base + Duration::from_secs(10), 0);
+        t.touch(link.clone(), base, 0, 0);
+        t.touch(link.clone(), base + Duration::from_secs(10), 0, 0);
 
         // now - 旧base = 15s > ttl 12s;now - 新t1 = 5s <= 12s → 应保留。
         t.gc_older_than(base + Duration::from_secs(15), Duration::from_secs(12));
@@ -347,8 +361,8 @@ mod tests {
         let mut t = LinkTable::new();
         let old = mk_link(0);
         let fresh = mk_link(1);
-        t.touch(old.clone(), base, 0);
-        t.touch(fresh.clone(), base + Duration::from_secs(20), 0);
+        t.touch(old.clone(), base, 0, 0);
+        t.touch(fresh.clone(), base + Duration::from_secs(20), 0, 0);
 
         t.gc_older_than(base + Duration::from_secs(25), Duration::from_secs(12));
         assert!(!t.contains(&old)); // 25-0=25 > 12 删
@@ -364,7 +378,7 @@ mod tests {
         let mut t = LinkTable::new();
         let links: Vec<_> = (0..5).map(mk_link).collect();
         for (i, l) in links.iter().enumerate() {
-            t.touch(l.clone(), base + Duration::from_secs(i as u64), 0);
+            t.touch(l.clone(), base + Duration::from_secs(i as u64), 0, 0);
         }
 
         t.enforce_max(2);
@@ -379,7 +393,7 @@ mod tests {
     fn link_enforce_max_noop_under_cap() {
         let base = Instant::now();
         let mut t = LinkTable::new();
-        t.touch(mk_link(0), base, 0);
+        t.touch(mk_link(0), base, 0, 0);
         t.enforce_max(10);
         assert_eq!(t.len(), 1);
     }

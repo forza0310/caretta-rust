@@ -3,7 +3,7 @@
 use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash_parts};
 use log::warn;
 use once_cell::sync::Lazy;
-use prometheus::{CounterVec, Gauge, GaugeVec, IntCounter, Opts};
+use prometheus::{CounterVec, Gauge, GaugeVec, HistogramVec, IntCounter, Opts, exponential_buckets};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -39,11 +39,49 @@ static LINKS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
     c
 });
 
+// 每条 link 累计重传数。eBPF 端 tcp_retransmit_skb 按 segs 计入,用户态求和后做 delta。
+// label 与 caretta_links_observed 完全一致——这样 prom 端按 link join 两张表即可
+// 同时拿到字节量与重传次数,不需要再造一组身份维度。
+static LINKS_RETRANSMITS_METRICS: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
+        Opts::new(
+            "caretta_tcp_retransmits_total",
+            "TCP retransmitted segments observed per link since launch (sum of `segs` arg to tcp_retransmit_skb)",
+        ),
+        &[
+            "link_id",
+            "client_id",
+            "client_ip",
+            "client_name",
+            "client_namespace",
+            "client_kind",
+            "client_owner",
+            "server_id",
+            "server_ip",
+            "server_port",
+            "server_name",
+            "server_namespace",
+            "server_kind",
+            "role",
+        ],
+    )
+    .expect("create caretta_tcp_retransmits_total");
+    prometheus::default_registry()
+        .register(Box::new(c.clone()))
+        .expect("register caretta_tcp_retransmits_total");
+    c
+});
+
 // 每条 link 上次上报到的累计字节数。
 //
 // 生命周期管理：与 main.rs `links` 表一一对应。链路 GC 时（main.rs 的 retain）调
 // metrics::forget_link()，forget_link 会同时把这里的 entry 也抹掉，避免泄漏。
 static LAST_LINK_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// 同 LAST_LINK_TOTALS,但跟踪重传 counter 的差分基准。两张表必须由 forget_link 同步
+// 清,只清一边等于没清——下次 link 复活会把累计值灌成 delta 造成 counter 毛刺。
+static LAST_LINK_RETRANS_TOTALS: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
@@ -72,6 +110,43 @@ static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
         .register(Box::new(g.clone()))
         .expect("register caretta_tcp_states");
     g
+});
+
+// 连接 lifetime 直方图,close 时 observe 一次。
+// label 集合与 caretta_tcp_states 完全相同——这样 TcpTable GC 一条 series 时可以
+// 用同一组 label 把这边的直方图 series 也一并 forget 掉,不必再造一套生命周期。
+//
+// buckets 选取:exponential_buckets(0.001, 4, 9) ≈ 1ms / 4ms / 16ms / 64ms / 256ms /
+// 1s / 4s / 16s / 64s。覆盖从短 RPC 到长连接的常见跨度,9 个桶在 cardinality 与
+// 分辨率之间是个均衡点。需要更长尾的场景再调,避免上来就 10+ 桶把存储压力顶上去。
+static TCP_LIFETIME_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "caretta_tcp_connection_lifetime_seconds",
+        "duration in seconds between SYN_SENT/SYN_RECV and TCP_CLOSE for each observed connection",
+    )
+    .buckets(exponential_buckets(0.001, 4.0, 9).expect("lifetime buckets"));
+    let h = HistogramVec::new(
+        opts,
+        &[
+            "link_id",
+            "client_id",
+            "client_name",
+            "client_namespace",
+            "client_kind",
+            "client_owner",
+            "server_id",
+            "server_name",
+            "server_namespace",
+            "server_kind",
+            "server_port",
+            "role",
+        ],
+    )
+    .expect("create caretta_tcp_connection_lifetime_seconds");
+    prometheus::default_registry()
+        .register(Box::new(h.clone()))
+        .expect("register caretta_tcp_connection_lifetime_seconds");
+    h
 });
 
 static POLLS_MADE: Lazy<IntCounter> = Lazy::new(|| {
@@ -250,6 +325,31 @@ pub fn handle_link_metric(link: &NetworkLink, throughput: u64) {
     LINKS_METRICS.with_label_values(&refs).inc_by(delta as f64);
 }
 
+/// 同 handle_link_metric,但用 LAST_LINK_RETRANS_TOTALS 做差分基准。
+/// retransmits 是 eBPF 端 per-CPU 累加再用户态求和的"自启动以来累计"——必须做
+/// delta 才能喂 prom Counter,直接 inc 全量会让 counter 失真。
+pub fn handle_link_retransmits(link: &NetworkLink, retransmits_total: u64) {
+    let label_values = link_label_values(link);
+    let refs = as_str_array(&label_values);
+    let link_key = link_totals_key(&refs);
+
+    let delta = if let Ok(mut seen) = LAST_LINK_RETRANS_TOTALS.lock() {
+        let previous = seen.get(&link_key).copied().unwrap_or(0);
+        seen.insert(link_key, retransmits_total);
+        retransmits_total.saturating_sub(previous)
+    } else {
+        0
+    };
+
+    if delta == 0 {
+        return;
+    }
+
+    LINKS_RETRANSMITS_METRICS
+        .with_label_values(&refs)
+        .inc_by(delta as f64);
+}
+
 /// 清理一条 link 占用的所有用户态/Prometheus 状态。GC 必须把 LAST_LINK_TOTALS 里
 /// 的"上次值"和 LINKS_METRICS 里的 series 一起删
 ///
@@ -263,12 +363,22 @@ pub fn forget_link(link: &NetworkLink) {
     if let Ok(mut seen) = LAST_LINK_TOTALS.lock() {
         seen.remove(&link_key);
     }
+    // retransmits 基准与 throughput 基准独立,GC 必须同步清——只清一边,下次同名 link
+    // 复活时另一边会把累计值灌成 delta,Counter 出现毛刺。
+    if let Ok(mut seen) = LAST_LINK_RETRANS_TOTALS.lock() {
+        seen.remove(&link_key);
+    }
 
     // remove_label_values 失败一律 warn:大部分会是"GC 端在 series 从未注册过的
     // 边界条件下进来"(delta 一直是 0、从未 inc_by → not-found),不算 bug 但也是
     // 信号;真正要警惕的是 cardinality drift 这类开发期 bug——同一条日志路径处理。
     if let Err(e) = LINKS_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_links_observed series failed: {e} (labels: {refs:?})");
+    }
+    // 重传 series 与字节 series 一一对应:有的 link 一直没重传过,这边删不到属于正常
+    // 边界,与 LINKS_METRICS 走同一条 warn 路径。
+    if let Err(e) = LINKS_RETRANSMITS_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_tcp_retransmits_total series failed: {e} (labels: {refs:?})");
     }
 }
 
@@ -326,6 +436,23 @@ pub fn forget_tcp(key: &TcpConnectionKey) {
     if let Err(e) = TCP_STATE_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_tcp_states series failed: {e} (labels: {refs:?})");
     }
+    // lifetime 直方图与 tcp_states 同一套 label,GC 一起 forget——否则只清 gauge
+    // 不清 histogram,cardinality 还是会泄漏。
+    if let Err(e) = TCP_LIFETIME_METRICS.remove_label_values(&refs) {
+        // 边界事件:这条 series 从未 observe 过(短期内连开都没开成功就触发了 GC),
+        // 删不存在的 series 落到这里是正常的,不算 bug。
+        warn!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {refs:?})");
+    }
+}
+
+/// close 时把一条连接的 lifetime 投到直方图。`lifetime_secs` 由调用方做 ns→s 转换,
+/// 这里只负责按 TCP series 的 label 拼出 key 然后 observe。
+pub fn handle_tcp_lifetime(key: &TcpConnectionKey, lifetime_secs: f64) {
+    let label_values = tcp_label_values(key);
+    let refs = as_str_array(&label_values);
+    TCP_LIFETIME_METRICS
+        .with_label_values(&refs)
+        .observe(lifetime_secs);
 }
 
 #[cfg(test)]
@@ -480,5 +607,231 @@ mod tests {
             tcp_label_values(&key_closed),
             "label values must be identical regardless of state"
         );
+    }
+
+    // handle_tcp_lifetime 必须真把 series 注册起来,forget_tcp 必须真把它删掉。
+    // 否则要么 cardinality 涨,要么直方图样本永远收不到。
+    #[test]
+    fn lifetime_observe_then_forget_round_trip() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "uniq-life-c"),
+            server: mk_workload("ns", "uniq-life-s"),
+            server_port: 7777,
+            role: ROLE_CLIENT,
+        };
+        handle_tcp_lifetime(&key, 0.250);
+        // forget 必须真删,remove_label_values 成功 == series 在;失败说明 observe 没建。
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        assert!(
+            TCP_LIFETIME_METRICS.remove_label_values(&refs).is_ok(),
+            "handle_tcp_lifetime must register the series"
+        );
+        // forget_tcp 走过去:此刻已经手动 remove,再 forget 应该是 no-op 不 panic。
+        forget_tcp(&key);
+    }
+
+    // 同一个 key 多次 observe 不应每次都创建新 series——prometheus crate 内部按
+    // label set 做 dedupe,但守住这个性质是修复 cardinality 泄漏的前提。
+    #[test]
+    fn lifetime_observe_should_dedupe_series_by_label_set() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "dup-life-c"),
+            server: mk_workload("ns", "dup-life-s"),
+            server_port: 7778,
+            role: ROLE_CLIENT,
+        };
+        handle_tcp_lifetime(&key, 0.001);
+        handle_tcp_lifetime(&key, 1.0);
+        handle_tcp_lifetime(&key, 60.0);
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        // 多次 observe 之后只该有一条 series,remove 一次就能彻底删。
+        assert!(TCP_LIFETIME_METRICS.remove_label_values(&refs).is_ok());
+        assert!(
+            TCP_LIFETIME_METRICS.remove_label_values(&refs).is_err(),
+            "series must be unique per label set; a second remove must fail"
+        );
+    }
+
+    // 与 forget_link_should_reset_delta_baseline 对称:retransmits 也走 delta 基准,
+    // forget 后必须把 LAST_LINK_RETRANS_TOTALS 清掉,否则同名 link 复活会丢 delta、
+    // 永远报不出新增重传。
+    #[test]
+    fn forget_link_should_reset_retransmits_baseline() {
+        let link = mk_link("uniq-rtx-client", "uniq-rtx-server", ROLE_CLIENT);
+
+        handle_link_retransmits(&link, 50);
+        // 首次:delta=50,基准=50。
+        handle_link_retransmits(&link, 50);
+        // 同值:delta=0,基准仍=50,series 仍在。
+
+        forget_link(&link);
+
+        // forget 后再 produce 同值:基准被清才能再次创建 series,从而 remove 成功。
+        handle_link_retransmits(&link, 50);
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        assert!(
+            LINKS_RETRANSMITS_METRICS.remove_label_values(&refs).is_ok(),
+            "forget_link must reset retransmits baseline so subsequent produce re-registers series"
+        );
+    }
+
+    // 零 delta 不应触发 inc_by——保证 PromQL 在没有重传的连接上看不到这条 series。
+    #[test]
+    fn handle_link_retransmits_should_skip_zero_delta() {
+        let link = mk_link("zero-rtx-c", "zero-rtx-s", ROLE_CLIENT);
+        // 第一次 0:delta=0,early-return,series 不该被创建。
+        handle_link_retransmits(&link, 0);
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        assert!(
+            LINKS_RETRANSMITS_METRICS.remove_label_values(&refs).is_err(),
+            "zero-delta produce must not register a series"
+        );
+    }
+
+    // ─── 负载下的计数器正确性 ──────────────────────────────────────────────
+    // 下面三条不测语法,测数值:多 tick 持续上报 / 多 link 交叉上报 / 多线程并发
+    // observe 三种现实压力下,counter / histogram 一阶量必须严格等于注入总和。
+    // 任何 delta 算偏一次、key 撞一次、样本丢一次,assert 都会爆。
+    // 这一组守护"eBPF 端 segs / lifetime 到 prom 的算术正确性"——单纯的 wiring
+    // guard 测不出 delta 路径与并发路径下的累积偏差,补这层数值闭环。
+
+    // 模拟主循环:eBPF 端 cumulative 随 tick 单调增长,用户态算 delta 后喂 Counter。
+    // 200 个 tick + 质数序列 delta 制造非均匀分布;同 cumulative 重放还要确保 delta=0。
+    #[test]
+    fn retransmits_counter_must_match_injected_segs_under_many_ticks() {
+        let link = mk_link("load-rtx-mono-c", "load-rtx-mono-s", ROLE_CLIENT);
+
+        // 用质数序列让每 tick 的 delta 形态不规整;任何 saturating_sub 错位都会立刻
+        // 让 expected 与 counter 偏离。
+        const TICK_DELTAS: &[u64] = &[1, 7, 13, 29, 53, 97, 211, 421, 853, 1709];
+        const TICKS: usize = 200;
+        let mut cumulative: u64 = 0;
+        let mut expected: u64 = 0;
+        for tick in 0..TICKS {
+            let inc = TICK_DELTAS[tick % TICK_DELTAS.len()];
+            cumulative = cumulative.saturating_add(inc);
+            expected = expected.saturating_add(inc);
+            handle_link_retransmits(&link, cumulative);
+        }
+        // stale 重放:同一 cumulative 再喂,delta=0,counter 必须不动。
+        handle_link_retransmits(&link, cumulative);
+        handle_link_retransmits(&link, cumulative);
+
+        let label_values = link_label_values(&link);
+        let refs = as_str_array(&label_values);
+        let v = LINKS_RETRANSMITS_METRICS.with_label_values(&refs).get();
+        assert_eq!(
+            v as u64, expected,
+            "counter under {TICKS} ticks must equal sum of injected deltas"
+        );
+        forget_link(&link);
+    }
+
+    // N 条独立 link 交错上报;若 link_totals_key 撞键或 delta 基准跨 link 串味,
+    // 其中某条 counter 会同时算上别条的 delta,assert 会立刻爆。
+    #[test]
+    fn retransmits_counter_must_isolate_independent_links_under_load() {
+        const LINKS: usize = 50;
+        const TICKS: usize = 30;
+
+        let links: Vec<NetworkLink> = (0..LINKS)
+            .map(|i| {
+                mk_link(
+                    &format!("load-rtx-iso-c-{i}"),
+                    &format!("load-rtx-iso-s-{i}"),
+                    ROLE_CLIENT,
+                )
+            })
+            .collect();
+        let mut cumulatives = vec![0u64; LINKS];
+
+        // 每 tick 把所有 link 都推进一次,推进量 = (link_idx + 1) × tick,
+        // 各 link 终值彼此唯一;串味会让某条值不再唯一可识别。
+        for tick in 1..=TICKS {
+            for (i, link) in links.iter().enumerate() {
+                let inc = (i as u64 + 1) * (tick as u64);
+                cumulatives[i] = cumulatives[i].saturating_add(inc);
+                handle_link_retransmits(link, cumulatives[i]);
+            }
+        }
+
+        for (i, link) in links.iter().enumerate() {
+            let label_values = link_label_values(link);
+            let refs = as_str_array(&label_values);
+            let v = LINKS_RETRANSMITS_METRICS.with_label_values(&refs).get();
+            assert_eq!(
+                v as u64, cumulatives[i],
+                "link #{i} counter must isolate from peers"
+            );
+        }
+        for link in &links {
+            forget_link(link);
+        }
+    }
+
+    // 多线程并发 observe lifetime:_count 必须等于实际观测次数,_sum 必须等于
+    // 实际观测值之和——HistogramVec 内部 atomic,这里压住"并发投递下一阶量不丢不重"。
+    #[test]
+    fn lifetime_histogram_count_and_sum_must_match_under_concurrent_load() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "load-life-conc-c"),
+            server: mk_workload("ns", "load-life-conc-s"),
+            server_port: 7779,
+            role: ROLE_CLIENT,
+        };
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 5_000;
+        // 每个线程用一个固定观测值,便于精确预期 sum——避免随机值在并发累加里被
+        // 浮点误差吃掉。值跨数量级覆盖直方图多个 bucket。
+        let observations_per_thread: Vec<f64> =
+            (0..THREADS).map(|t| (t as f64 + 1.0) * 0.001).collect();
+        let expected_sum: f64 = observations_per_thread
+            .iter()
+            .map(|v| v * PER_THREAD as f64)
+            .sum();
+        let expected_count = (THREADS * PER_THREAD) as u64;
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for tid in 0..THREADS {
+            let key = key.clone();
+            let v = observations_per_thread[tid];
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..PER_THREAD {
+                    handle_tcp_lifetime(&key, v);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        let h = TCP_LIFETIME_METRICS.with_label_values(&refs);
+        assert_eq!(
+            h.get_sample_count(),
+            expected_count,
+            "histogram count must equal total concurrent observations"
+        );
+        let actual_sum = h.get_sample_sum();
+        // 相对容差 1e-9:浮点累加可能有最低位抖动,但远小于"丢一个 0.001 量级样本"
+        // 的影响——任何样本丢失都会被这条断言抓住。
+        assert!(
+            (actual_sum - expected_sum).abs() / expected_sum < 1e-9,
+            "histogram sum {actual_sum} must match injected sum {expected_sum} within float tolerance"
+        );
+
+        let _ = TCP_LIFETIME_METRICS.remove_label_values(&refs);
     }
 }

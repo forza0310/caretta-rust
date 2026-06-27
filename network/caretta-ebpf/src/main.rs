@@ -2,7 +2,9 @@
 #![no_main]
 
 use aya_ebpf::bindings::{BPF_TCP_CLOSE, BPF_TCP_SYN_RECV, BPF_TCP_SYN_SENT};
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_probe_read_kernel};
+use aya_ebpf::helpers::{
+    bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_probe_read_kernel,
+};
 use aya_ebpf::macros::{btf_tracepoint, fentry, map};
 use aya_ebpf::maps::{HashMap, PerCpuHashMap};
 use aya_ebpf::programs::{BtfTracePointContext, FEntryContext};
@@ -55,9 +57,13 @@ pub struct ConnectionIdentifier {
 #[repr(C)]
 #[derive(Copy, Clone)]
 // Per-connection counters tracked in eBPF maps.
+//
+// 都是单调累加计数器,跨 CPU 各自累加自己副本、用户态再求和——所以可以塞进
+// PerCpuHashMap。retransmits 由 tcp_retransmit_skb fentry 在重传发生时 +1。
 pub struct ConnectionThroughputStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub retransmits: u64,
 }
 
 // ── ABI 契约:与用户态镜像结构体逐字节一致 ──────────────────────────────────
@@ -87,11 +93,12 @@ const _: () = {
     assert!(offset_of!(ConnectionIdentifier, tuple) == 4);
     assert!(offset_of!(ConnectionIdentifier, role) == 16);
 
-    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64)
-    assert!(size_of::<ConnectionThroughputStats>() == 16);
+    // ConnectionThroughputStats: bytes_sent(u64) bytes_received(u64) retransmits(u64)
+    assert!(size_of::<ConnectionThroughputStats>() == 24);
     assert!(align_of::<ConnectionThroughputStats>() == 8);
     assert!(offset_of!(ConnectionThroughputStats, bytes_sent) == 0);
     assert!(offset_of!(ConnectionThroughputStats, bytes_received) == 8);
+    assert!(offset_of!(ConnectionThroughputStats, retransmits) == 16);
 
     // SockOffsets: 4 × u32
     assert!(size_of::<SockOffsets>() == 16);
@@ -134,6 +141,20 @@ static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
     HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
 #[map]
+// Open 时间戳:open 路径写 bpf_ktime_get_ns(),close 路径取出来算 lifetime。
+// 与 CONNECTION_STATES 同样的 key 体系——便于 mark_connection_closed 一把锁的逻辑里
+// 一并清理,不引入新的身份维度。
+static CONNECTION_OPEN_TS: HashMap<ConnectionIdentifier, u64> =
+    HashMap::<ConnectionIdentifier, u64>::with_max_entries(131072, 0);
+
+#[map]
+// Close 时算出的连接 lifetime(纳秒)投递桶:eBPF 写,用户态每 tick 全量读+删。
+// 单次投递语义——同一条连接关闭只产生一条记录,用户态收割后就抹掉,容量与
+// CONNECTION_STATES 同阶,只在用户态收割比 close 风暴慢时才会撑爆。
+static CLOSED_LIFETIMES: HashMap<ConnectionIdentifier, u64> =
+    HashMap::<ConnectionIdentifier, u64>::with_max_entries(131072, 0);
+
+#[map]
 // Runtime-discovered sock_common field offsets. Userspace populates this once at startup
 // after parsing /sys/kernel/btf/vmlinux,eBPF 端按这些 offset 读 sock 字段。
 static SOCK_OFFSETS: HashMap<u32, SockOffsets> =
@@ -152,6 +173,16 @@ pub fn handle_tcp_sendmsg(ctx: FEntryContext) -> u32 {
 #[fentry(function = "tcp_cleanup_rbuf")]
 pub fn handle_tcp_cleanup_rbuf(ctx: FEntryContext) -> u32 {
     match try_handle_tcp_cleanup_rbuf(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+// fentry on tcp_retransmit_skb counts retransmissions per connection.
+// kernel 原型: void tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
+#[fentry(function = "tcp_retransmit_skb")]
+pub fn handle_tcp_retransmit_skb(ctx: FEntryContext) -> u32 {
+    match try_handle_tcp_retransmit_skb(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -199,6 +230,14 @@ fn mark_connection_closed(cookie: u64) {
         // 状态字段不在那张表里,close 路径对它一字不动——这是 RMW race 修复的关键
         // 不变量,不能回退。
         let _ = CONNECTION_STATES.insert(&key, &0u64, 0);
+
+        // lifetime 投递:open 时写入的时间戳还在就算 now - open,投到 CLOSED_LIFETIMES
+        // 让用户态下一轮收割。算完一律抹掉 open_ts,避免 sock 复用时撞键。
+        if let Some(open_ts) = unsafe { CONNECTION_OPEN_TS.get(&key) } {
+            let lifetime_ns = unsafe { bpf_ktime_get_ns() }.saturating_sub(*open_ts);
+            let _ = CLOSED_LIFETIMES.insert(&key, &lifetime_ns, 0);
+        }
+        let _ = CONNECTION_OPEN_TS.remove(&key);
     }
 
     let _ = SOCK_TO_CONNECTION.remove(&cookie);
@@ -292,6 +331,12 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
         let _ = CONNECTION_STATES.remove(&key);
         return Err(e);
     }
+    // 起始时间戳:lifetime 用,close 时 now - open_ts 投递到 CLOSED_LIFETIMES。
+    // 写失败只 warn 不回滚——失败的后果仅是这条连接没 lifetime 样本,不影响其他指标。
+    let open_ts = unsafe { bpf_ktime_get_ns() };
+    if let Err(e) = CONNECTION_OPEN_TS.insert(&key, &open_ts, 0) {
+        warn!(ctx, "CONNECTION_OPEN_TS map insert failed: err={}", e);
+    }
     Ok(())
 }
 
@@ -318,6 +363,7 @@ fn try_handle_tcp_sendmsg(ctx: &FEntryContext) -> Result<(), i32> {
         None => ConnectionThroughputStats {
             bytes_sent: 0,
             bytes_received: 0,
+            retransmits: 0,
         },
     };
 
@@ -353,12 +399,53 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
         None => ConnectionThroughputStats {
             bytes_sent: 0,
             bytes_received: 0,
+            retransmits: 0,
         },
     };
 
     throughput.bytes_received = throughput.bytes_received.saturating_add(copied as u64);
     if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
         warn!(ctx, "CONNECTIONS map insert failed in tcp_cleanup_rbuf: err={}", e);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn try_handle_tcp_retransmit_skb(ctx: &FEntryContext) -> Result<(), i32> {
+    // fentry args:(sk, skb, segs)。segs 是这次重传包含的 TSO 段数,一次"重传事件"
+    // 实际可能跨多个 TCP 段——按 segs 累加比 +1 更接近真实重传字节量。
+    let sk: *const core::ffi::c_void = ctx.arg(0);
+    let segs: i32 = ctx.arg(2);
+    if segs <= 0 {
+        return Ok(());
+    }
+    let cookie = sock_cookie(sk as u64);
+    if cookie == 0 {
+        return Ok(());
+    }
+
+    let key = match unsafe { SOCK_TO_CONNECTION.get(&cookie) } {
+        Some(k) => *k,
+        None => return Ok(()),
+    };
+
+    // 同 sendmsg / cleanup_rbuf 的 RMW 模板:PerCpuHashMap 当前 CPU 副本不冲突。
+    let mut throughput = match unsafe { CONNECTIONS.get(&key) } {
+        Some(t) => *t,
+        None => ConnectionThroughputStats {
+            bytes_sent: 0,
+            bytes_received: 0,
+            retransmits: 0,
+        },
+    };
+
+    throughput.retransmits = throughput.retransmits.saturating_add(segs as u64);
+    if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
+        warn!(
+            ctx,
+            "CONNECTIONS map insert failed in tcp_retransmit_skb: err={}", e
+        );
         return Err(e);
     }
 
