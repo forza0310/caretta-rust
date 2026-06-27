@@ -66,6 +66,32 @@ pub struct ConnectionThroughputStats {
     pub retransmits: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+// `struct tcp_sock` 关键采样字段相对 sk 指针的 byte offset。用户态启动期从
+// vmlinux BTF 解出来写到 TCP_SOCK_OFFSETS map,eBPF 端按这些 offset 读 tcp_sock 字段。
+//
+// `struct sock *` 与 `struct tcp_sock *` 在 Linux 里同基址(tcp_sock 头部递归嵌入
+// inet_connection_sock → inet_sock → sock),所以 BTF 解出的 tcp_sock.srtt_us bit_offset
+// 直接当作相对 sk 指针的 byte offset。`_reserved` 预留给后续 segs_in/segs_out 偏移。
+pub struct TcpSockOffsets {
+    pub srtt_us_off: u32,
+    pub _reserved: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+// 每条连接最近一次观测到的 sock 采样型快照。cleanup_rbuf 路径 last-writer-wins
+// 覆写一次,用户态在收割 CONNECTION_STATES 时 lookup 拿"最近一次的 srtt"投到直方图。
+//
+// 不放 PerCpuHashMap 的理由:srtt 是 instantaneous gauge,加法无意义;放普通 HashMap
+// 接受微小竞写——u32 单条 store 在 x86 上原子,实际不撕裂。`_reserved` 预留给后续
+// segs_in / segs_out 等 u32 计数器接力使用。
+pub struct SockSampleSnapshot {
+    pub last_srtt_us: u32,
+    pub _reserved: [u32; 3],
+}
+
 // ── ABI 契约:与用户态镜像结构体逐字节一致 ──────────────────────────────────
 // 这几个结构体在 `network/caretta/src/types.rs`(SockOffsets/ConnectionTuple/
 // ConnectionIdentifier)与 `per_cpu.rs`(ConnectionThroughputStats)里有完全相同
@@ -107,6 +133,16 @@ const _: () = {
     assert!(offset_of!(SockOffsets, skc_rcv_saddr_off) == 4);
     assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
     assert!(offset_of!(SockOffsets, skc_num_off) == 12);
+
+    // TcpSockOffsets: srtt_us_off(u32) + 3 × u32 预留 = 16 byte
+    assert!(size_of::<TcpSockOffsets>() == 16);
+    assert!(align_of::<TcpSockOffsets>() == 4);
+    assert!(offset_of!(TcpSockOffsets, srtt_us_off) == 0);
+
+    // SockSampleSnapshot: last_srtt_us(u32) + 3 × u32 预留 = 16 byte
+    assert!(size_of::<SockSampleSnapshot>() == 16);
+    assert!(align_of::<SockSampleSnapshot>() == 4);
+    assert!(offset_of!(SockSampleSnapshot, last_srtt_us) == 0);
 
     // role 常量两侧必须同值(用户态:ROLE_CLIENT / ROLE_SERVER)。
     assert!(CONNECTION_ROLE_CLIENT == 1);
@@ -159,6 +195,20 @@ static CLOSED_LIFETIMES: HashMap<ConnectionIdentifier, u64> =
 // after parsing /sys/kernel/btf/vmlinux,eBPF 端按这些 offset 读 sock 字段。
 static SOCK_OFFSETS: HashMap<u32, SockOffsets> =
     HashMap::<u32, SockOffsets>::with_max_entries(1, 0);
+
+#[map]
+// 同 SOCK_OFFSETS 但解的是 tcp_sock 字段——cleanup_rbuf 路径按 srtt_us_off 取 RTT 采样。
+// 单 entry,启动期 populate 一次,此后只读;缺失时 cleanup_rbuf 跳过 srtt 采样但不影响
+// throughput 统计——容错降级,免得 BTF 解析 race 把基础指标也拖坏。
+static TCP_SOCK_OFFSETS: HashMap<u32, TcpSockOffsets> =
+    HashMap::<u32, TcpSockOffsets>::with_max_entries(1, 0);
+
+#[map]
+// 每条连接最近一次的 sock 采样快照(目前只装 srtt)。cleanup_rbuf last-writer-wins 写入,
+// 用户态每 tick 在收割 CONNECTION_STATES 时 lookup → 观测进直方图。
+// max_entries 与 CONNECTION_STATES 同阶,close 路径与用户态 GC 都会同步删,避免泄漏。
+static SOCK_SAMPLES: HashMap<ConnectionIdentifier, SockSampleSnapshot> =
+    HashMap::<ConnectionIdentifier, SockSampleSnapshot>::with_max_entries(131072, 0);
 
 // fentry on tcp_sendmsg captures TCP write-side payload size.
 #[fentry(function = "tcp_sendmsg")]
@@ -238,6 +288,9 @@ fn mark_connection_closed(cookie: u64) {
             let _ = CLOSED_LIFETIMES.insert(&key, &lifetime_ns, 0);
         }
         let _ = CONNECTION_OPEN_TS.remove(&key);
+        // sock 关闭后最后一次 srtt 采样也没意义了——同步抹掉避免 sock 复用时残留旧值。
+        // best-effort:删失败影响仅是这条 sample 多活一会儿,不影响正确性。
+        let _ = SOCK_SAMPLES.remove(&key);
     }
 
     let _ = SOCK_TO_CONNECTION.remove(&cookie);
@@ -407,6 +460,28 @@ fn try_handle_tcp_cleanup_rbuf(ctx: &FEntryContext) -> Result<(), i32> {
     if let Err(e) = CONNECTIONS.insert(&key, &throughput, 0) {
         warn!(ctx, "CONNECTIONS map insert failed in tcp_cleanup_rbuf: err={}", e);
         return Err(e);
+    }
+
+    // srtt 采样:cleanup_rbuf 每次 ACK 段进来时,tp->srtt_us 都是当前最新的 smoothed RTT
+    // 估计。顺手按 TCP_SOCK_OFFSETS 给的偏移读一次写到 SOCK_SAMPLES。
+    //
+    // 容错:TCP_SOCK_OFFSETS 缺失(BTF populate race)时直接跳过——throughput 已经记上了,
+    // 不要为采样字段把这条 ACK 整条丢掉。读到的 srtt_us==0 也跳过:0 是 tp 初始值,kernel
+    // 还没拿到任何 RTT 样本前都是 0,写进去会把直方图首桶刷糊。
+    let off_key = 0u32;
+    if let Some(tcp_off) = unsafe { TCP_SOCK_OFFSETS.get(&off_key) } {
+        if let Some(srtt_us) = read_sock_field::<u32>(sk as u64, tcp_off.srtt_us_off)
+            && srtt_us > 0
+        {
+            let snap = SockSampleSnapshot {
+                last_srtt_us: srtt_us,
+                _reserved: [0; 3],
+            };
+            // insert 失败只 warn 不返回错误:srtt 采样丢一拍不影响其他指标。
+            if let Err(e) = SOCK_SAMPLES.insert(&key, &snap, 0) {
+                warn!(ctx, "SOCK_SAMPLES insert failed: err={}", e);
+            }
+        }
     }
 
     Ok(())

@@ -46,10 +46,44 @@ pub struct SockOffsets {
     pub skc_num_off: u32,
 }
 
+/// `struct tcp_sock` 关键字段相对 sk 指针的 byte offset。
+///
+/// 内核里 `struct tcp_sock` 头部递归嵌入 `inet_connection_sock` → `inet_sock` → `sock`,
+/// `struct sock *` 与 `struct tcp_sock *` 同一基址,所以 BTF 解出的 `tcp_sock.srtt_us`
+/// bit_offset 可以直接当成相对 sk 指针的 byte offset 走 `bpf_probe_read_kernel`。
+///
+/// `_reserved` 预留 12 byte 给后续要采的 `segs_in` / `segs_out` 偏移补进来——结构总大小
+/// 保持 16 byte 不变,新增字段不会推动 ABI。
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct TcpSockOffsets {
+    pub srtt_us_off: u32,
+    pub _reserved: [u32; 3],
+}
+
+/// 单条 sock 的采样型 gauge 快照。`tcp_cleanup_rbuf` 每次 ACK 处理时 last-writer-wins
+/// 覆写一次,用户态在收割连接状态时顺手 lookup 当作"最近一次观测的 srtt"喂直方图。
+///
+/// 这一族字段语义与 `ConnectionThroughputStats` 完全不同:
+///   - throughput 是 monotonic counter,跨 CPU 各加各的、用户态聚合求和——所以放
+///     PerCpuHashMap。
+///   - srtt 是 instantaneous gauge,加法无意义、各 CPU 看到的值刷新即覆盖——所以放
+///     普通 HashMap,接受微小竞写(u32 写在 x86 上单条 store 不会撕裂)。
+///
+/// `_reserved` 与 `TcpSockOffsets` 配对:后续 segs_in/out 采样字段填这里,不动 ABI。
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct SockSampleSnapshot {
+    pub last_srtt_us: u32,
+    pub _reserved: [u32; 3],
+}
+
 unsafe impl aya::Pod for ConnectionTuple {}
 unsafe impl aya::Pod for ConnectionIdentifier {}
 unsafe impl aya::Pod for ConnectionThroughputStats {}
 unsafe impl aya::Pod for SockOffsets {}
+unsafe impl aya::Pod for TcpSockOffsets {}
+unsafe impl aya::Pod for SockSampleSnapshot {}
 
 // ── ABI 契约:与 eBPF 端镜像结构体逐字节一致 ────────────────────────────────
 // 下面这几个 `#[repr(C)]` 结构体在 `caretta-ebpf/src/main.rs` 里有一份完全相同的
@@ -92,6 +126,17 @@ const _: () = {
     assert!(offset_of!(SockOffsets, skc_rcv_saddr_off) == 4);
     assert!(offset_of!(SockOffsets, skc_dport_off) == 8);
     assert!(offset_of!(SockOffsets, skc_num_off) == 12);
+
+    // TcpSockOffsets: srtt_us_off(u32) + 3 × u32 预留 = 16 byte。预留槽算结构的不可
+    // 分割部分,size 一动两侧立刻在编译期炸。
+    assert!(size_of::<TcpSockOffsets>() == 16);
+    assert!(align_of::<TcpSockOffsets>() == 4);
+    assert!(offset_of!(TcpSockOffsets, srtt_us_off) == 0);
+
+    // SockSampleSnapshot: last_srtt_us(u32) + 3 × u32 预留 = 16 byte。同 TcpSockOffsets。
+    assert!(size_of::<SockSampleSnapshot>() == 16);
+    assert!(align_of::<SockSampleSnapshot>() == 4);
+    assert!(offset_of!(SockSampleSnapshot, last_srtt_us) == 0);
 
     // role 常量两侧必须同值(eBPF 侧:CONNECTION_ROLE_CLIENT / _SERVER)。
     assert!(ROLE_CLIENT == 1);

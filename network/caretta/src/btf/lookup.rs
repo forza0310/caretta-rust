@@ -18,7 +18,7 @@ use super::parser::{
     KIND_STRUCT, TypeInfo, flatten_named_members, parse_header, read_string, read_type_at,
     resolve_field_size,
 };
-use crate::types::SockOffsets;
+use crate::types::{SockOffsets, TcpSockOffsets};
 
 /// 默认 vmlinux BTF 路径——所有支持 BTF 的内核(5.5+)都会在这里挂出 BTF blob。
 pub const DEFAULT_VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
@@ -158,6 +158,19 @@ pub fn parse_sock_offsets(btf_path: &Path) -> anyhow::Result<SockOffsets> {
         skc_rcv_saddr_off: offs["skc_rcv_saddr"],
         skc_dport_off: offs["skc_dport"],
         skc_num_off: offs["skc_num"],
+    })
+}
+
+/// 解析 vmlinux BTF 拿 `struct tcp_sock` 的采样字段偏移。
+///
+/// 当前只解 `srtt_us`(__u32,4 字节,kernel 里存的是 真实 srtt 微秒 << 3,用户态用时
+/// 必须 `>> 3` 还原)。size 不符直接 bail。
+pub fn parse_tcp_sock_offsets(btf_path: &Path) -> anyhow::Result<TcpSockOffsets> {
+    let offs = read_struct_field_offsets(btf_path, "tcp_sock", &[("srtt_us", 4)])?;
+
+    Ok(TcpSockOffsets {
+        srtt_us_off: offs["srtt_us"],
+        _reserved: [0; 3],
     })
 }
 
@@ -542,5 +555,88 @@ mod tests {
         assert!(off.contains_key("skc_dport"));
         assert!(off.contains_key("skc_num"));
         eprintln!("sock_common offsets on this kernel: {off:?}");
+    }
+
+    /// 同 should_resolve_sock_common_against_real_vmlinux,但覆盖 tcp_sock.srtt_us
+    /// 这条 RTT 采样路径。size=4 校验同步守住"kernel 改 srtt_us 类型"这类隐式 ABI 变更。
+    #[test]
+    #[ignore = "needs /sys/kernel/btf/vmlinux (kernel 5.5+, CONFIG_DEBUG_INFO_BTF=y)"]
+    fn should_resolve_tcp_sock_against_real_vmlinux() {
+        let path = std::env::var("VMLINUX_BTF_PATH")
+            .unwrap_or_else(|_| DEFAULT_VMLINUX_BTF_PATH.to_string());
+        let off = parse_tcp_sock_offsets(Path::new(&path))
+            .expect("tcp_sock.srtt_us offset should resolve from real vmlinux");
+        // srtt_us 是 tcp_sock 内部字段,偏移随内核版本走,但绝不会是 0
+        // (前面有 inet_connection_sock 等嵌入字段占位)。
+        assert!(
+            off.srtt_us_off > 0,
+            "tcp_sock.srtt_us must sit past the embedded sock_common header, got off={}",
+            off.srtt_us_off
+        );
+        eprintln!("tcp_sock.srtt_us offset on this kernel: {}", off.srtt_us_off);
+    }
+
+    /// 合成一份带 tcp_sock 的最小 BTF,断言 parse_tcp_sock_offsets 能正确解出
+    /// srtt_us 偏移并通过 size=4 校验——守住"size 不符即 bail",并锁住
+    /// parse_tcp_sock_offsets 的解析路径与 parse_sock_offsets 同源,不会偷偷
+    /// 走旁路。
+    #[test]
+    fn should_parse_tcp_sock_srtt_offset_from_synthetic_btf() {
+        // type id 分配:
+        //   1: INT "u32" size=4
+        //   2: STRUCT "tcp_sock" { padding_a: u32 @ off 0, srtt_us: u32 @ off 4 }
+        let mut strings: Vec<u8> = vec![0];
+        let off_u32 = strings.len() as u32;
+        strings.extend_from_slice(b"u32\0");
+        let off_tcpsock = strings.len() as u32;
+        strings.extend_from_slice(b"tcp_sock\0");
+        let off_pad = strings.len() as u32;
+        strings.extend_from_slice(b"padding_a\0");
+        let off_srtt = strings.len() as u32;
+        strings.extend_from_slice(b"srtt_us\0");
+
+        let mut types: Vec<u8> = Vec::new();
+        // type 1: INT u32 size=4
+        types.extend_from_slice(&off_u32.to_le_bytes());
+        types.extend_from_slice(&((KIND_INT << 24) | 0u32).to_le_bytes());
+        types.extend_from_slice(&4u32.to_le_bytes());
+        types.extend_from_slice(&0u32.to_le_bytes());
+        // type 2: STRUCT tcp_sock vlen=2 size=8 { padding @0, srtt_us @ bit 32 = byte 4 }
+        types.extend_from_slice(&off_tcpsock.to_le_bytes());
+        types.extend_from_slice(&((KIND_STRUCT << 24) | 2u32).to_le_bytes());
+        types.extend_from_slice(&8u32.to_le_bytes());
+        types.extend_from_slice(&off_pad.to_le_bytes());
+        types.extend_from_slice(&1u32.to_le_bytes());
+        types.extend_from_slice(&0u32.to_le_bytes());
+        types.extend_from_slice(&off_srtt.to_le_bytes());
+        types.extend_from_slice(&1u32.to_le_bytes());
+        types.extend_from_slice(&32u32.to_le_bytes());
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&BTF_MAGIC_LE.to_le_bytes());
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&(BTF_HEADER_SIZE as u32).to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        blob.extend(types);
+        blob.extend(strings);
+
+        // 通过 parse_struct_field_offsets 走与 parse_tcp_sock_offsets 完全同源的入口,
+        // 验证 byte offset = 4(bit 32 / 8)。
+        let off = parse_struct_field_offsets(&blob, "tcp_sock", &[("srtt_us", 4)])
+            .expect("tcp_sock.srtt_us should resolve");
+        assert_eq!(off["srtt_us"], 4);
+
+        // size 校验失败必须 bail——故意写 size=8 校验拦截路径。
+        let err = parse_struct_field_offsets(&blob, "tcp_sock", &[("srtt_us", 8)])
+            .expect_err("size mismatch on srtt_us must bail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("size") && (msg.contains("expected") || msg.contains("ABI")),
+            "error should explain size mismatch, got: {msg}"
+        );
     }
 }

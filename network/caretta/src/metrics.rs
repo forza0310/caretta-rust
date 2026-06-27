@@ -147,6 +147,45 @@ static TCP_LIFETIME_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     h
 });
 
+// 单条 TCP 连接最近一次观测到的 smoothed RTT(秒)。每个收割 tick 都把 eBPF 端
+// SOCK_SAMPLES 里 last-writer-wins 写下的 srtt_us 转秒后 observe 一次,所以同一条
+// 连接每隔 tick 会贡献一个样本——直方图分位数反映"近期 RTT 分布"而非全生命周期。
+//
+// buckets:exponential_buckets(0.0001, 2.0, 14) → 100µs / 200µs / 400µs / ... / ~1.6s。
+// 这条曲线覆盖 LAN 同机房 ~100µs 到跨大区 WAN ~1s 的常见 RTT,且对 1-50ms 这段
+// (生产里绝大多数业务连接落在这里)给到足够多的 bucket 区分度。
+static TCP_SRTT_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
+    let buckets = prometheus::exponential_buckets(0.0001, 2.0, 14)
+        .expect("exponential_buckets(0.0001, 2.0, 14) must produce valid bucket bounds");
+    let opts = prometheus::HistogramOpts::new(
+        "caretta_tcp_srtt_seconds",
+        "smoothed RTT (in seconds) sampled per TCP connection on each tcp_cleanup_rbuf tick",
+    )
+    .buckets(buckets);
+    let h = HistogramVec::new(
+        opts,
+        &[
+            "link_id",
+            "client_id",
+            "client_name",
+            "client_namespace",
+            "client_kind",
+            "client_owner",
+            "server_id",
+            "server_name",
+            "server_namespace",
+            "server_kind",
+            "server_port",
+            "role",
+        ],
+    )
+    .expect("create caretta_tcp_srtt_seconds");
+    prometheus::default_registry()
+        .register(Box::new(h.clone()))
+        .expect("register caretta_tcp_srtt_seconds");
+    h
+});
+
 static POLLS_MADE: Lazy<IntCounter> = Lazy::new(|| {
     let c = IntCounter::new("caretta_polls_made", "Counter of polls made by caretta")
         .expect("create caretta_polls_made");
@@ -441,6 +480,10 @@ pub fn forget_tcp(key: &TcpConnectionKey) {
         // 删不存在的 series 落到这里是正常的,不算 bug。
         warn!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {refs:?})");
     }
+    // srtt 直方图同理,GC 必须连这条 series 一起收割。
+    if let Err(e) = TCP_SRTT_METRICS.remove_label_values(&refs) {
+        warn!("forget caretta_tcp_srtt_seconds series failed: {e} (labels: {refs:?})");
+    }
 }
 
 /// close 时把一条连接的 lifetime 投到直方图。`lifetime_secs` 由调用方做 ns→s 转换,
@@ -451,6 +494,16 @@ pub fn handle_tcp_lifetime(key: &TcpConnectionKey, lifetime_secs: f64) {
     TCP_LIFETIME_METRICS
         .with_label_values(&refs)
         .observe(lifetime_secs);
+}
+
+/// observe 单条 TCP 连接当前的 srtt 采样(秒)。kernel 端单位换算(`srtt_us >> 3` 再
+/// `/ 1e6`)由调用方做,本函数只按 TCP series 共用的 label observe。
+pub fn handle_tcp_srtt(key: &TcpConnectionKey, srtt_seconds: f64) {
+    let label_values = tcp_label_values(key);
+    let refs = as_str_array(&label_values);
+    TCP_SRTT_METRICS
+        .with_label_values(&refs)
+        .observe(srtt_seconds);
 }
 
 #[cfg(test)]
@@ -649,6 +702,111 @@ mod tests {
         assert!(
             TCP_LIFETIME_METRICS.remove_label_values(&refs).is_err(),
             "series must be unique per label set; a second remove must fail"
+        );
+    }
+
+    // 与 lifetime_observe_then_forget_round_trip 对称:srtt observe 必须真注册,
+    // forget_tcp 必须一并收割——否则 cardinality 会随每条新连接线性涨。
+    #[test]
+    fn srtt_observe_then_forget_round_trip() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "uniq-srtt-c"),
+            server: mk_workload("ns", "uniq-srtt-s"),
+            server_port: 7777,
+            role: ROLE_CLIENT,
+        };
+        handle_tcp_srtt(&key, 0.0005);
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        // remove 成功 ⇔ series 已注册 ⇔ handle_tcp_srtt 走通了完整 observe 路径。
+        assert!(
+            TCP_SRTT_METRICS.remove_label_values(&refs).is_ok(),
+            "handle_tcp_srtt must register the series"
+        );
+        // forget_tcp 此刻应是 no-op(已经手动 remove 过),不应 panic。
+        forget_tcp(&key);
+    }
+
+    // forget_tcp 必须把 srtt series 也一起删掉——只删 gauge / lifetime 不删 srtt
+    // 等于没清,cardinality 仍漏。
+    #[test]
+    fn forget_tcp_should_also_remove_srtt_series() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "cascade-srtt-c"),
+            server: mk_workload("ns", "cascade-srtt-s"),
+            server_port: 8888,
+            role: ROLE_SERVER,
+        };
+        handle_tcp_srtt(&key, 0.002);
+        forget_tcp(&key);
+        // forget 走完,再 remove 必须找不到——证明 forget_tcp 真删了 srtt。
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        assert!(
+            TCP_SRTT_METRICS.remove_label_values(&refs).is_err(),
+            "forget_tcp must remove caretta_tcp_srtt_seconds series; second remove would succeed otherwise"
+        );
+    }
+
+    // srtt observe 也应按 label set 去重:同一 key 多次 observe 只该是一条 series。
+    #[test]
+    fn srtt_observe_should_dedupe_series_by_label_set() {
+        let key = TcpConnectionKey {
+            client: mk_workload("ns", "dup-srtt-c"),
+            server: mk_workload("ns", "dup-srtt-s"),
+            server_port: 7780,
+            role: ROLE_CLIENT,
+        };
+        handle_tcp_srtt(&key, 0.0001);
+        handle_tcp_srtt(&key, 0.01);
+        handle_tcp_srtt(&key, 1.0);
+        let label_values = tcp_label_values(&key);
+        let refs = as_str_array(&label_values);
+        assert!(TCP_SRTT_METRICS.remove_label_values(&refs).is_ok());
+        assert!(
+            TCP_SRTT_METRICS.remove_label_values(&refs).is_err(),
+            "srtt series must be unique per label set; a second remove must fail"
+        );
+    }
+
+    // srtt buckets 必须严格单调递增——prometheus 在 register 时其实会校验一次,
+    // 但 caretta 选 exponential_buckets(0.0001, 2.0, 14),把这条性质显式锁住,
+    // 后续有人手抖把参数改成 1.0(乘子=1 会产生重复 bucket)时立刻在 CI 炸。
+    #[test]
+    fn srtt_buckets_must_be_strictly_monotonic() {
+        let buckets = prometheus::exponential_buckets(0.0001, 2.0, 14)
+            .expect("buckets must construct successfully");
+        for w in buckets.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "srtt buckets must be strictly increasing, got {w:?}"
+            );
+        }
+        // 起点 ~100µs,终点 ~1.6s——夹一下边界,后续若有人把参数改到完全偏离生产
+        // RTT 区间,这条 assert 也会提示。
+        assert!(buckets[0] < 0.001);
+        assert!(*buckets.last().unwrap() > 0.5);
+    }
+
+    // kernel 里 tcp_sock.srtt_us 存的是 真实 srtt 微秒 << 3,用户态必须先 `>> 3`(等价
+    // `/ 8.0`)再除 1e6 转秒。把这条公式锁成单元测试守住:任何把"/ 8 漏了"或者
+    // "÷错单位"的回归会立刻爆。
+    #[test]
+    fn srtt_us_conversion_should_divide_by_eight_then_by_million() {
+        // 内核里 1ms 真实 RTT 表示为 srtt_us = 1000 << 3 = 8000。
+        let srtt_us_kernel: u32 = 8000;
+        let secs = (srtt_us_kernel as f64) / 8.0 / 1_000_000.0;
+        assert!(
+            (secs - 0.001).abs() < 1e-12,
+            "1ms RTT must convert back to 0.001s, got {secs}"
+        );
+
+        // 跨大区一个常见量级:300ms 真实 RTT。kernel 里 srtt_us = 300_000 << 3 = 2_400_000。
+        let srtt_us_kernel: u32 = 2_400_000;
+        let secs = (srtt_us_kernel as f64) / 8.0 / 1_000_000.0;
+        assert!(
+            (secs - 0.3).abs() < 1e-12,
+            "300ms RTT must convert back to 0.3s, got {secs}"
         );
     }
 

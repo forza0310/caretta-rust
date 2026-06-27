@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use aya::Btf;
 use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
 use aya::programs::{BtfTracePoint, FEntry};
-use btf::parse_sock_offsets;
+use btf::{parse_sock_offsets, parse_tcp_sock_offsets};
 use config::Opt;
 use log::{info, warn};
 use resolver::{IpResolver, K8sResolver, StaticResolver};
@@ -30,9 +30,9 @@ use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use types::{
-    ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets, TcpConnection,
-    TcpConnectionKey, aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link,
-    reduce_connection_to_tcp,
+    ConnectionIdentifier, ConnectionThroughputStats, NetworkLink, SockOffsets,
+    SockSampleSnapshot, TcpConnection, TcpConnectionKey, TcpSockOffsets,
+    aggregate_per_cpu_throughput, is_loopback, reduce_connection_to_link, reduce_connection_to_tcp,
 };
 
 /// 一条 link 在最后一次观测到流量后多久没活动就 GC 掉对应的 prometheus series + 用户态记账。
@@ -114,6 +114,16 @@ async fn main() -> anyhow::Result<()> {
     )?;
     offsets_map.insert(offsets_key, offsets, 0)?;
 
+    // TCP_SOCK_OFFSETS:从同一份 BTF 解出 tcp_sock.srtt_us 偏移,推到 eBPF 端给
+    // try_handle_tcp_cleanup_rbuf 末尾的 srtt 采样路径用。srtt_us 在 tcp_sock 里随
+    // 内核版本变,所以必须运行时解,不能硬编码。
+    let tcp_offsets = parse_tcp_sock_offsets(std::path::Path::new(&opt.vmlinux_btf_path))?;
+    let mut tcp_offsets_map: BpfHashMap<_, u32, TcpSockOffsets> = BpfHashMap::try_from(
+        ebpf.map_mut("TCP_SOCK_OFFSETS")
+            .context("TCP_SOCK_OFFSETS map not found")?,
+    )?;
+    tcp_offsets_map.insert(offsets_key, tcp_offsets, 0)?;
+
     let tracepoint: &mut BtfTracePoint = ebpf
         .program_mut("handle_sock_set_state")
         .context("btf_tracepoint program handle_sock_set_state not found")?
@@ -162,6 +172,15 @@ async fn main() -> anyhow::Result<()> {
     // 仅在用户态 purge 路径上跟随 CONNECTION_STATES 删除做 best-effort 清理,避免孤儿化 entry 长期占位。
     let mut connection_open_ts: BpfHashMap<_, ConnectionIdentifier, u64> =
         BpfHashMap::try_from(open_ts_map)?;
+
+    let sock_samples_map = ebpf
+        .take_map("SOCK_SAMPLES")
+        .context("SOCK_SAMPLES map not found")?;
+    // eBPF 端 tcp_cleanup_rbuf 每次 ACK 处理时 last-writer-wins 写入 srtt_us。
+    // 用户态在 Pass 1 收割 CONNECTION_STATES 时顺手查这条 map,作为这条连接"最近
+    // 一次观测的 srtt"喂进直方图;close 路径上同步 remove 避免 sock 复用串味。
+    let mut sock_samples: BpfHashMap<_, ConnectionIdentifier, SockSampleSnapshot> =
+        BpfHashMap::try_from(sock_samples_map)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], opt.prometheus_port));
@@ -268,7 +287,6 @@ async fn main() -> anyhow::Result<()> {
                 // past 累计值留在 links 表里的 link 不在此集合中，它们会自然老化。
                 let mut link_seen_this_tick: std::collections::HashSet<NetworkLink> =
                     std::collections::HashSet::new();
-                let mut current_tcp_connections: Vec<TcpConnection> = Vec::new();
                 let mut to_delete: Vec<ConnectionIdentifier> = Vec::new();
                 let mut loopback_counter = 0u64;
                 let mut items_counter = 0u64;
@@ -278,8 +296,17 @@ async fn main() -> anyhow::Result<()> {
                 // resolver 调用全推到 Pass 2 走并发
                 // 主循环以 CONNECTION_STATES 为权威连接清单——它在 sock_set_state 路径上
                 // open 时写 1、close 时写 0
-                let mut pending: Vec<(ConnectionIdentifier, u64, ConnectionThroughputStats)> =
-                    Vec::new();
+                //
+                // pending 元组里夹带 srtt 采样:Pass 1 拿 conn 时顺手 lookup SOCK_SAMPLES,
+                // 没采到(连接还没收过 ACK / sock 刚 reset)就给 None,Pass 2 / observe 阶段
+                // 跳过即可。lookup 必须在这里做——Pass 2 之后只剩 resolved 出来的
+                // TcpConnection,失去与原始 ConnectionIdentifier 的关联,无法再查 map。
+                let mut pending: Vec<(
+                    ConnectionIdentifier,
+                    u64,
+                    ConnectionThroughputStats,
+                    Option<SockSampleSnapshot>,
+                )> = Vec::new();
                 while let Some(entry) = entries.next() {
                     let (conn, is_active) = match entry {
                         Ok(v) => v,
@@ -297,6 +324,9 @@ async fn main() -> anyhow::Result<()> {
                         Err(_) => ConnectionThroughputStats::default(),
                     };
 
+                    // srtt 采样:lookup 失败(没采到)是 happy 路径,不报错。
+                    let srtt_sample = sock_samples.get(&conn, 0).ok();
+
                     if is_active == 0 {
                         to_delete.push(conn);
                     }
@@ -306,30 +336,34 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    pending.push((conn, is_active, throughput));
+                    pending.push((conn, is_active, throughput, srtt_sample));
                 }
 
                 // Pass 2:resolver 调用并发 fan-out。
                 let resolver_ref = resolver.as_ref();
                 let resolved = futures_util::future::join_all(pending.into_iter().map(
-                    |(conn, is_active, throughput)| async move {
+                    |(conn, is_active, throughput, srtt_sample)| async move {
                         let link = reduce_connection_to_link(resolver_ref, conn).await.ok()?;
                         let tcp =
                             reduce_connection_to_tcp(resolver_ref, conn, throughput, is_active)
                                 .await
                                 .ok()?;
-                        Some((link, tcp, throughput))
+                        Some((link, tcp, throughput, srtt_sample))
                     },
                 ))
                 .await;
 
-                for (link, tcp, throughput) in resolved.into_iter().flatten() {
+                // current_tcp_connections 同时把 srtt 采样一起带过来——同一条 tcp 上立刻
+                // 喂直方图,不再额外存第三张表。
+                let mut current_tcp_connections: Vec<(TcpConnection, Option<SockSampleSnapshot>)> =
+                    Vec::new();
+                for (link, tcp, throughput, srtt_sample) in resolved.into_iter().flatten() {
                     let bytes = throughput.bytes_sent.saturating_add(throughput.bytes_received);
                     let entry = current_links.entry(link.clone()).or_insert((0, 0));
                     entry.0 += bytes;
                     entry.1 += throughput.retransmits;
                     link_seen_this_tick.insert(link);
-                    current_tcp_connections.push(tcp);
+                    current_tcp_connections.push((tcp, srtt_sample));
                 }
 
                 metrics::set_map_size(items_counter);
@@ -368,6 +402,10 @@ async fn main() -> anyhow::Result<()> {
                     let _ = connections.remove(&conn);
                     // CONNECTION_OPEN_TS 同时清理
                     let _ = connection_open_ts.remove(&conn);
+                    // SOCK_SAMPLES 同时 best-effort 清理:eBPF 端 mark_connection_closed
+                    // 已经 remove 过一次,正常路径走到这里都是 NotFound;留这行兜底以防
+                    // 用户态 GC 比 close 路径先观察到 sock 死(同 4-tuple 复用窗口)。
+                    let _ = sock_samples.remove(&conn);
 
                     if let Err(e) = connection_states.remove(&conn) {
                         warn!("Error deleting connection state from map: {e}");
@@ -395,8 +433,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                for tcp in current_tcp_connections {
+                for (tcp, srtt_sample) in current_tcp_connections {
                     metrics::handle_tcp_metric(&tcp);
+                    // 采到非零样本才喂直方图,避免给 histogram 灌 0 误导分位数。
+                    // kernel 端 srtt_us 编码是 真实 us << 3,所以先 / 8 再 / 1e6 转秒。
+                    if let Some(sample) = srtt_sample
+                        && sample.last_srtt_us > 0
+                    {
+                        let secs = (sample.last_srtt_us as f64) / 8.0 / 1_000_000.0;
+                        metrics::handle_tcp_srtt(&TcpConnectionKey::from(&tcp), secs);
+                    }
                     tcp_states.observe(tcp, tick);
                 }
 
