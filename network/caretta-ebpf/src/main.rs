@@ -6,9 +6,9 @@ use aya_ebpf::helpers::{
     bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_probe_read_kernel,
 };
 use aya_ebpf::macros::{btf_tracepoint, fentry, map};
-use aya_ebpf::maps::{HashMap, PerCpuHashMap};
+use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuHashMap};
 use aya_ebpf::programs::{BtfTracePointContext, FEntryContext};
-use aya_log_ebpf::warn;
+use aya_log_ebpf::{error, warn};
 
 const CONNECTION_ROLE_UNKNOWN: u32 = 0;
 const CONNECTION_ROLE_CLIENT: u32 = 1;
@@ -180,9 +180,19 @@ static CONNECTION_STATES: HashMap<ConnectionIdentifier, u64> =
 
 #[map]
 // sock cookie → 活跃连接 key 的反查表。
-// cookie 在 sock 生命周期内分配一次、sock free 后不会复用
-static SOCK_TO_CONNECTION: HashMap<u64, ConnectionIdentifier> =
-    HashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
+// cookie 在 sock 生命周期内分配一次、sock free 后不会复用。
+//
+// 用 LruHashMap 而不是 HashMap:目前只有 inet_sock_set_state(..., TCP_CLOSE) tp
+// 触发 mark_connection_closed 删 cookie。但内核存在多条绕开这条 tp 直接释放 sock
+// 的路径——
+//   - SYN backlog 里 request_sock 被 inet_csk_reqsk_queue_drop 等直接淘汰
+//   - 进程 kill / __sk_free 批量回收(OOM、滚动更新)
+//   - 个别内核版本的 tcp_done / RST abort 路径
+//   - request_sock 升格全 sock 的失败分支
+// 这些路径上 cookie 没人删,如果用普通 HashMap 长期累积必然撑爆 131072。而 cookie
+// 是用户态看不见的维度,没法像 CONNECTION_STATES 那样在用户态做 missed-tick GC
+static SOCK_TO_CONNECTION: LruHashMap<u64, ConnectionIdentifier> =
+    LruHashMap::<u64, ConnectionIdentifier>::with_max_entries(131072, 0);
 
 #[map]
 // Open 时间戳:open 路径写 bpf_ktime_get_ns(),close 路径取出来算 lifetime。
@@ -386,11 +396,7 @@ fn try_handle_sock_set_state(ctx: &BtfTracePointContext) -> Result<(), i32> {
         return Err(e);
     }
     if let Err(e) = SOCK_TO_CONNECTION.insert(&cookie, &key, 0) {
-        // 同上,反查表撑爆——后续 sendmsg/cleanup_rbuf/close 都没法落到这条 sock 上。
-        // 这里同时把刚刚写入的 CONNECTION_STATES 条目回滚,避免留下永远没人 close 的
-        // 孤儿状态。
-        warn!(ctx, "SOCK_TO_CONNECTION map insert failed: err={}", e);
-        let _ = CONNECTION_STATES.remove(&key);
+        error!(ctx, "SOCK_TO_CONNECTION insert failed unexpectedly: err={}", e);
         return Err(e);
     }
     // 起始时间戳:lifetime 用,close 时 now - open_ts 投递到 CLOSED_LIFETIMES。
