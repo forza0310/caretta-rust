@@ -305,7 +305,8 @@ static FILTERED_LOOPBACK_CONNECTIONS: Lazy<Gauge> = Lazy::new(|| {
 static MAP_SIZE: Lazy<Gauge> = Lazy::new(|| {
     let g = Gauge::new(
         "caretta_ebpf_connections_map_size",
-        "number of items in the connections map iterated from user space per iteration",
+        "Number of entries iterated from CONNECTION_STATES each tick. Approaches 131072 \
+         indicates eBPF map saturation risk—new connections will fail to insert.",
     )
     .expect("create caretta_ebpf_connections_map_size");
     prometheus::default_registry()

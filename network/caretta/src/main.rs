@@ -297,6 +297,12 @@ async fn main() -> anyhow::Result<()> {
     // 单调递增的 tick 序号:作为 tcp_states 软-GC 的时间基准(见 TcpTable::gc_stale)。
     let mut tick: u64 = 0;
 
+    // CONNECTION_STATES 占用告警 hysteresis 阈值
+    const CONNECTION_STATES_CAPACITY: u64 = 131072;
+    const CONNECTION_STATES_WARN_HIGH: u64 = CONNECTION_STATES_CAPACITY * 80 / 100;
+    const CONNECTION_STATES_WARN_LOW: u64 = CONNECTION_STATES_CAPACITY * 70 / 100;
+    let mut connection_states_above_threshold = false;
+
     let mut ticker = tokio::time::interval(Duration::from_secs(opt.poll_interval.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip); // 不在压力大时堆积过多 tick，反正每个 tick 都是全量扫描。
 
@@ -408,6 +414,29 @@ async fn main() -> anyhow::Result<()> {
 
                 metrics::set_map_size(items_counter);
                 metrics::set_filtered_loopback_connections(loopback_counter);
+
+                // CONNECTION_STATES 占用上探到 HIGH 水位时报一次,降回 LOW 才允许下一次报。
+                // hysteresis 阈值定义在 main 函数顶部 const 区,这里只做触发判断,不复用 ticker。
+                if items_counter >= CONNECTION_STATES_WARN_HIGH && !connection_states_above_threshold
+                {
+                    warn!(
+                        "CONNECTION_STATES occupancy {} / {} ({}%) crossed warn threshold; \
+                         high-cardinality ConnectionIdentifier 场景 (SNAT ephemeral / pid 轮转 / 多 ns) \
+                         可能让 map 撑爆,建议扩容或排查",
+                        items_counter,
+                        CONNECTION_STATES_CAPACITY,
+                        items_counter * 100 / CONNECTION_STATES_CAPACITY,
+                    );
+                    connection_states_above_threshold = true;
+                } else if items_counter <= CONNECTION_STATES_WARN_LOW
+                    && connection_states_above_threshold
+                {
+                    warn!(
+                        "CONNECTION_STATES occupancy {} / {} dropped below recovery threshold",
+                        items_counter, CONNECTION_STATES_CAPACITY,
+                    );
+                    connection_states_above_threshold = false;
+                }
 
                 // 把已死亡 link 的累计字节数 / 重传合并进本 tick 的 current_links。注意只读
                 // 不写——last_active 不在这里刷新，否则一条死了一小时的 link 仍会每
