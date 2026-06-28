@@ -11,6 +11,36 @@
 
 ---
 
+## 面板预览
+
+以下截图直接取自仓库自带的 Grafana dashboard([deploy/caretta-grafana-dashboard-configmap.yaml](deploy/caretta-grafana-dashboard-configmap.yaml)),数据源就是上表两个 `/metrics` 端点——没有额外加工。
+
+### Service Map —— 服务拓扑
+
+![ServiceMap](images/ServiceMap.jpeg)
+
+由 `caretta_links_observed` 聚合而来,边宽 = 累计字节,节点按 owner 上卷后的 Workload 维度(Deployment / DaemonSet / Installation / external)合并。
+
+### RTT & Packet —— 平滑 RTT 与收发包
+
+![RTT & Packet](images/RTT%20%26%20Packet.jpeg)
+
+`caretta_tcp_srtt_seconds` 直方图分位 + `caretta_tcp_segs_{in,out}_total` 的 rate,链路质量与吞吐放一起看。
+
+### Lifetime & Retransmit —— 连接生命周期与重传
+
+![Lifetime & Retransmit](images/Lifetime%20%26%20Retransmit.jpeg)
+
+`caretta_tcp_connection_lifetime_seconds` 在 close 一次性落直方图、`caretta_tcp_retransmits_total` 的 rate——短命异常连接 + 网络抖动的两个最直接信号。
+
+### K8s Event —— 集群事件
+
+![K8s Event](images/K8s%20Event.jpeg)
+
+来自 `caretta-k8s-state` 的 `caretta_k8s_events_total`,按 `(namespace, type, reason, workload)` 维度切片,主要看 `Warning` 类型的速率毛刺。
+
+---
+
 ## 架构
 
 ```
