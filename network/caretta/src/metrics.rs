@@ -1,7 +1,7 @@
 //! Prometheus metric definitions and update helpers for links and TCP states.
 
 use crate::types::{NetworkLink, TcpConnection, TcpConnectionKey, fnv_hash_parts};
-use log::warn;
+use log::{debug, warn};
 use once_cell::sync::Lazy;
 use prometheus::{CounterVec, Gauge, GaugeVec, HistogramVec, IntCounter, Opts};
 use std::borrow::Cow;
@@ -544,22 +544,22 @@ pub fn forget_link(link: &NetworkLink) {
         seen.remove(&link_key);
     }
 
-    // remove_label_values 失败一律 warn:大部分会是"GC 端在 series 从未注册过的
-    // 边界条件下进来"(delta 一直是 0、从未 inc_by → not-found),不算 bug 但也是
-    // 信号;真正要警惕的是 cardinality drift 这类开发期 bug——同一条日志路径处理。
+    // LINKS_METRICS 是无条件注册的(handle_link_metric 每次都 with_label_values),只要这条
+    // link 出现过这条 series 就必然在 registry 里——删不到说明真有 cardinality drift,保 warn。
     if let Err(e) = LINKS_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_links_observed series failed: {e} (labels: {refs:?})");
     }
-    // 重传 / segs series 与字节 series 一一对应:有的 link 一直没重传 / 没 segs 样本,
-    // 这边删不到属于正常边界,与 LINKS_METRICS 走同一条 warn 路径。
+    // 重传 / segs 是条件注册:delta==0 时 handle_link_* 提前 return,series 从未落到 registry。
+    // 一条 link 全程零重传 / 零 segs 样本时,GC 删不到这几条 series 是正常边界,降到 debug,
+    // 避免淹没真正的 cardinality drift 告警。
     if let Err(e) = LINKS_RETRANSMITS_METRICS.remove_label_values(&refs) {
-        warn!("forget caretta_tcp_retransmits_total series failed: {e} (labels: {refs:?})");
+        debug!("forget caretta_tcp_retransmits_total series failed: {e} (labels: {refs:?})");
     }
     if let Err(e) = LINKS_SEGS_IN_METRICS.remove_label_values(&refs) {
-        warn!("forget caretta_tcp_segs_in_total series failed: {e} (labels: {refs:?})");
+        debug!("forget caretta_tcp_segs_in_total series failed: {e} (labels: {refs:?})");
     }
     if let Err(e) = LINKS_SEGS_OUT_METRICS.remove_label_values(&refs) {
-        warn!("forget caretta_tcp_segs_out_total series failed: {e} (labels: {refs:?})");
+        debug!("forget caretta_tcp_segs_out_total series failed: {e} (labels: {refs:?})");
     }
 }
 
@@ -614,19 +614,19 @@ pub fn handle_tcp_metric(connection: &TcpConnection) {
 pub fn forget_tcp(key: &TcpConnectionKey) {
     let label_values = tcp_label_values(key);
     let refs = as_str_array(&label_values);
+    // TCP_STATE_METRICS 是无条件注册:handle_tcp_metric 每次 observe 都 set,只要连接出现过
+    // series 一定在 registry——删不到说明 GC/produce 两边 label 集合漂了,保 warn。
     if let Err(e) = TCP_STATE_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_tcp_states series failed: {e} (labels: {refs:?})");
     }
-    // lifetime 直方图与 tcp_states 同一套 label,GC 一起 forget——否则只清 gauge
-    // 不清 histogram,cardinality 还是会泄漏。
+    // lifetime / srtt 直方图是条件注册:lifetime 只有 close 事件来才 observe,srtt 只有有效样本才
+    // observe。短期连开都没开成功就触发 GC 时,这两条 series 从未落到 registry,删不到是正常边界,
+    // 降到 debug——cardinality drift 这种真问题由 TCP_STATE_METRICS 那条 warn 兜底。
     if let Err(e) = TCP_LIFETIME_METRICS.remove_label_values(&refs) {
-        // 边界事件:这条 series 从未 observe 过(短期内连开都没开成功就触发了 GC),
-        // 删不存在的 series 落到这里是正常的,不算 bug。
-        warn!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {refs:?})");
+        debug!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {refs:?})");
     }
-    // srtt 直方图同理,GC 必须连这条 series 一起收割。
     if let Err(e) = TCP_SRTT_METRICS.remove_label_values(&refs) {
-        warn!("forget caretta_tcp_srtt_seconds series failed: {e} (labels: {refs:?})");
+        debug!("forget caretta_tcp_srtt_seconds series failed: {e} (labels: {refs:?})");
     }
 }
 
