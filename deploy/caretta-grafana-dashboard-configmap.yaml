@@ -381,7 +381,7 @@ data:
           },
           "id": 200,
           "panels": [],
-          "title": "TCP Health (connection lifetime & retransmits)",
+          "title": "TCP Health (lifetime / retransmits / RTT / packet rate)",
           "type": "row"
         },
         {
@@ -718,19 +718,6 @@ data:
           "type": "stat"
         },
         {
-          "collapsed": false,
-          "gridPos": {
-            "h": 1,
-            "w": 24,
-            "x": 0,
-            "y": 41
-          },
-          "id": 210,
-          "panels": [],
-          "title": "TCP Latency & Packet Rate (srtt / segs)",
-          "type": "row"
-        },
-        {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -771,7 +758,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 42
+            "y": 41
           },
           "id": 211,
           "options": {
@@ -854,7 +841,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 42
+            "y": 41
           },
           "id": 212,
           "options": {
@@ -953,7 +940,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 50
+            "y": 49
           },
           "id": 213,
           "options": {
@@ -1032,7 +1019,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 50
+            "y": 49
           },
           "id": 214,
           "options": {
@@ -1079,7 +1066,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 58
+            "y": 57
           },
           "id": 100,
           "panels": [],
@@ -1156,7 +1143,7 @@ data:
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 59
+            "y": 58
           },
           "id": 101,
           "interval": "1m",
@@ -1256,7 +1243,7 @@ data:
             "h": 12,
             "w": 24,
             "x": 0,
-            "y": 67
+            "y": 66
           },
           "id": 102,
           "options": {
