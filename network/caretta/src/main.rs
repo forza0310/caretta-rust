@@ -68,7 +68,19 @@ fn ensure_vmlinux_btf_available() -> anyhow::Result<aya::Btf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 区分 caretta-ebpf 侧和用户态日志
+    {
+        use std::io::Write;
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                let source = match record.file() {
+                    Some(f) if f.contains("caretta-ebpf") => "caretta-ebpf",
+                    _ => record.target(),
+                };
+                writeln!(buf, "[{:<5} {}] {}", record.level(), source, record.args())
+            })
+            .init();
+    }
     let opt = Opt::from_env_and_args();
 
     // Load eBPF object file produced by the build script.
@@ -138,9 +150,28 @@ async fn main() -> anyhow::Result<()> {
         "eBPF programs attached: fentry tcp_sendmsg + fentry tcp_cleanup_rbuf + fentry tcp_retransmit_skb + tp_btf inet_sock_set_state"
     );
 
-    // EbpfLogger::init 必须放在所有 program.load() 之后
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        warn!("failed to initialize eBPF logger: {e}");
+    // 读取 AYA_LOGS ringbuf，打印 eBPF 侧的 log。
+    match aya_log::EbpfLogger::init(&mut ebpf) {
+        Ok(logger) => match tokio::io::unix::AsyncFd::new(logger) {
+            Ok(mut async_logger) => {
+                tokio::task::spawn(async move {
+                    loop {
+                        match async_logger.readable_mut().await {
+                            Ok(mut guard) => {
+                                guard.get_inner_mut().flush();
+                                guard.clear_ready();
+                            }
+                            Err(e) => {
+                                warn!("eBPF logger poll loop exiting: {e}");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => warn!("failed to wrap eBPF logger in AsyncFd: {e}"),
+        },
+        Err(e) => warn!("failed to initialize eBPF logger: {e}"),
     }
 
     let connections_map = ebpf
