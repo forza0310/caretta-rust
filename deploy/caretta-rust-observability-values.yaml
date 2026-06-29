@@ -12,11 +12,14 @@
 
 prometheus:
   enabled: true
-  scrapeInterval: 5s
+  # 全局默认 scrape 间隔(渲染为 global.scrape_interval)
+  scrapeInterval: 15s
+  evaluationInterval: 30s
   scrapeConfigs:
     - job_name: caretta-rust
       metrics_path: /metrics
-      scrape_interval: 5s
+      # job 级覆盖(优先级高于全局)
+      scrape_interval: 15s
       kubernetes_sd_configs:
         - role: pod
           namespaces:
