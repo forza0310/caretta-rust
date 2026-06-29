@@ -53,14 +53,15 @@
 │   │   → bytes_sent           │  maps   │   ├─ Pass 1 同步收集     │   │
 │   │ fentry tcp_cleanup_rbuf  │         │   ├─ Pass 2 resolver fan-out│ │
 │   │   → bytes_received       │         │   ├─ to_purge 复检 + 删除   │ │
-│   │ tp_btf inet_sock_set_state│        │   └─ link/tcp 表 GC      │   │
-│   │   → 连接状态变化            │       │                          │   │
-│   └──────────────────────────┘         │  IpResolver               │   │
-│                                        │   ├─ K8sResolver (watch)  │   │
-│   启动期:从 vmlinux BTF 解 sock        │   └─ StaticResolver (fallback)│ │
-│   字段偏移 → SOCK_OFFSETS map         │                          │   │
+│   │   → srtt / segs 采样       │        │   └─ link/tcp 表 GC      │   │
+│   │ fentry tcp_retransmit_skb │        │                          │   │
+│   │   → retransmits          │         │  IpResolver               │   │
+│   │ tp_btf inet_sock_set_state│        │   ├─ K8sResolver (watch)  │   │
+│   │   → 连接状态变化 / 生命周期 │        │   └─ StaticResolver (fallback)│ │
+│   └──────────────────────────┘         │                          │   │
 │                                        │  /metrics  /debug/resolver│   │
-│                                        └─────────────────────────┘   │
+│   启动期:从 vmlinux BTF 解 sock        │                          │   │
+│   字段偏移 → SOCK_OFFSETS map         └─────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -79,11 +80,11 @@
 四个 program,内核 ≥ 5.5 用 BTF-typed hook,不依赖 kprobe + offset 硬编码:
 
 - **`fentry tcp_sendmsg`** —— 每次发包累加 `bytes_sent` 到 PerCpu map
-- **`fentry tcp_cleanup_rbuf`** —— 收包累加 `bytes_received`(同 caretta-go,语义为「已消费」字节)
-- **`fentry tcp_retransmit_skb`** —— 按 `segs` 累加 `retransmits` 到同一份 PerCpu 计数器
+- **`fentry tcp_cleanup_rbuf`** —— 收包累加 `bytes_received`(同 caretta-go,语义为「已消费」字节);同路径顺手从 `tcp_sock` 现读 `srtt_us` / `segs_in` / `segs_out` 写入 `SOCK_SAMPLES`,供用户态喂 srtt 直方图与 segs 计数器(`srtt_us==0` 的初始样本整条跳过,免得刷糊直方图首桶)
+- **`fentry tcp_retransmit_skb`** —— 按 `segs`(一次重传的 TSO 段数,比 +1 更接近真实重传量)累加 `retransmits` 到同一份 PerCpu 计数器
 - **`tp_btf inet_sock_set_state`** —— TCP 状态机迁移,识别 client/server role,写 `CONNECTION_STATES`;同路径写 `CONNECTION_OPEN_TS` 起始戳,close 时算 `now - open_ts` 投递到 `CLOSED_LIFETIMES`
 
-`bpf_probe_read_kernel` 用的 `sock_common` 字段 byte offset 在**用户态启动期**从 `/sys/kernel/btf/vmlinux` 解出来塞到 `SOCK_OFFSETS` map,内核改 ABI 时启动就 fail——不再有 kernel-version-specific 硬编码。
+`bpf_probe_read_kernel` 用的字段 byte offset 在**用户态启动期**从 `/sys/kernel/btf/vmlinux` 解出来塞进 map,内核改 ABI 时启动就 fail——不再有 kernel-version-specific 硬编码。两套偏移分开存:`sock_common` 字段(四元组等)→ `SOCK_OFFSETS`,`tcp_sock` 字段(`srtt_us` / `segs_in` / `segs_out`)→ `TCP_SOCK_OFFSETS`;后者缺失只让 srtt/segs 采样跳过,不影响吞吐与状态采集。
 
 ### 用户态主循环 (`network/caretta`)
 
