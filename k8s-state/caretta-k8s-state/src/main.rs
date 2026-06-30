@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .spawn_refresh(Duration::from_secs(opt.refresh_interval.max(1)));
 
     // Event watch:复用 caretta-k8s-core 的通用 watch loop。
-    let observer = EventObserver::new(owners);
+    let observer = EventObserver::new(owners, opt.max_event_identities);
     caretta_k8s_core::watch::spawn_watch::<Event, _>(client, "events", observer);
     info!("event watch started");
 

@@ -12,6 +12,9 @@ const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_TRAVERSE_UP_HIERARCHY: bool = true;
 const DEFAULT_OWNER_RESOLVE_KIND_ALLOWLIST: &str = "";
 const DEFAULT_OWNER_KIND_PRIORITY: &str = "";
+// Event 去重水位表(LRU)的容量上限。Event 会被 TTL GC 后以新 uid 重建,
+// 故按 namespace/name 记水位且不随 Delete 清理,靠 LRU 淘汰旧条目兜底内存。
+const DEFAULT_MAX_EVENT_IDENTITIES: usize = 65536;
 
 #[derive(Debug, Clone, Parser)]
 pub struct Opt {
@@ -27,6 +30,8 @@ pub struct Opt {
     pub owner_resolve_kind_allowlist: String,
     #[clap(long, default_value = DEFAULT_OWNER_KIND_PRIORITY)]
     pub owner_kind_priority: String,
+    #[clap(long, default_value_t = DEFAULT_MAX_EVENT_IDENTITIES)]
+    pub max_event_identities: usize,
 }
 
 impl Opt {
@@ -76,6 +81,13 @@ impl Opt {
         }
         if let Ok(v) = std::env::var("OWNER_KIND_PRIORITY") {
             opt.owner_kind_priority = v;
+        }
+
+        if let Ok(v) = std::env::var("MAX_EVENT_IDENTITIES") {
+            match v.parse::<usize>() {
+                Ok(n) => opt.max_event_identities = n,
+                Err(_) => Self::warn_invalid_env("MAX_EVENT_IDENTITIES", &v, "usize"),
+            }
         }
 
         opt
