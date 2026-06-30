@@ -184,9 +184,8 @@ static TCP_STATE_METRICS: Lazy<GaugeVec> = Lazy::new(|| {
     g
 });
 
-// 连接 lifetime 直方图,close 时 observe 一次。
-// label 集合与 caretta_tcp_states 完全相同——这样 TcpTable GC 一条 series 时可以
-// 用同一组 label 把这边的直方图 series 也一并 forget 掉,不必再造一套生命周期。
+// 连接 lifetime 直方图,TCP连接 close 时 observe 一次。
+// tcp_label_values 那套 12 元组,只在喂 Prometheus 时切掉首项 link_id(link_id 在直方图上冗余）
 //
 // buckets 按语义分段铺,相邻比例 ~2-5×,覆盖 5ms → 2h:
 //   亚秒:健康探测 / 同机房 RPC / 短请求(5ms / 25ms / 100ms / 250ms / 500ms)
@@ -209,7 +208,6 @@ static TCP_LIFETIME_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         opts,
         &[
-            "link_id",
             "client_id",
             "client_name",
             "client_namespace",
@@ -248,7 +246,6 @@ static TCP_SRTT_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         opts,
         &[
-            "link_id",
             "client_id",
             "client_name",
             "client_namespace",
@@ -563,7 +560,7 @@ pub fn forget_link(link: &NetworkLink) {
     }
 }
 
-/// 构造 `caretta_tcp_states` 这条 series 的全部 label values。
+/// 构造 `caretta_tcp_states` 这条 series 的12元组 label values。
 ///
 /// 与 link_label_values 同理——给 handle_tcp_metric 和 forget_tcp 共用,同样用 Cow
 /// 借引用省 clone。注意签名收的是 TcpConnectionKey 而不是 TcpConnection：state 不参与
@@ -619,34 +616,34 @@ pub fn forget_tcp(key: &TcpConnectionKey) {
     if let Err(e) = TCP_STATE_METRICS.remove_label_values(&refs) {
         warn!("forget caretta_tcp_states series failed: {e} (labels: {refs:?})");
     }
-    // lifetime / srtt 直方图是条件注册:lifetime 只有 close 事件来才 observe,srtt 只有有效样本才
-    // observe。短期连开都没开成功就触发 GC 时,这两条 series 从未落到 registry,删不到是正常边界,
-    // 降到 debug——cardinality drift 这种真问题由 TCP_STATE_METRICS 那条 warn 兜底。
-    if let Err(e) = TCP_LIFETIME_METRICS.remove_label_values(&refs) {
-        debug!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {refs:?})");
+    // lifetime / srtt 直方图注册时不带 link_id，切掉首项 link_id 用 &refs[1..] 删
+    // lifetime 只有 close 事件来才 observe,srtt 只有有效样本才 observe。
+    // 因为意外没观测到 series 就触发 GC 时,删不到是正常边界,降到 debug。
+    if let Err(e) = TCP_LIFETIME_METRICS.remove_label_values(&refs[1..]) {
+        debug!("forget caretta_tcp_connection_lifetime_seconds series failed: {e} (labels: {:?})", &refs[1..]);
     }
-    if let Err(e) = TCP_SRTT_METRICS.remove_label_values(&refs) {
-        debug!("forget caretta_tcp_srtt_seconds series failed: {e} (labels: {refs:?})");
+    if let Err(e) = TCP_SRTT_METRICS.remove_label_values(&refs[1..]) {
+        debug!("forget caretta_tcp_srtt_seconds series failed: {e} (labels: {:?})", &refs[1..]);
     }
 }
 
 /// close 时把一条连接的 lifetime 投到直方图。`lifetime_secs` 由调用方做 ns→s 转换,
-/// 这里只负责按 TCP series 的 label 拼出 key 然后 observe。
+/// 这里按 tcp_label_values 拼出 key 后切掉首项 link_id(直方图不带它)再 observe。
 pub fn handle_tcp_lifetime(key: &TcpConnectionKey, lifetime_secs: f64) {
     let label_values = tcp_label_values(key);
     let refs = as_str_array(&label_values);
     TCP_LIFETIME_METRICS
-        .with_label_values(&refs)
+        .with_label_values(&refs[1..])
         .observe(lifetime_secs);
 }
 
 /// observe 单条 TCP 连接当前的 srtt 采样(秒)。kernel 端单位换算(`srtt_us >> 3` 再
-/// `/ 1e6`)由调用方做,本函数只按 TCP series 共用的 label observe。
+/// `/ 1e6`)由调用方做,本函数按 tcp_label_values 拼 key 后切掉首项 link_id 再 observe。
 pub fn handle_tcp_srtt(key: &TcpConnectionKey, srtt_seconds: f64) {
     let label_values = tcp_label_values(key);
     let refs = as_str_array(&label_values);
     TCP_SRTT_METRICS
-        .with_label_values(&refs)
+        .with_label_values(&refs[1..])
         .observe(srtt_seconds);
 }
 
@@ -816,10 +813,11 @@ mod tests {
         };
         handle_tcp_lifetime(&key, 0.250);
         // forget 必须真删,remove_label_values 成功 == series 在;失败说明 observe 没建。
+        // 直方图不带 link_id,切掉首项再删(下同)。
         let label_values = tcp_label_values(&key);
         let refs = as_str_array(&label_values);
         assert!(
-            TCP_LIFETIME_METRICS.remove_label_values(&refs).is_ok(),
+            TCP_LIFETIME_METRICS.remove_label_values(&refs[1..]).is_ok(),
             "handle_tcp_lifetime must register the series"
         );
         // forget_tcp 走过去:此刻已经手动 remove,再 forget 应该是 no-op 不 panic。
@@ -842,9 +840,9 @@ mod tests {
         let label_values = tcp_label_values(&key);
         let refs = as_str_array(&label_values);
         // 多次 observe 之后只该有一条 series,remove 一次就能彻底删。
-        assert!(TCP_LIFETIME_METRICS.remove_label_values(&refs).is_ok());
+        assert!(TCP_LIFETIME_METRICS.remove_label_values(&refs[1..]).is_ok());
         assert!(
-            TCP_LIFETIME_METRICS.remove_label_values(&refs).is_err(),
+            TCP_LIFETIME_METRICS.remove_label_values(&refs[1..]).is_err(),
             "series must be unique per label set; a second remove must fail"
         );
     }
@@ -864,7 +862,7 @@ mod tests {
         let refs = as_str_array(&label_values);
         // remove 成功 ⇔ series 已注册 ⇔ handle_tcp_srtt 走通了完整 observe 路径。
         assert!(
-            TCP_SRTT_METRICS.remove_label_values(&refs).is_ok(),
+            TCP_SRTT_METRICS.remove_label_values(&refs[1..]).is_ok(),
             "handle_tcp_srtt must register the series"
         );
         // forget_tcp 此刻应是 no-op(已经手动 remove 过),不应 panic。
@@ -887,7 +885,7 @@ mod tests {
         let label_values = tcp_label_values(&key);
         let refs = as_str_array(&label_values);
         assert!(
-            TCP_SRTT_METRICS.remove_label_values(&refs).is_err(),
+            TCP_SRTT_METRICS.remove_label_values(&refs[1..]).is_err(),
             "forget_tcp must remove caretta_tcp_srtt_seconds series; second remove would succeed otherwise"
         );
     }
@@ -906,9 +904,9 @@ mod tests {
         handle_tcp_srtt(&key, 1.0);
         let label_values = tcp_label_values(&key);
         let refs = as_str_array(&label_values);
-        assert!(TCP_SRTT_METRICS.remove_label_values(&refs).is_ok());
+        assert!(TCP_SRTT_METRICS.remove_label_values(&refs[1..]).is_ok());
         assert!(
-            TCP_SRTT_METRICS.remove_label_values(&refs).is_err(),
+            TCP_SRTT_METRICS.remove_label_values(&refs[1..]).is_err(),
             "srtt series must be unique per label set; a second remove must fail"
         );
     }
@@ -1184,7 +1182,7 @@ mod tests {
 
         let label_values = tcp_label_values(&key);
         let refs = as_str_array(&label_values);
-        let h = TCP_LIFETIME_METRICS.with_label_values(&refs);
+        let h = TCP_LIFETIME_METRICS.with_label_values(&refs[1..]);
         assert_eq!(
             h.get_sample_count(),
             expected_count,
@@ -1198,6 +1196,6 @@ mod tests {
             "histogram sum {actual_sum} must match injected sum {expected_sum} within float tolerance"
         );
 
-        let _ = TCP_LIFETIME_METRICS.remove_label_values(&refs);
+        let _ = TCP_LIFETIME_METRICS.remove_label_values(&refs[1..]);
     }
 }

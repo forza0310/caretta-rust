@@ -29,7 +29,8 @@ role
 
 #### `caretta_tcp_connection_lifetime_seconds` — 连接存活时长（Histogram）
 
-label 与 `caretta_tcp_states` 同。一条连接 CLOSE 时 observe 一次 `close_ns - open_ns` 转秒;
+label 与 `caretta_tcp_states` 同,但去掉 `link_id`(grafana 端 `sum by (le)` 聚合,link_id 在直方图上纯冗余)。
+一条连接 CLOSE 时 observe 一次 `close_ns - open_ns` 转秒;
 bucket 从 1ms 跨到 ~1000s,可挑出超短(SYN 立刻 RST)/超长(连接池长存活)两端。
 
 #### `caretta_tcp_retransmits_total` — 重传计数（Counter）
@@ -39,7 +40,7 @@ label 与 `caretta_links_observed` 同。eBPF fentry `tcp_retransmit_skb` 每次
 
 #### `caretta_tcp_srtt_seconds` — 平滑 RTT 直方图(Histogram)
 
-label 与 `caretta_tcp_states` 同。eBPF 在 `tcp_cleanup_rbuf` 路径上采样 `tp->srtt_us` 写入
+label 与 `caretta_tcp_states` 同,但去掉 `link_id`。eBPF 在 `tcp_cleanup_rbuf` 路径上采样 `tp->srtt_us` 写入
 快照,用户态收割时 observe 一次。bucket 100µs → 1.6s,kernel 端编码 us<<3 已折算为秒。
 
 #### `caretta_tcp_segs_in_total` / `caretta_tcp_segs_out_total` — 收发包数(Counter)
